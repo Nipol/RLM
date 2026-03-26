@@ -1,0 +1,2322 @@
+import { splitTrailingExpression } from './code_guard.ts';
+import type {
+  CellEntry,
+  ExecutionErrorSnapshot,
+  JsonValue,
+  LLMQueryHandler,
+  RLMQueryHandler,
+  RLMQueryInput,
+  ValueSnapshot,
+} from './types.ts';
+
+interface SandboxExecutionInput {
+  context: JsonValue | null;
+  currentCode: string;
+  history: CellEntry[];
+  replayCells: CellEntry[];
+  timeoutMs: number;
+}
+
+interface SandboxExecutionOutput {
+  error: ExecutionErrorSnapshot | null;
+  finalAnswer: string | null;
+  finalResult?: ValueSnapshot | null;
+  result: ValueSnapshot;
+  status: 'error' | 'success';
+  stderr: string;
+  stdout: string;
+}
+
+interface WorkerLike {
+  onerror: ((event: ErrorEvent) => void) | null;
+  onmessage: ((event: MessageEvent<SandboxExecutionOutput>) => void) | null;
+  onmessageerror: ((event: MessageEvent<unknown>) => void) | null;
+  terminate(): void;
+}
+
+type WorkerFactory = (
+  url: string,
+  options: WorkerOptions,
+) => WorkerLike;
+
+interface PersistentRuntimeOptions {
+  context: JsonValue | null;
+  llmQueryHandler?: LLMQueryHandler;
+  rlmQueryHandler?: RLMQueryHandler;
+}
+
+interface PersistentExecuteInput {
+  captureFinals?: boolean;
+  code: string;
+  history: CellEntry[];
+  timeoutMs: number;
+}
+
+interface PersistentWorkerLike {
+  onerror: ((event: ErrorEvent) => void) | null;
+  onmessage: ((event: MessageEvent<PersistentWorkerHostMessage>) => void) | null;
+  onmessageerror: ((event: MessageEvent<unknown>) => void) | null;
+  postMessage(message: PersistentWorkerMessage): void;
+  terminate(): void;
+}
+
+type PersistentWorkerFactory = (
+  url: string,
+  options: WorkerOptions,
+) => PersistentWorkerLike;
+
+interface PersistentWorkerExecuteMessage {
+  captureFinals: boolean;
+  code: string;
+  historyDelta: CellEntry[];
+  requestId: number;
+  type: 'execute';
+}
+
+interface PersistentWorkerExecuteResultMessage extends SandboxExecutionOutput {
+  requestId: number;
+  type: 'execute_result';
+}
+
+interface PersistentWorkerInitMessage {
+  context: JsonValue | null;
+  type: 'init';
+}
+
+interface PersistentWorkerQueryRequestMessage {
+  prompt: string;
+  queryId: number;
+  type: 'llm_query_request';
+}
+
+interface PersistentWorkerRecursiveQueryRequestMessage {
+  prompt: RLMQueryInput;
+  queryId: number;
+  type: 'rlm_query_request';
+}
+
+interface PersistentWorkerQueryResponseMessage {
+  queryId: number;
+  type: 'llm_query_response';
+  value: JsonValue;
+}
+
+interface PersistentWorkerQueryErrorMessage {
+  error: ExecutionErrorSnapshot;
+  queryId: number;
+  type: 'llm_query_error';
+}
+
+type PersistentWorkerHostMessage =
+  | PersistentWorkerExecuteResultMessage
+  | PersistentWorkerQueryRequestMessage
+  | PersistentWorkerRecursiveQueryRequestMessage;
+
+type PersistentWorkerMessage =
+  | PersistentWorkerExecuteMessage
+  | PersistentWorkerInitMessage
+  | PersistentWorkerQueryErrorMessage
+  | PersistentWorkerQueryResponseMessage;
+
+interface PendingExecution {
+  reject: (error: Error) => void;
+  requestId: number;
+  resolve: (output: SandboxExecutionOutput) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+interface PendingQueryController {
+  controller: AbortController;
+  worker: PersistentWorkerLike;
+}
+
+/**
+ * Returns whether one query response belongs to a worker that is no longer active.
+ */
+function isStalePersistentWorker(
+  activeWorker: PersistentWorkerLike | null,
+  worker: PersistentWorkerLike,
+): boolean {
+  return activeWorker !== worker;
+}
+
+/**
+ * Returns whether one pending query controller should be aborted while tearing down a worker.
+ */
+function shouldAbortPendingQueryController(
+  activeWorker: PersistentWorkerLike | null,
+  pendingWorker: PersistentWorkerLike,
+): boolean {
+  return activeWorker === null || pendingWorker === activeWorker;
+}
+
+/**
+ * Aborts and clears all pending query controllers that belong to the worker being torn down.
+ */
+function abortPendingQueryControllers(
+  pendingControllers: Map<number, PendingQueryController>,
+  activeWorker: PersistentWorkerLike | null,
+): void {
+  for (const [queryId, pending] of pendingControllers.entries()) {
+    if (!shouldAbortPendingQueryController(activeWorker, pending.worker)) {
+      continue;
+    }
+
+    pending.controller.abort();
+    pendingControllers.delete(queryId);
+  }
+}
+
+type WorkerFailureOutput = SandboxExecutionOutput & {
+  error: ExecutionErrorSnapshot;
+  status: 'error';
+};
+
+const PERSISTENT_RESTORE_TIMEOUT_MS = 30_000;
+const SANDBOX_TIMEOUT_GRACE_MS = 15;
+
+/**
+ * Carries a worker bootstrap failure back into the active execute() call as a normal REPL result.
+ */
+class PersistentWorkerStartupError extends Error {
+  readonly output: WorkerFailureOutput;
+
+  /**
+   * Stores the infrastructure failure that happened before any execute request was in flight.
+   */
+  constructor(output: WorkerFailureOutput) {
+    super(output.error.message);
+    this.name = 'PersistentWorkerStartupError';
+    this.output = output;
+  }
+}
+
+/**
+ * Raised when a sandboxed execution does not respond before its configured deadline.
+ */
+export class SandboxTimeoutError extends Error {
+  /**
+   * Formats a timeout error with the offending deadline in milliseconds.
+   */
+  constructor(timeoutMs: number) {
+    super(`Execution timed out after ${timeoutMs}ms.`);
+    this.name = 'TimeoutError';
+  }
+}
+
+/**
+ * Indents multi-line source so generated worker modules remain readable and valid.
+ */
+function indentBlock(code: string, spaces = 4): string {
+  const prefix = ' '.repeat(spaces);
+  return code
+    .split('\n')
+    .map((line) => (line.length === 0 ? '' : `${prefix}${line}`))
+    .join('\n');
+}
+
+/**
+ * Rewrites the current cell into a snippet that stores the cell's visible result.
+ */
+function buildCurrentCellCode(source: string): string {
+  const { body, expression } = splitTrailingExpression(source);
+  const bodyBlock = body.trim().length === 0 ? '' : `${body}\n`;
+
+  if (expression === null) {
+    return `${bodyBlock}__resultSnapshot = __snapshotValue(undefined);`;
+  }
+
+  return `${bodyBlock}__resultSnapshot = __snapshotValue(${expression});`;
+}
+
+/**
+ * Concatenates previously successful cells into replayable source code.
+ */
+function buildReplayCode(cells: CellEntry[]): string {
+  return cells
+    .map((cell) => `// replay:${cell.cellId}\n${cell.code}`)
+    .join('\n\n');
+}
+
+/**
+ * Generates the shared worker-side sandbox guards that block filesystem access explicitly.
+ */
+function buildSandboxGuardSource(): string {
+  return `
+const __blockedSandboxError = (kind) => {
+  const error = new Error(kind + ' access is disabled in the RLM sandbox.');
+  error.name = 'SandboxAccessError';
+  return error;
+};
+
+const __throwBlockedAccess = (kind) => {
+  throw __blockedSandboxError(kind);
+};
+
+const __blockedFileSystem = (..._args) => __throwBlockedAccess('File system');
+const __blockedEnvironment = (..._args) => __throwBlockedAccess('Environment');
+
+const __sandboxDeno = Object.freeze({
+  chmod: __blockedFileSystem,
+  chmodSync: __blockedFileSystem,
+  chown: __blockedFileSystem,
+  chownSync: __blockedFileSystem,
+  copyFile: __blockedFileSystem,
+  copyFileSync: __blockedFileSystem,
+  create: __blockedFileSystem,
+  createSync: __blockedFileSystem,
+  cwd: __blockedFileSystem,
+  env: Object.freeze({
+    delete: __blockedEnvironment,
+    get: __blockedEnvironment,
+    set: __blockedEnvironment,
+    toObject: __blockedEnvironment,
+  }),
+  lstat: __blockedFileSystem,
+  lstatSync: __blockedFileSystem,
+  makeTempDir: __blockedFileSystem,
+  makeTempDirSync: __blockedFileSystem,
+  makeTempFile: __blockedFileSystem,
+  makeTempFileSync: __blockedFileSystem,
+  mkdir: __blockedFileSystem,
+  mkdirSync: __blockedFileSystem,
+  open: __blockedFileSystem,
+  openSync: __blockedFileSystem,
+  readDir: __blockedFileSystem,
+  readDirSync: __blockedFileSystem,
+  readFile: __blockedFileSystem,
+  readFileSync: __blockedFileSystem,
+  readLink: __blockedFileSystem,
+  readLinkSync: __blockedFileSystem,
+  readTextFile: __blockedFileSystem,
+  readTextFileSync: __blockedFileSystem,
+  realPath: __blockedFileSystem,
+  realPathSync: __blockedFileSystem,
+  remove: __blockedFileSystem,
+  removeSync: __blockedFileSystem,
+  rename: __blockedFileSystem,
+  renameSync: __blockedFileSystem,
+  stat: __blockedFileSystem,
+  statSync: __blockedFileSystem,
+  symlink: __blockedFileSystem,
+  symlinkSync: __blockedFileSystem,
+  truncate: __blockedFileSystem,
+  truncateSync: __blockedFileSystem,
+  writeFile: __blockedFileSystem,
+  writeFileSync: __blockedFileSystem,
+  writeTextFile: __blockedFileSystem,
+  writeTextFileSync: __blockedFileSystem,
+});
+
+try {
+  Object.defineProperty(globalThis, 'Deno', {
+    configurable: false,
+    value: __sandboxDeno,
+    writable: false,
+  });
+} catch (_) {
+  globalThis.Deno = __sandboxDeno;
+}
+`;
+}
+
+/**
+ * Generates a shared worker-side helper that normalizes question-derived lookup targets.
+ */
+function buildNormalizeTargetSource(): string {
+  return `
+const normalizeTarget = (value) => {
+  if (value === undefined || value === null) {
+    return null;
+  }
+
+  const valueType = typeof value;
+  if (valueType !== 'boolean' && valueType !== 'number' && valueType !== 'string') {
+    return '';
+  }
+
+  let text = String(value).trim();
+  if (text.length === 0) {
+    return '';
+  }
+
+  const pairedQuotes = new Map([
+    ['"', '"'],
+    ["'", "'"],
+    ['\`', '\`'],
+    ['“', '”'],
+    ['‘', '’'],
+    ['(', ')'],
+    ['[', ']'],
+    ['{', '}'],
+  ]);
+
+  while (text.length >= 2) {
+    const opener = text[0];
+    const closer = text[text.length - 1];
+    if (pairedQuotes.get(opener) !== closer) {
+      break;
+    }
+
+    text = text.slice(1, -1).trim();
+  }
+
+  const sourceText = text;
+  text = text
+    .replace(/^[\\s"'“”‘’\`([{]+/u, '')
+    .replace(/[\\s"'“”‘’\`)\\]}!?.,:;]+$/u, '')
+    .trim();
+
+  if (text.length === 0) {
+    return '';
+  }
+
+  const looksLikeQuery = /^(?:what|which|who|where|when|why|how|return|find|identify|extract|give|show|locate)\\b/iu
+    .test(text);
+
+  if (looksLikeQuery) {
+    const targetPatterns = [
+      /\\bfor\\s+(.+?)(?:\\s*[?!.]|$)/iu,
+      /\\bnamed\\s+(.+?)(?:\\s*[?!.]|$)/iu,
+      /\\bcalled\\s+(.+?)(?:\\s*[?!.]|$)/iu,
+      /\\bbelongs\\s+to\\s+(?:profile\\s+)?(.+?)(?:\\s*[?!.]|$)/iu,
+    ];
+
+    for (const pattern of targetPatterns) {
+      const match = sourceText.match(pattern) ?? text.match(pattern);
+      if (!match || typeof match[1] !== 'string') {
+        continue;
+      }
+
+      const candidate = normalizeTarget(match[1]);
+      if (candidate !== null && candidate.length > 0 && candidate !== text) {
+        return candidate;
+      }
+    }
+
+    return '';
+  }
+
+  const descriptorSuffixes = new Set([
+    'code',
+    'id',
+    'identifier',
+    'key',
+    'label',
+    'number',
+    'token',
+  ]);
+  const words = text.split(/\\s+/u).filter((part) => part.length > 0);
+  if (words.length >= 1) {
+    const trailingWord = words[words.length - 1].toLowerCase();
+    if (descriptorSuffixes.has(trailingWord)) {
+      if (words.length === 1) {
+        return '';
+      }
+
+      return words.slice(0, -1).join(' ');
+    }
+  }
+
+  return text;
+};
+`;
+}
+
+/**
+ * Generates a shared worker-side helper that extracts the substring between exact anchors.
+ */
+function buildAnchoredValueSource(): string {
+  return `
+const findAnchoredValue = (text, prefix, suffix) => {
+  if (text === undefined || text === null || prefix === undefined || prefix === null || suffix === undefined || suffix === null) {
+    return null;
+  }
+
+  if (typeof text !== 'string' || typeof prefix !== 'string' || typeof suffix !== 'string') {
+    return '';
+  }
+
+  if (prefix.length === 0) {
+    return '';
+  }
+
+  const start = text.indexOf(prefix);
+  if (start < 0) {
+    return '';
+  }
+
+  const valueStart = start + prefix.length;
+  const end = suffix.length === 0 ? -1 : text.indexOf(suffix, valueStart);
+  if (end >= 0) {
+    const exact = text.slice(valueStart, end).trim();
+    return exact.length === 0 ? '' : exact;
+  }
+
+  const trailing = text.slice(valueStart).trimStart();
+  if (trailing.length === 0) {
+    return '';
+  }
+
+  const token = trailing.split(/\\s+/u, 1)[0];
+  return normalizeTarget(token);
+};
+`;
+}
+
+/**
+ * Generates the full worker module that bootstraps the sandbox and executes one cell.
+ */
+function buildWorkerSource(input: SandboxExecutionInput): string {
+  const replayCode = buildReplayCode(input.replayCells);
+  const currentCode = buildCurrentCellCode(input.currentCode);
+
+  return `
+// @ts-nocheck
+const __postResult = globalThis.postMessage.bind(globalThis);
+const __stdoutParts = [];
+const __stderrParts = [];
+
+const __disableGlobal = (name) => {
+  try {
+    Object.defineProperty(globalThis, name, {
+      configurable: false,
+      value: undefined,
+      writable: false,
+    });
+    return;
+  } catch (_) {
+    // Fall through to direct assignment.
+  }
+
+  try {
+    globalThis[name] = undefined;
+  } catch (_) {
+    // Ignore best-effort lockdown failures.
+  }
+};
+
+const __stableStringify = (value, depth = 0) => {
+  if (value === null) {
+    return null;
+  }
+
+  if (depth > 2) {
+    return '[MaxDepth]';
+  }
+
+  if (Array.isArray(value)) {
+    return value.slice(0, 10).map((entry) => __stableStringify(entry, depth + 1));
+  }
+
+  const valueType = typeof value;
+  if (valueType === 'boolean' || valueType === 'number' || valueType === 'string') {
+    return value;
+  }
+
+  if (valueType === 'bigint') {
+    return value.toString();
+  }
+
+  if (valueType !== 'object') {
+    return undefined;
+  }
+
+  const entries = Object.entries(value).slice(0, 10);
+  const snapshot = {};
+
+  for (const [key, nested] of entries) {
+    const serialized = __stableStringify(nested, depth + 1);
+    if (serialized !== undefined) {
+      snapshot[key] = serialized;
+    }
+  }
+
+  return snapshot;
+};
+
+const __previewValue = (value) => {
+  if (value === null) {
+    return 'null';
+  }
+
+  if (value === undefined) {
+    return 'undefined';
+  }
+
+  const valueType = typeof value;
+
+  if (valueType === 'string') {
+    return value;
+  }
+
+  if (valueType === 'number' || valueType === 'boolean' || valueType === 'bigint') {
+    return String(value);
+  }
+
+  if (valueType === 'function') {
+    return '[Function]';
+  }
+
+  if (valueType === 'symbol') {
+    return value.toString();
+  }
+
+  try {
+    const stable = __stableStringify(value);
+    if (stable !== undefined) {
+      return JSON.stringify(stable);
+    }
+  } catch (_) {
+    // Fall through to Object.prototype.
+  }
+
+  return Object.prototype.toString.call(value);
+};
+
+const __createSignal = (path, value) => {
+  if (value === undefined && path === '$') {
+    return null;
+  }
+
+  if (value === null) {
+    return { kind: 'null', path, preview: 'null' };
+  }
+
+  const valueType = typeof value;
+  if (
+    valueType === 'bigint' ||
+    valueType === 'boolean' ||
+    valueType === 'number' ||
+    valueType === 'string' ||
+    valueType === 'undefined'
+  ) {
+    return {
+      kind: valueType,
+      path,
+      preview: __previewValue(value),
+    };
+  }
+
+  return null;
+};
+
+const __signalPathSegment = (key) =>
+  /^[A-Za-z_$][\\w$]*$/.test(key) ? '.' + key : '[' + JSON.stringify(key) + ']';
+
+const __collectSignals = (value, path = '$', depth = 0, signals = []) => {
+  if (signals.length >= 16 || depth > 4) {
+    return signals;
+  }
+
+  const signal = __createSignal(path, value);
+  if (signal !== null) {
+    signals.push(signal);
+    return signals;
+  }
+
+  if (Array.isArray(value)) {
+    for (let index = 0; index < Math.min(value.length, 8); index += 1) {
+      if (signals.length >= 16) {
+        break;
+      }
+
+      __collectSignals(value[index], path + '[' + index + ']', depth + 1, signals);
+    }
+
+    return signals;
+  }
+
+  if (value && typeof value === 'object') {
+    for (const [key, nested] of Object.entries(value).slice(0, 8)) {
+      if (signals.length >= 16) {
+        break;
+      }
+
+      __collectSignals(nested, path + __signalPathSegment(key), depth + 1, signals);
+    }
+  }
+
+  return signals;
+};
+
+const __snapshotValue = (value) => {
+  const json = __stableStringify(value);
+  const signals = __collectSignals(value);
+  const base = {
+    kind: value === null
+      ? 'null'
+      : Array.isArray(value)
+      ? 'array'
+      : typeof value,
+    preview: __previewValue(value),
+  };
+
+  if (signals.length > 0) {
+    base.signals = signals;
+  }
+
+  if (json === undefined) {
+    return base;
+  }
+
+  return { ...base, json };
+};
+
+const __write = (parts, values) => {
+  parts.push(values.map((value) => __previewValue(value)).join(' ') + '\\n');
+};
+
+const __console = {
+  debug: (...values) => __write(__stdoutParts, values),
+  error: (...values) => __write(__stderrParts, values),
+  info: (...values) => __write(__stdoutParts, values),
+  log: (...values) => __write(__stdoutParts, values),
+  warn: (...values) => __write(__stderrParts, values),
+};
+
+globalThis.console = __console;
+
+for (const __globalName of [
+  'BroadcastChannel',
+  'EventSource',
+  'SharedWorker',
+  'WebSocket',
+  'Worker',
+  'caches',
+  'close',
+  'fetch',
+  'indexedDB',
+  'localStorage',
+  'navigator',
+  'onmessage',
+  'postMessage',
+  'sessionStorage',
+]) {
+  __disableGlobal(__globalName);
+}
+
+${buildSandboxGuardSource()}
+${buildNormalizeTargetSource()}
+${buildAnchoredValueSource()}
+
+const __deepFreeze = (value) => {
+  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
+    Object.freeze(value);
+
+    for (const nested of Object.values(value)) {
+      __deepFreeze(nested);
+    }
+  }
+
+  return value;
+};
+
+const context = __deepFreeze(structuredClone(${JSON.stringify(input.context ?? null)}));
+const history = __deepFreeze(structuredClone(${JSON.stringify(input.history)}));
+
+let __captureFinals = false;
+let __finalAnswer = null;
+let __finalResult = null;
+let __resultSnapshot = __snapshotValue(undefined);
+
+const FINAL = (value) => {
+  if (__captureFinals) {
+    __finalAnswer = __previewValue(value);
+    __finalResult = __snapshotValue(value);
+  }
+
+  return value;
+};
+
+const FINAL_VAR = (value) => FINAL(value);
+
+try {
+  await (async () => {
+${indentBlock(replayCode)}
+    __captureFinals = true;
+${indentBlock(currentCode)}
+  })();
+
+  __postResult({
+    error: null,
+    finalAnswer: __finalAnswer,
+    finalResult: __finalResult,
+    result: __resultSnapshot,
+    status: 'success',
+    stderr: __stderrParts.join(''),
+    stdout: __stdoutParts.join(''),
+  });
+} catch (error) {
+  const __error = error instanceof Error
+    ? { message: error.message, name: error.name, stack: error.stack }
+    : { message: String(error), name: 'Error' };
+
+  __postResult({
+    error: __error,
+    finalAnswer: __finalAnswer,
+    finalResult: __finalResult,
+    result: __resultSnapshot,
+    status: 'error',
+    stderr: __stderrParts.join(''),
+    stdout: __stdoutParts.join(''),
+  });
+}
+`;
+}
+
+/**
+ * Produces the default result placeholder for worker failures before user code runs.
+ */
+function createUndefinedSnapshot(): ValueSnapshot {
+  return { kind: 'undefined', preview: 'undefined' };
+}
+
+/**
+ * Normalizes arbitrary thrown values into a serializable error payload.
+ */
+function createErrorSnapshot(error: unknown, fallbackName = 'Error'): ExecutionErrorSnapshot {
+  if (error instanceof Error) {
+    return {
+      message: error.message,
+      name: error.name,
+      stack: error.stack,
+    };
+  }
+
+  return {
+    message: String(error),
+    name: fallbackName,
+  };
+}
+
+/**
+ * Encodes generated worker source as a self-contained TypeScript data URL.
+ */
+function buildWorkerUrl(source: string): string {
+  return `data:application/typescript;charset=utf-8,${encodeURIComponent(source)}`;
+}
+
+/**
+ * Executes one cell in the default Deno worker sandbox.
+ */
+export async function executeCellInSandbox(
+  input: SandboxExecutionInput,
+): Promise<SandboxExecutionOutput> {
+  return await executeCellInSandboxWithFactory(input, (url, options) => new Worker(url, options));
+}
+
+/**
+ * Executes one cell with an injected worker factory so runtime edge cases can be tested.
+ */
+export async function executeCellInSandboxWithFactory(
+  input: SandboxExecutionInput,
+  workerFactory: WorkerFactory,
+): Promise<SandboxExecutionOutput> {
+  const worker = workerFactory(buildWorkerUrl(buildWorkerSource(input)), {
+    deno: { permissions: 'none' },
+    type: 'module',
+  });
+
+  return await new Promise<SandboxExecutionOutput>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      worker.terminate();
+      reject(new SandboxTimeoutError(input.timeoutMs));
+    }, input.timeoutMs + SANDBOX_TIMEOUT_GRACE_MS);
+
+    /**
+     * Completes the pending execution once the worker reaches a terminal state.
+     */
+    const finish = (value: SandboxExecutionOutput): void => {
+      clearTimeout(timer);
+      worker.terminate();
+      resolve(value);
+    };
+
+    worker.onmessage = (event: MessageEvent<SandboxExecutionOutput>) => {
+      finish(event.data);
+    };
+
+    worker.onerror = (event: ErrorEvent) => {
+      finish(
+        {
+          error: {
+            message: event.message,
+            name: 'WorkerError',
+          },
+          finalAnswer: null,
+          finalResult: null,
+          result: createUndefinedSnapshot(),
+          status: 'error',
+          stderr: '',
+          stdout: '',
+        },
+      );
+    };
+
+    worker.onmessageerror = () => {
+      finish(
+        {
+          error: {
+            message: 'Sandbox worker failed to serialize its response.',
+            name: 'MessageError',
+          },
+          finalAnswer: null,
+          finalResult: null,
+          result: createUndefinedSnapshot(),
+          status: 'error',
+          stderr: '',
+          stdout: '',
+        },
+      );
+    };
+  });
+}
+
+/**
+ * Tests whether a character can appear inside a JavaScript identifier.
+ */
+function isIdentifierCharacter(char: string | undefined): boolean {
+  return char !== undefined && /[\p{L}\p{N}_$]/u.test(char);
+}
+
+/**
+ * Skips over contiguous whitespace from the provided cursor.
+ */
+function skipWhitespace(source: string, start: number): number {
+  let index = start;
+  while (index < source.length && /\s/u.test(source[index])) {
+    index += 1;
+  }
+
+  return index;
+}
+
+/**
+ * Checks whether a keyword match is isolated from adjacent identifier characters.
+ */
+function hasKeywordBoundary(source: string, start: number, length: number): boolean {
+  return !isIdentifierCharacter(source[start - 1]) &&
+    !isIdentifierCharacter(source[start + length]);
+}
+
+/**
+ * Tracks whether the current scanner position is nested inside non-top-level syntax.
+ */
+function createScannerState() {
+  return {
+    braces: 0,
+    brackets: 0,
+    canStartStatement: true,
+    parens: 0,
+    state: 'code' as
+      | 'block-comment'
+      | 'code'
+      | 'double'
+      | 'line-comment'
+      | 'single'
+      | 'template',
+  };
+}
+
+/**
+ * Advances a lightweight JavaScript scanner by one character.
+ */
+function advanceScanner(
+  source: string,
+  index: number,
+  scanner = createScannerState(),
+): {
+  nextIndex: number;
+  scanner: ReturnType<typeof createScannerState>;
+} {
+  const char = source[index];
+  const next = source[index + 1];
+
+  if (scanner.state === 'code') {
+    if (char === "'" || char === '"' || char === '`') {
+      scanner.state = char === "'" ? 'single' : char === '"' ? 'double' : 'template';
+      scanner.canStartStatement = false;
+      return { nextIndex: index + 1, scanner };
+    }
+
+    if (char === '/' && next === '/') {
+      scanner.state = 'line-comment';
+      return { nextIndex: index + 2, scanner };
+    }
+
+    if (char === '/' && next === '*') {
+      scanner.state = 'block-comment';
+      return { nextIndex: index + 2, scanner };
+    }
+
+    if (char === '{') {
+      scanner.braces += 1;
+      scanner.canStartStatement = false;
+      return { nextIndex: index + 1, scanner };
+    }
+
+    if (char === '}') {
+      scanner.braces = Math.max(0, scanner.braces - 1);
+      scanner.canStartStatement = scanner.braces === 0 &&
+        scanner.brackets === 0 &&
+        scanner.parens === 0;
+      return { nextIndex: index + 1, scanner };
+    }
+
+    if (char === '(') {
+      scanner.parens += 1;
+      scanner.canStartStatement = false;
+      return { nextIndex: index + 1, scanner };
+    }
+
+    if (char === ')') {
+      scanner.parens = Math.max(0, scanner.parens - 1);
+      return { nextIndex: index + 1, scanner };
+    }
+
+    if (char === '[') {
+      scanner.brackets += 1;
+      scanner.canStartStatement = false;
+      return { nextIndex: index + 1, scanner };
+    }
+
+    if (char === ']') {
+      scanner.brackets = Math.max(0, scanner.brackets - 1);
+      return { nextIndex: index + 1, scanner };
+    }
+
+    if (scanner.braces === 0 && scanner.brackets === 0 && scanner.parens === 0) {
+      if (char === ';' || char === '\n') {
+        scanner.canStartStatement = true;
+        return { nextIndex: index + 1, scanner };
+      }
+
+      if (!/\s/u.test(char)) {
+        scanner.canStartStatement = false;
+      }
+    }
+
+    return { nextIndex: index + 1, scanner };
+  }
+
+  if (scanner.state === 'line-comment') {
+    if (char === '\n') {
+      scanner.state = 'code';
+      scanner.canStartStatement = scanner.braces === 0 &&
+        scanner.brackets === 0 &&
+        scanner.parens === 0;
+    }
+
+    return { nextIndex: index + 1, scanner };
+  }
+
+  if (scanner.state === 'block-comment') {
+    if (char === '*' && next === '/') {
+      scanner.state = 'code';
+      return { nextIndex: index + 2, scanner };
+    }
+
+    return { nextIndex: index + 1, scanner };
+  }
+
+  if (char === '\\') {
+    return {
+      nextIndex: Math.min(source.length, index + 2),
+      scanner,
+    };
+  }
+
+  const quote = scanner.state === 'single' ? "'" : scanner.state === 'double' ? '"' : '`';
+  if (char === quote) {
+    scanner.state = 'code';
+  }
+
+  return { nextIndex: index + 1, scanner };
+}
+
+/**
+ * Finds the end index of a top-level statement.
+ */
+function findStatementEnd(source: string, start: number): number {
+  const scanner = createScannerState();
+  let index = start;
+
+  while (index < source.length) {
+    const char = source[index];
+    if (
+      scanner.state === 'code' &&
+      scanner.braces === 0 &&
+      scanner.brackets === 0 &&
+      scanner.parens === 0 &&
+      char === ';'
+    ) {
+      return index + 1;
+    }
+
+    const advanced = advanceScanner(source, index, scanner);
+    index = advanced.nextIndex;
+  }
+
+  return source.length;
+}
+
+/**
+ * Finds the end index of a braced block starting at the provided opening brace.
+ */
+function findBracedBlockEnd(source: string, openingBrace: number): number {
+  const scanner = createScannerState();
+  scanner.braces = 1;
+  let index = openingBrace + 1;
+
+  while (index < source.length) {
+    const char = source[index];
+    const next = source[index + 1];
+
+    if (scanner.state === 'code') {
+      if (char === "'" || char === '"' || char === '`') {
+        scanner.state = char === "'" ? 'single' : char === '"' ? 'double' : 'template';
+        index += 1;
+        continue;
+      }
+
+      if (char === '/' && next === '/') {
+        scanner.state = 'line-comment';
+        index += 2;
+        continue;
+      }
+
+      if (char === '/' && next === '*') {
+        scanner.state = 'block-comment';
+        index += 2;
+        continue;
+      }
+
+      if (char === '{') {
+        scanner.braces += 1;
+        index += 1;
+        continue;
+      }
+
+      if (char === '}') {
+        scanner.braces -= 1;
+        index += 1;
+        if (scanner.braces === 0) {
+          return index;
+        }
+
+        continue;
+      }
+
+      index += 1;
+      continue;
+    }
+
+    if (scanner.state === 'line-comment') {
+      if (char === '\n') {
+        scanner.state = 'code';
+      }
+
+      index += 1;
+      continue;
+    }
+
+    if (scanner.state === 'block-comment') {
+      if (char === '*' && next === '/') {
+        scanner.state = 'code';
+        index += 2;
+        continue;
+      }
+
+      index += 1;
+      continue;
+    }
+
+    if (char === '\\') {
+      index += 2;
+      continue;
+    }
+
+    const quote = scanner.state === 'single' ? "'" : scanner.state === 'double' ? '"' : '`';
+    if (char === quote) {
+      scanner.state = 'code';
+    }
+
+    index += 1;
+  }
+
+  return source.length;
+}
+
+/**
+ * Splits a string on top-level delimiters while ignoring nested structures.
+ */
+function splitTopLevel(source: string, delimiter: string): string[] {
+  const parts: string[] = [];
+  const scanner = createScannerState();
+  let cursor = 0;
+  let index = 0;
+
+  while (index < source.length) {
+    if (
+      scanner.state === 'code' &&
+      scanner.braces === 0 &&
+      scanner.brackets === 0 &&
+      scanner.parens === 0 &&
+      source[index] === delimiter
+    ) {
+      parts.push(source.slice(cursor, index));
+      cursor = index + 1;
+      index += 1;
+      continue;
+    }
+
+    const advanced = advanceScanner(source, index, scanner);
+    index = advanced.nextIndex;
+  }
+
+  parts.push(source.slice(cursor));
+  return parts;
+}
+
+/**
+ * Finds the initializer operator for one variable declarator.
+ */
+function findDeclaratorAssignment(source: string): number | null {
+  const scanner = createScannerState();
+  let index = 0;
+
+  while (index < source.length) {
+    const char = source[index];
+    const next = source[index + 1];
+    const previous = source[index - 1];
+
+    if (
+      scanner.state === 'code' &&
+      scanner.braces === 0 &&
+      scanner.brackets === 0 &&
+      scanner.parens === 0 &&
+      char === '=' &&
+      previous !== '=' &&
+      previous !== '!' &&
+      previous !== '<' &&
+      previous !== '>' &&
+      next !== '=' &&
+      next !== '>'
+    ) {
+      return index;
+    }
+
+    const advanced = advanceScanner(source, index, scanner);
+    index = advanced.nextIndex;
+  }
+
+  return null;
+}
+
+/**
+ * Converts a top-level declarator into an assignment that persists inside the proxy scope.
+ */
+function rewriteDeclarator(source: string): string {
+  const declarator = source.trim();
+  if (declarator.length === 0) {
+    return '';
+  }
+
+  const assignmentIndex = findDeclaratorAssignment(declarator);
+  const left = (assignmentIndex === null ? declarator : declarator.slice(0, assignmentIndex))
+    .trim();
+  const right = assignmentIndex === null
+    ? 'undefined'
+    : declarator.slice(assignmentIndex + 1).trim();
+  const assignment = `${left} = ${right}`;
+
+  if (left.startsWith('{') || left.startsWith('[')) {
+    return `(${assignment})`;
+  }
+
+  return assignment;
+}
+
+/**
+ * Rewrites one top-level variable declaration statement.
+ */
+function rewriteVariableDeclaration(
+  source: string,
+  start: number,
+  keywordLength: number,
+): { end: number; replacement: string } {
+  const end = findStatementEnd(source, start);
+  const trailingSemicolon = source[end - 1] === ';';
+  const bodyEnd = trailingSemicolon ? end - 1 : end;
+  const declarators = source.slice(start + keywordLength, bodyEnd);
+  const rewritten = splitTopLevel(declarators, ',')
+    .map((declarator) => rewriteDeclarator(declarator))
+    .filter((declarator) => declarator.length > 0)
+    .join(';\n');
+
+  return {
+    end,
+    replacement: rewritten.length === 0 ? '' : `${rewritten};`,
+  };
+}
+
+/**
+ * Rewrites one top-level function declaration into an assignment expression.
+ */
+function rewriteFunctionDeclaration(
+  source: string,
+  start: number,
+): { end: number; replacement: string } {
+  let cursor = start;
+
+  if (source.startsWith('async', cursor)) {
+    cursor += 'async'.length;
+    cursor = skipWhitespace(source, cursor);
+  }
+
+  cursor += 'function'.length;
+  cursor = skipWhitespace(source, cursor);
+
+  if (source[cursor] === '*') {
+    cursor += 1;
+    cursor = skipWhitespace(source, cursor);
+  }
+
+  const nameStart = cursor;
+  while (isIdentifierCharacter(source[cursor])) {
+    cursor += 1;
+  }
+
+  const name = source.slice(nameStart, cursor);
+  let braceIndex = cursor;
+  while (braceIndex < source.length && source[braceIndex] !== '{') {
+    braceIndex += 1;
+  }
+
+  const bodyEnd = findBracedBlockEnd(source, braceIndex);
+  const end = source[bodyEnd] === ';' ? bodyEnd + 1 : bodyEnd;
+  const declaration = source.slice(start, end).trim().replace(/;$/u, '');
+
+  return {
+    end,
+    replacement: `${name} = ${declaration};`,
+  };
+}
+
+/**
+ * Rewrites one top-level class declaration into an assignment expression.
+ */
+function rewriteClassDeclaration(
+  source: string,
+  start: number,
+): { end: number; replacement: string } {
+  let cursor = start + 'class'.length;
+  cursor = skipWhitespace(source, cursor);
+
+  const nameStart = cursor;
+  while (isIdentifierCharacter(source[cursor])) {
+    cursor += 1;
+  }
+
+  const name = source.slice(nameStart, cursor);
+  let braceIndex = cursor;
+  while (braceIndex < source.length && source[braceIndex] !== '{') {
+    braceIndex += 1;
+  }
+
+  const bodyEnd = findBracedBlockEnd(source, braceIndex);
+  const end = source[bodyEnd] === ';' ? bodyEnd + 1 : bodyEnd;
+  const declaration = source.slice(start, end).trim().replace(/;$/u, '');
+
+  return {
+    end,
+    replacement: `${name} = ${declaration};`,
+  };
+}
+
+/**
+ * Rewrites persistent top-level bindings so later cells can reuse them from the proxy scope.
+ */
+function rewriteTopLevelBindings(source: string): string {
+  const scanner = createScannerState();
+  let cursor = 0;
+  let output = '';
+  let segmentStart = 0;
+
+  while (cursor < source.length) {
+    const topLevel = scanner.state === 'code' &&
+      scanner.braces === 0 &&
+      scanner.brackets === 0 &&
+      scanner.parens === 0 &&
+      scanner.canStartStatement;
+
+    if (topLevel) {
+      const isAsyncFunction = source.startsWith('async', cursor) &&
+        hasKeywordBoundary(source, cursor, 'async'.length) &&
+        /^\s*function\b/u.test(source.slice(cursor + 'async'.length));
+      const isFunction = source.startsWith('function', cursor) &&
+        hasKeywordBoundary(source, cursor, 'function'.length);
+      const isClass = source.startsWith('class', cursor) &&
+        hasKeywordBoundary(source, cursor, 'class'.length);
+      const isConst = source.startsWith('const', cursor) &&
+        hasKeywordBoundary(source, cursor, 'const'.length);
+      const isLet = source.startsWith('let', cursor) &&
+        hasKeywordBoundary(source, cursor, 'let'.length);
+      const isVar = source.startsWith('var', cursor) &&
+        hasKeywordBoundary(source, cursor, 'var'.length);
+
+      let rewritten: { end: number; replacement: string } | null = null;
+      if (isAsyncFunction || isFunction) {
+        rewritten = rewriteFunctionDeclaration(source, cursor);
+      } else if (isClass) {
+        rewritten = rewriteClassDeclaration(source, cursor);
+      } else if (isConst) {
+        rewritten = rewriteVariableDeclaration(source, cursor, 'const'.length);
+      } else if (isLet) {
+        rewritten = rewriteVariableDeclaration(source, cursor, 'let'.length);
+      } else if (isVar) {
+        rewritten = rewriteVariableDeclaration(source, cursor, 'var'.length);
+      }
+
+      if (rewritten !== null) {
+        output += source.slice(segmentStart, cursor);
+        output += rewritten.replacement;
+        cursor = rewritten.end;
+        segmentStart = rewritten.end;
+        scanner.canStartStatement = true;
+        continue;
+      }
+    }
+
+    const advanced = advanceScanner(source, cursor, scanner);
+    cursor = advanced.nextIndex;
+  }
+
+  output += source.slice(segmentStart);
+  return output;
+}
+
+/**
+ * Converts one cell into a persistent-runtime program that writes its visible result explicitly.
+ */
+function buildPersistentCellCode(source: string): string {
+  const { body, expression } = splitTrailingExpression(source);
+  const rewrittenBody = rewriteTopLevelBindings(body);
+  const bodyBlock = rewrittenBody.trim().length === 0 ? '' : `${rewrittenBody}\n`;
+
+  if (expression === null) {
+    return `${bodyBlock}__setResult(undefined);`;
+  }
+
+  return `${bodyBlock}__setResult(${expression});`;
+}
+
+/**
+ * Builds the worker module used by the long-lived persistent interpreter.
+ */
+function buildPersistentWorkerSource(): string {
+  return `
+// @ts-nocheck
+const __hostPost = globalThis.postMessage.bind(globalThis);
+const __addEventListener = globalThis.addEventListener.bind(globalThis);
+const __stdoutParts = [];
+const __stderrParts = [];
+const __stateStore = Object.create(null);
+const __pendingQueries = new Map();
+const __reservedBindings = new Set(['FINAL', 'FINAL_VAR', 'context', 'findAnchoredValue', 'history', 'llm_query', 'normalizeTarget', 'rlm_query']);
+const __excludedBindings = new Set(['__scope', '__setResult']);
+
+let __context = null;
+let __history = Object.freeze([]);
+let __captureFinals = false;
+let __finalAnswer = null;
+let __finalResult = null;
+let __nextQueryId = 0;
+let __resultSnapshot = { kind: 'undefined', preview: 'undefined' };
+
+const __disableGlobal = (name) => {
+  try {
+    Object.defineProperty(globalThis, name, {
+      configurable: false,
+      value: undefined,
+      writable: false,
+    });
+    return;
+  } catch (_) {
+    // Fall through to direct assignment.
+  }
+
+  try {
+    globalThis[name] = undefined;
+  } catch (_) {
+    // Ignore best-effort lockdown failures.
+  }
+};
+
+const __stableStringify = (value, depth = 0) => {
+  if (value === null) {
+    return null;
+  }
+
+  if (depth > 2) {
+    return '[MaxDepth]';
+  }
+
+  if (Array.isArray(value)) {
+    return value.slice(0, 10).map((entry) => __stableStringify(entry, depth + 1));
+  }
+
+  const valueType = typeof value;
+  if (valueType === 'boolean' || valueType === 'number' || valueType === 'string') {
+    return value;
+  }
+
+  if (valueType === 'bigint') {
+    return value.toString();
+  }
+
+  if (valueType !== 'object') {
+    return undefined;
+  }
+
+  const entries = Object.entries(value).slice(0, 10);
+  const snapshot = {};
+
+  for (const [key, nested] of entries) {
+    const serialized = __stableStringify(nested, depth + 1);
+    if (serialized !== undefined) {
+      snapshot[key] = serialized;
+    }
+  }
+
+  return snapshot;
+};
+
+const __previewValue = (value) => {
+  if (value === null) {
+    return 'null';
+  }
+
+  if (value === undefined) {
+    return 'undefined';
+  }
+
+  const valueType = typeof value;
+
+  if (valueType === 'string') {
+    return value;
+  }
+
+  if (valueType === 'number' || valueType === 'boolean' || valueType === 'bigint') {
+    return String(value);
+  }
+
+  if (valueType === 'function') {
+    return '[Function]';
+  }
+
+  if (valueType === 'symbol') {
+    return value.toString();
+  }
+
+  try {
+    const stable = __stableStringify(value);
+    if (stable !== undefined) {
+      return JSON.stringify(stable);
+    }
+  } catch (_) {
+    // Fall through to Object.prototype.
+  }
+
+  return Object.prototype.toString.call(value);
+};
+
+const __createSignal = (path, value) => {
+  if (value === undefined && path === '$') {
+    return null;
+  }
+
+  if (value === null) {
+    return { kind: 'null', path, preview: 'null' };
+  }
+
+  const valueType = typeof value;
+  if (
+    valueType === 'bigint' ||
+    valueType === 'boolean' ||
+    valueType === 'number' ||
+    valueType === 'string' ||
+    valueType === 'undefined'
+  ) {
+    return {
+      kind: valueType,
+      path,
+      preview: __previewValue(value),
+    };
+  }
+
+  return null;
+};
+
+const __signalPathSegment = (key) =>
+  /^[A-Za-z_$][\\w$]*$/.test(key) ? '.' + key : '[' + JSON.stringify(key) + ']';
+
+const __collectSignals = (value, path = '$', depth = 0, signals = []) => {
+  if (signals.length >= 16 || depth > 4) {
+    return signals;
+  }
+
+  const signal = __createSignal(path, value);
+  if (signal !== null) {
+    signals.push(signal);
+    return signals;
+  }
+
+  if (Array.isArray(value)) {
+    for (let index = 0; index < Math.min(value.length, 8); index += 1) {
+      if (signals.length >= 16) {
+        break;
+      }
+
+      __collectSignals(value[index], path + '[' + index + ']', depth + 1, signals);
+    }
+
+    return signals;
+  }
+
+  if (value && typeof value === 'object') {
+    for (const [key, nested] of Object.entries(value).slice(0, 8)) {
+      if (signals.length >= 16) {
+        break;
+      }
+
+      __collectSignals(nested, path + __signalPathSegment(key), depth + 1, signals);
+    }
+  }
+
+  return signals;
+};
+
+const __snapshotValue = (value) => {
+  const json = __stableStringify(value);
+  const signals = __collectSignals(value);
+  const base = {
+    kind: value === null
+      ? 'null'
+      : Array.isArray(value)
+      ? 'array'
+      : typeof value,
+    preview: __previewValue(value),
+  };
+
+  if (signals.length > 0) {
+    base.signals = signals;
+  }
+
+  if (json === undefined) {
+    return base;
+  }
+
+  return { ...base, json };
+};
+
+const __deepFreeze = (value) => {
+  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
+    Object.freeze(value);
+
+    for (const nested of Object.values(value)) {
+      __deepFreeze(nested);
+    }
+  }
+
+  return value;
+};
+
+const __appendHistory = (entries) => {
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return;
+  }
+
+  const frozenEntries = entries.map((entry) => __deepFreeze(structuredClone(entry)));
+  __history = Object.freeze(__history.concat(frozenEntries));
+};
+
+const __write = (parts, values) => {
+  parts.push(values.map((value) => __previewValue(value)).join(' ') + '\\n');
+};
+
+const __toError = (snapshot) => {
+  const error = new Error(snapshot.message);
+  error.name = snapshot.name;
+  if (snapshot.stack) {
+    error.stack = snapshot.stack;
+  }
+
+  return error;
+};
+
+const __console = {
+  debug: (...values) => __write(__stdoutParts, values),
+  error: (...values) => __write(__stderrParts, values),
+  info: (...values) => __write(__stdoutParts, values),
+  log: (...values) => __write(__stdoutParts, values),
+  warn: (...values) => __write(__stderrParts, values),
+};
+
+globalThis.console = __console;
+
+for (const __globalName of [
+  'BroadcastChannel',
+  'EventSource',
+  'SharedWorker',
+  'WebSocket',
+  'Worker',
+  'caches',
+  'close',
+  'fetch',
+  'indexedDB',
+  'localStorage',
+  'navigator',
+  'onmessage',
+  'postMessage',
+  'sessionStorage',
+]) {
+  __disableGlobal(__globalName);
+}
+
+${buildSandboxGuardSource()}
+${buildNormalizeTargetSource()}
+${buildAnchoredValueSource()}
+
+const FINAL = (value) => {
+  if (__captureFinals) {
+    __finalAnswer = __previewValue(value);
+    __finalResult = __snapshotValue(value);
+  }
+
+  return value;
+};
+
+const FINAL_VAR = (value) => FINAL(value);
+
+const llm_query = (prompt) => new Promise((resolve, reject) => {
+  if (prompt === undefined || prompt === null) {
+    reject(new Error('llm_query requires a concrete prompt.'));
+    return;
+  }
+
+  const promptText = String(prompt);
+  if (promptText.trim().length === 0) {
+    reject(new Error('llm_query requires a non-empty prompt.'));
+    return;
+  }
+
+  const queryId = __nextQueryId++;
+  __pendingQueries.set(queryId, { reject, resolve });
+  __hostPost({
+    prompt: promptText,
+    queryId,
+    type: 'llm_query_request',
+  });
+});
+
+const rlm_query = (prompt) => new Promise((resolve, reject) => {
+  if (prompt === undefined || prompt === null) {
+    reject(new Error('rlm_query requires a concrete prompt.'));
+    return;
+  }
+
+  let delegatedRequest;
+  if (typeof prompt === 'string') {
+    const promptText = String(prompt);
+    if (promptText.trim().length === 0) {
+      reject(new Error('rlm_query requires a non-empty prompt.'));
+      return;
+    }
+    delegatedRequest = promptText;
+  } else if (typeof prompt === 'object' && prompt !== null && !Array.isArray(prompt)) {
+    const task = prompt.task;
+    if (typeof task !== 'string') {
+      reject(new Error('rlm_query object requests require a string task.'));
+      return;
+    }
+    if (task.trim().length === 0) {
+      reject(new Error('rlm_query requires a non-empty task.'));
+      return;
+    }
+    delegatedRequest = prompt;
+  } else {
+    reject(new Error('rlm_query expects either a task string or an object with a task field.'));
+    return;
+  }
+
+  const queryId = __nextQueryId++;
+  __pendingQueries.set(queryId, { reject, resolve });
+  __hostPost({
+    prompt: delegatedRequest,
+    queryId,
+    type: 'rlm_query_request',
+  });
+});
+
+const __scope = new Proxy(__stateStore, {
+  deleteProperty(target, key) {
+    if (typeof key === 'string' && __reservedBindings.has(key)) {
+      return false;
+    }
+
+    return Reflect.deleteProperty(target, key);
+  },
+  get(target, key) {
+    if (key === Symbol.unscopables) {
+      return undefined;
+    }
+
+    if (key === 'context') {
+      return __context;
+    }
+
+    if (key === 'history') {
+      return __history;
+    }
+
+    if (key === 'FINAL') {
+      return FINAL;
+    }
+
+    if (key === 'FINAL_VAR') {
+      return FINAL_VAR;
+    }
+
+    if (key === 'llm_query') {
+      return llm_query;
+    }
+
+    if (key === 'findAnchoredValue') {
+      return findAnchoredValue;
+    }
+
+    if (key === 'normalizeTarget') {
+      return normalizeTarget;
+    }
+
+    if (key === 'rlm_query') {
+      return rlm_query;
+    }
+
+    if (Reflect.has(target, key)) {
+      return Reflect.get(target, key);
+    }
+
+    return globalThis[key];
+  },
+  has(_target, key) {
+    if (key === Symbol.unscopables) {
+      return false;
+    }
+
+    return typeof key !== 'string' || !__excludedBindings.has(key);
+  },
+  set(target, key, value) {
+    if (typeof key === 'string' && __reservedBindings.has(key)) {
+      throw new Error('Reserved REPL identifiers cannot be reassigned or redeclared.');
+    }
+
+    Reflect.set(target, key, value);
+    return true;
+  },
+});
+
+const __execute = async (message) => {
+  __stdoutParts.length = 0;
+  __stderrParts.length = 0;
+  __captureFinals = message.captureFinals;
+  __finalAnswer = null;
+  __finalResult = null;
+  __appendHistory(message.historyDelta);
+  __resultSnapshot = __snapshotValue(undefined);
+
+  try {
+    const __AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+    const __runner = new __AsyncFunction(
+      '__scope',
+      '__setResult',
+      "with (__scope) {\\n" + message.code + "\\n}",
+    );
+
+    await __runner(__scope, (value) => {
+      __resultSnapshot = __snapshotValue(value);
+    });
+
+    __hostPost({
+      error: null,
+      finalAnswer: __finalAnswer,
+      finalResult: __finalResult,
+      requestId: message.requestId,
+      result: __resultSnapshot,
+      status: 'success',
+      stderr: __stderrParts.join(''),
+      stdout: __stdoutParts.join(''),
+      type: 'execute_result',
+    });
+  } catch (error) {
+    const __error = error instanceof Error
+      ? { message: error.message, name: error.name, stack: error.stack }
+      : { message: String(error), name: 'Error' };
+
+    __hostPost({
+      error: __error,
+      finalAnswer: __finalAnswer,
+      finalResult: __finalResult,
+      requestId: message.requestId,
+      result: __resultSnapshot,
+      status: 'error',
+      stderr: __stderrParts.join(''),
+      stdout: __stdoutParts.join(''),
+      type: 'execute_result',
+    });
+  }
+};
+
+const __handleMessage = async (message) => {
+  if (message.type === 'init') {
+    __context = __deepFreeze(structuredClone(message.context));
+    return;
+  }
+
+  if (message.type === 'llm_query_response') {
+    const pending = __pendingQueries.get(message.queryId);
+    if (pending) {
+      __pendingQueries.delete(message.queryId);
+      pending.resolve(message.value);
+    }
+
+    return;
+  }
+
+  if (message.type === 'llm_query_error') {
+    const pending = __pendingQueries.get(message.queryId);
+    if (pending) {
+      __pendingQueries.delete(message.queryId);
+      pending.reject(__toError(message.error));
+    }
+
+    return;
+  }
+
+  if (message.type === 'execute') {
+    await __execute(message);
+  }
+};
+
+__addEventListener('message', (event) => {
+  void __handleMessage(event.data);
+});
+`;
+}
+
+/**
+ * Manages a single long-lived worker that preserves successful interpreter state.
+ */
+export class PersistentSandboxRuntime {
+  readonly #context: JsonValue | null;
+  readonly #llmQueryHandler?: LLMQueryHandler;
+  readonly #rlmQueryHandler?: RLMQueryHandler;
+  readonly #workerFactory: PersistentWorkerFactory;
+  #isExecuting = false;
+  #nextRequestId = 0;
+  #pendingExecution: PendingExecution | null = null;
+  #pendingQueryControllers = new Map<number, PendingQueryController>();
+  #syncedHistoryLength = 0;
+  #startupFailure: WorkerFailureOutput | null = null;
+  #worker: PersistentWorkerLike | null = null;
+
+  /**
+   * Captures the runtime configuration used for every worker lifecycle.
+   */
+  constructor(
+    options: PersistentRuntimeOptions,
+    workerFactory: PersistentWorkerFactory = (url, workerOptions) =>
+      new Worker(url, workerOptions) as unknown as PersistentWorkerLike,
+  ) {
+    this.#context = structuredClone(options.context ?? null);
+    this.#llmQueryHandler = options.llmQueryHandler;
+    this.#rlmQueryHandler = options.rlmQueryHandler;
+    this.#workerFactory = workerFactory;
+  }
+
+  /**
+   * Executes one cell against the current persistent interpreter, recreating it when needed.
+   */
+  async execute(input: PersistentExecuteInput): Promise<SandboxExecutionOutput> {
+    if (this.#isExecuting) {
+      throw new Error('Concurrent REPL executions are not supported.');
+    }
+
+    this.#isExecuting = true;
+    let failure: unknown = null;
+    let output: SandboxExecutionOutput | null = null;
+
+    try {
+      const worker = await this.#ensureWorker(input.history);
+      const startupFailure = this.#takeStartupFailure();
+      if (startupFailure !== null) {
+        output = startupFailure;
+      } else {
+        output = await this.#dispatchExecution(worker, {
+          captureFinals: input.captureFinals ?? true,
+          code: buildPersistentCellCode(input.code),
+          historyDelta: input.history.slice(this.#syncedHistoryLength),
+          requestId: this.#nextRequestId++,
+          timeoutMs: input.timeoutMs,
+        });
+        this.#syncedHistoryLength = input.history.length;
+      }
+
+      if (output.status !== 'success') {
+        this.#destroyWorker();
+      }
+    } catch (error) {
+      if (error instanceof PersistentWorkerStartupError) {
+        output = error.output;
+      } else {
+        failure = error;
+      }
+    }
+
+    this.#isExecuting = false;
+    if (failure !== null) {
+      throw failure;
+    }
+
+    return output as SandboxExecutionOutput;
+  }
+
+  /**
+   * Terminates the current worker so the next execution will rebuild from journal state.
+   */
+  close(): void {
+    this.#destroyWorker();
+  }
+
+  /**
+   * Creates and restores a worker when no live interpreter is available.
+   */
+  async #ensureWorker(history: CellEntry[]): Promise<PersistentWorkerLike> {
+    if (this.#worker !== null) {
+      return this.#worker;
+    }
+
+    this.#syncedHistoryLength = 0;
+    this.#startupFailure = null;
+    const worker = this.#workerFactory(buildWorkerUrl(buildPersistentWorkerSource()), {
+      deno: { permissions: 'none' },
+      type: 'module',
+    });
+    this.#worker = worker;
+    this.#attachWorkerHandlers(worker);
+    worker.postMessage({
+      context: structuredClone(this.#context),
+      type: 'init',
+    });
+
+    try {
+      await this.#restoreWorkerState(worker, history);
+    } catch (error) {
+      this.#destroyWorker();
+      throw error;
+    }
+
+    const startupFailure = this.#takeStartupFailure();
+    if (startupFailure !== null) {
+      throw new PersistentWorkerStartupError(startupFailure);
+    }
+
+    return worker;
+  }
+
+  /**
+   * Replays successful historical cells into a freshly created persistent worker.
+   */
+  async #restoreWorkerState(worker: PersistentWorkerLike, history: CellEntry[]): Promise<void> {
+    for (let index = 0; index < history.length; index += 1) {
+      const cell = history[index];
+      if (cell.status !== 'success') {
+        continue;
+      }
+
+      const output = await this.#dispatchExecution(worker, {
+        captureFinals: false,
+        code: buildPersistentCellCode(cell.code),
+        historyDelta: history.slice(this.#syncedHistoryLength, index),
+        requestId: this.#nextRequestId++,
+        timeoutMs: PERSISTENT_RESTORE_TIMEOUT_MS,
+      });
+      this.#syncedHistoryLength = index;
+
+      if (output.status !== 'success') {
+        throw new Error(
+          `Failed to restore persistent interpreter state from cell ${cell.cellId}.`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Sends one execute request into the active worker and waits for its terminal response.
+   */
+  #dispatchExecution(
+    worker: PersistentWorkerLike,
+    input: Omit<PersistentWorkerExecuteMessage, 'type'> & { timeoutMs: number },
+  ): Promise<SandboxExecutionOutput> {
+    return new Promise<SandboxExecutionOutput>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.#pendingExecution = null;
+        this.#destroyWorker();
+        reject(new SandboxTimeoutError(input.timeoutMs));
+      }, input.timeoutMs + SANDBOX_TIMEOUT_GRACE_MS);
+
+      this.#pendingExecution = {
+        reject,
+        requestId: input.requestId,
+        resolve,
+        timer,
+      };
+
+      worker.postMessage({
+        captureFinals: input.captureFinals,
+        code: input.code,
+        historyDelta: structuredClone(input.historyDelta),
+        requestId: input.requestId,
+        type: 'execute',
+      });
+    });
+  }
+
+  /**
+   * Hooks worker lifecycle events into the currently pending host-side execution.
+   */
+  #attachWorkerHandlers(worker: PersistentWorkerLike): void {
+    worker.onmessage = (event: MessageEvent<PersistentWorkerHostMessage>) => {
+      if (this.#worker !== worker) {
+        return;
+      }
+
+      const message = event.data;
+      if (message.type === 'llm_query_request' || message.type === 'rlm_query_request') {
+        void this.#respondToQuery(worker, message);
+        return;
+      }
+
+      const pending = this.#pendingExecution;
+      if (pending === null || pending.requestId !== message.requestId) {
+        return;
+      }
+
+      clearTimeout(pending.timer);
+      this.#pendingExecution = null;
+      pending.resolve({
+        error: message.error,
+        finalAnswer: message.finalAnswer,
+        finalResult: message.finalResult ?? null,
+        result: message.result,
+        status: message.status,
+        stderr: message.stderr,
+        stdout: message.stdout,
+      });
+    };
+
+    worker.onerror = (event: ErrorEvent) => {
+      if (this.#worker !== worker) {
+        return;
+      }
+
+      this.#finishWorkerFailure(
+        {
+          error: {
+            message: event.message,
+            name: 'WorkerError',
+          },
+          finalAnswer: null,
+          finalResult: null,
+          result: createUndefinedSnapshot(),
+          status: 'error',
+          stderr: '',
+          stdout: '',
+        },
+      );
+    };
+
+    worker.onmessageerror = () => {
+      if (this.#worker !== worker) {
+        return;
+      }
+
+      this.#finishWorkerFailure(
+        {
+          error: {
+            message: 'Persistent sandbox worker failed to serialize its response.',
+            name: 'MessageError',
+          },
+          finalAnswer: null,
+          finalResult: null,
+          result: createUndefinedSnapshot(),
+          status: 'error',
+          stderr: '',
+          stdout: '',
+        },
+      );
+    };
+  }
+
+  /**
+   * Routes one worker-originated llm_query request to the configured host handler.
+   */
+  async #respondToQuery(
+    worker: PersistentWorkerLike,
+    message: PersistentWorkerQueryRequestMessage | PersistentWorkerRecursiveQueryRequestMessage,
+  ): Promise<void> {
+    if (message.type === 'rlm_query_request') {
+      const handler = this.#rlmQueryHandler;
+      if (handler === undefined) {
+        worker.postMessage({
+          error: {
+            message: 'rlm_query is not configured for this REPL session.',
+            name: 'LLMQueryError',
+          },
+          queryId: message.queryId,
+          type: 'llm_query_error',
+        });
+        return;
+      }
+
+      const controller = new AbortController();
+      this.#pendingQueryControllers.set(message.queryId, { controller, worker });
+
+      try {
+        const value = await handler(message.prompt, { signal: controller.signal });
+        if (isStalePersistentWorker(this.#worker, worker)) {
+          return;
+        }
+
+        worker.postMessage({
+          queryId: message.queryId,
+          type: 'llm_query_response',
+          value: structuredClone(value),
+        });
+      } catch (error) {
+        if (isStalePersistentWorker(this.#worker, worker)) {
+          return;
+        }
+
+        worker.postMessage({
+          error: createErrorSnapshot(error, 'LLMQueryError'),
+          queryId: message.queryId,
+          type: 'llm_query_error',
+        });
+      } finally {
+        this.#pendingQueryControllers.delete(message.queryId);
+      }
+      return;
+    }
+
+    const handler = this.#llmQueryHandler;
+
+    if (handler === undefined) {
+      worker.postMessage({
+        error: {
+          message: 'llm_query is not configured for this REPL session.',
+          name: 'LLMQueryError',
+        },
+        queryId: message.queryId,
+        type: 'llm_query_error',
+      });
+      return;
+    }
+
+    const controller = new AbortController();
+    this.#pendingQueryControllers.set(message.queryId, { controller, worker });
+
+    try {
+      const value = await handler(message.prompt, { signal: controller.signal });
+      if (this.#worker !== worker) {
+        return;
+      }
+
+      worker.postMessage({
+        queryId: message.queryId,
+        type: 'llm_query_response',
+        value: structuredClone(value),
+      });
+    } catch (error) {
+      if (this.#worker !== worker) {
+        return;
+      }
+
+      worker.postMessage({
+        error: createErrorSnapshot(error, 'LLMQueryError'),
+        queryId: message.queryId,
+        type: 'llm_query_error',
+      });
+    } finally {
+      this.#pendingQueryControllers.delete(message.queryId);
+    }
+  }
+
+  /**
+   * Resolves the current execution with an infrastructure error and tears down the worker.
+   */
+  #finishWorkerFailure(output: WorkerFailureOutput): void {
+    const pending = this.#pendingExecution;
+    this.#destroyWorker();
+
+    if (pending === null) {
+      this.#startupFailure = output;
+      return;
+    }
+
+    clearTimeout(pending.timer);
+    this.#pendingExecution = null;
+    pending.resolve(output);
+  }
+
+  /**
+   * Terminates the active worker without mutating journal state.
+   */
+  #destroyWorker(): void {
+    const worker = this.#worker;
+    this.#worker = null;
+    this.#syncedHistoryLength = 0;
+    abortPendingQueryControllers(this.#pendingQueryControllers, worker);
+
+    if (worker !== null) {
+      worker.onerror = null;
+      worker.onmessage = null;
+      worker.onmessageerror = null;
+      worker.terminate();
+    }
+  }
+
+  /**
+   * Reads and clears a worker failure that happened before execute dispatch began.
+   */
+  #takeStartupFailure(): WorkerFailureOutput | null {
+    const failure = this.#startupFailure;
+    this.#startupFailure = null;
+    return failure;
+  }
+}
+
+export const __workerRuntimeTestables = {
+  abortPendingQueryControllers,
+  buildCurrentCellCode,
+  buildPersistentCellCode,
+  buildReplayCode,
+  buildWorkerSource,
+  createUndefinedSnapshot,
+  executeCellInSandboxWithFactory,
+  isStalePersistentWorker,
+  rewriteTopLevelBindings,
+  shouldAbortPendingQueryController,
+};

@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+.deno-coverage-cache/
+coverage/
+coverage-pass-*/
+coverage-pass-*-cache/
+.DS_Store
+.idea/
+.vscode/
+*.log
+tmp/
+logs/
