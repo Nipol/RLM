@@ -10,8 +10,8 @@ import type { OpenAIProviderConfig, RLMConfig } from './env.ts';
 import { createDefaultExecutionBackend } from './execution_backend.ts';
 import { createSubqueryLogger, getLoggerJournalPath, resolveRLMLogger } from './logger.ts';
 import { createLLMQueryHandler, createRLMQueryHandler } from './llm_query.ts';
-import type { LLMAdapter, LLMCompletionResponse } from './llm_adapter.ts';
-import { OpenAIResponsesAdapter } from './openai_adapter.ts';
+import type { LLMAdapter, LLMCaller, LLMCallerResponse } from './llm_adapter.ts';
+import { OpenAIResponsesProvider } from './openai_adapter.ts';
 import { buildRLMSystemPrompt, buildRLMTurnInput } from './rlm_prompt.ts';
 import { extractFinalSignal, extractReplCodeBlocks } from './repl_protocol.ts';
 import type { FinalSignal, ReplCodeBlock } from './repl_protocol.ts';
@@ -60,7 +60,7 @@ interface InternalRLMRunOptions extends
  * @example
  * ```ts
  * const options: RLMRunOptions = {
- *   adapter,
+ *   llm,
  *   context: { document: 'Chapter 1\\nThe answer is 42.' },
  *   prompt: 'Extract the answer.',
  *   rootModel: 'gpt-5-nano',
@@ -69,12 +69,13 @@ interface InternalRLMRunOptions extends
  * ```
  */
 export interface RLMRunOptions extends RLMRunInput {
-  adapter: LLMAdapter;
+  adapter?: LLMAdapter;
   clock?: () => Date;
   depth?: number;
   executionBackend?: ExecutionBackend;
   idGenerator?: () => string;
   journalPath?: string;
+  llm?: LLMCaller;
   logger?: RLMLogger;
   rootModel: string;
   subModel: string;
@@ -96,7 +97,6 @@ export interface RLMRunOptions extends RLMRunInput {
 export interface RLMRunResult {
   answer: string;
   finalValue: JsonValue | null;
-  responseId: string | null;
   session: ReplSession;
   steps: number;
   usage: RLMUsageSummary;
@@ -107,6 +107,8 @@ export interface RLMRunResult {
  *
  * Explicit `openAI` configuration is the preferred library path.
  * `config` or implicit `.env` loading remain available for standalone convenience.
+ * In this provider-backed path, `cellTimeoutMs` is interpreted as additional REPL
+ * cell budget on top of the provider request timeout.
  *
  * @example
  * ```ts
@@ -181,6 +183,14 @@ function resolveRunLimit(value: number | undefined, fallback: number): number {
   return value ?? fallback;
 }
 
+function resolveProviderAwareCellTimeoutMs(
+  additionalTimeoutMs: number | undefined,
+  providerRequestTimeoutMs: number,
+  defaultAdditionalTimeoutMs = DEFAULT_CELL_TIMEOUT_MS,
+): number {
+  return providerRequestTimeoutMs + (additionalTimeoutMs ?? defaultAdditionalTimeoutMs);
+}
+
 function resolveOpenAIRunLogger(
   logger: RLMLogger | undefined,
   journalPath: string | undefined,
@@ -188,6 +198,18 @@ function resolveOpenAIRunLogger(
   return logger ?? (journalPath === undefined ? undefined : resolveRLMLogger({
     journalPath,
   }));
+}
+
+function resolveRLMCaller(
+  llm: LLMCaller | undefined,
+  adapter: LLMAdapter | undefined,
+): LLMCaller {
+  const resolved = llm ?? adapter;
+  if (resolved !== undefined) {
+    return resolved;
+  }
+
+  throw new Error('RLM requires an llm caller or legacy adapter.');
 }
 
 function resolveControllerRole(depth: number | undefined): 'child' | 'root' {
@@ -272,13 +294,13 @@ async function appendSubqueryEntry(
  * The resulting client captures long-lived dependencies once and exposes
  * a small `run(...)` method for task-specific inputs.
  *
- * @param options The shared adapter, model, logger, backend, and default limits.
+ * @param options The shared caller, model, logger, backend, and default limits.
  * @returns A stable library client that can execute many RLM runs over time.
  *
  * @example
  * ```ts
  * const client = createRLM({
- *   adapter,
+ *   llm,
  *   models: { root: 'gpt-5-nano', sub: 'gpt-5-mini' },
  * });
  *
@@ -305,6 +327,7 @@ export function createRLM(options: RLMClientOptions): RLMClient {
         context: input.context,
         executionBackend: options.executionBackend,
         idGenerator: options.idGenerator,
+        llm: options.llm,
         logger: options.logger,
         maxSteps: resolveRunLimit(input.maxSteps, defaults.maxSteps!),
         maxSubcallDepth: resolveRunLimit(input.maxSubcallDepth, defaults.maxSubcallDepth!),
@@ -321,7 +344,9 @@ export function createRLM(options: RLMClientOptions): RLMClient {
  * Builds the OpenAI-backed convenience client from explicit provider arguments.
  *
  * This helper is meant for library consumers who want explicit provider configuration
- * without manually constructing an adapter.
+ * without manually constructing a caller.
+ * In this provider-backed path, `defaults.cellTimeoutMs` is interpreted as additional
+ * REPL cell budget on top of the provider request timeout.
  *
  * @param options Explicit OpenAI configuration plus optional logger, backend, and defaults.
  * @returns An `RLMClient` configured to use the OpenAI Responses API.
@@ -340,15 +365,19 @@ export function createRLM(options: RLMClientOptions): RLMClient {
  * ```
  */
 export function createOpenAIRLM(options: OpenAIRLMClientOptions): RLMClient {
-  return createRLM({
-    adapter: new OpenAIResponsesAdapter({
-      config: options.openAI,
-      fetcher: options.fetcher,
-    }),
+  const provider = new OpenAIResponsesProvider({
+    fetcher: options.fetcher,
+  });
+  const defaultAdditionalCellTimeoutMs = options.defaults?.cellTimeoutMs ?? DEFAULT_CELL_TIMEOUT_MS;
+  const baseClient = createRLM({
+    llm: provider.createCaller(options.openAI),
     clock: options.clock,
     defaults: {
-      cellTimeoutMs: options.defaults?.cellTimeoutMs ??
-        Math.max(DEFAULT_CELL_TIMEOUT_MS, options.openAI.requestTimeoutMs),
+      cellTimeoutMs: resolveProviderAwareCellTimeoutMs(
+        undefined,
+        options.openAI.requestTimeoutMs,
+        defaultAdditionalCellTimeoutMs,
+      ),
       maxSteps: options.defaults?.maxSteps,
       maxSubcallDepth: options.defaults?.maxSubcallDepth,
       outputCharLimit: options.defaults?.outputCharLimit,
@@ -361,6 +390,20 @@ export function createOpenAIRLM(options: OpenAIRLMClientOptions): RLMClient {
       sub: options.openAI.subModel,
     },
   });
+
+  return {
+    run: async (input) =>
+      await baseClient.run({
+        ...input,
+        cellTimeoutMs: input.cellTimeoutMs === undefined
+          ? undefined
+          : resolveProviderAwareCellTimeoutMs(
+            input.cellTimeoutMs,
+            options.openAI.requestTimeoutMs,
+            defaultAdditionalCellTimeoutMs,
+          ),
+      }),
+  };
 }
 
 /**
@@ -374,7 +417,7 @@ export function createOpenAIRLM(options: OpenAIRLMClientOptions): RLMClient {
  * @example
  * ```ts
  * const result = await runRLM({
- *   adapter,
+ *   llm,
  *   context: { document: 'Chapter 1\\nThe answer is 42.' },
  *   prompt: 'Extract the answer.',
  *   rootModel: 'gpt-5-nano',
@@ -427,6 +470,7 @@ export async function runOpenAIRLM(options: RunOpenAIRLMOptions): Promise<RLMRun
     (options.openAI === undefined ? loadRLMConfig() : {
       openAI: options.openAI,
       runtime: {
+        cellTimeoutMs: DEFAULT_CELL_TIMEOUT_MS,
         maxSteps: DEFAULT_MAX_STEPS,
         maxSubcallDepth: DEFAULT_MAX_SUBCALL_DEPTH,
         outputCharLimit: DEFAULT_OUTPUT_CHAR_LIMIT,
@@ -436,8 +480,7 @@ export async function runOpenAIRLM(options: RunOpenAIRLMOptions): Promise<RLMRun
   const client = createOpenAIRLM({
     clock: options.clock,
     defaults: {
-      cellTimeoutMs: options.cellTimeoutMs ??
-        Math.max(DEFAULT_CELL_TIMEOUT_MS, loaded.openAI.requestTimeoutMs),
+      cellTimeoutMs: loaded.runtime.cellTimeoutMs,
       maxSteps: options.maxSteps ?? loaded.runtime.maxSteps,
       maxSubcallDepth: options.maxSubcallDepth ?? loaded.runtime.maxSubcallDepth,
       outputCharLimit: options.outputCharLimit ?? loaded.runtime.outputCharLimit,
@@ -472,6 +515,7 @@ export async function runOpenAIRLM(options: RunOpenAIRLMOptions): Promise<RLMRun
  */
 async function runRLMInternal(options: InternalRLMRunOptions): Promise<RLMRunResult> {
   throwIfAborted(options.signal);
+  const llm = resolveRLMCaller(options.llm, options.adapter);
   const clock = options.clock ?? (() => new Date());
   const transcript: Parameters<typeof buildRLMTurnInput>[0]['transcript'] = [];
   const role = resolveControllerRole(options.depth);
@@ -490,7 +534,8 @@ async function runRLMInternal(options: InternalRLMRunOptions): Promise<RLMRunRes
     idGenerator: options.idGenerator,
     logger: options.logger,
     llmQueryHandler: createLLMQueryHandler({
-      adapter: options.adapter,
+      currentDepth: options.depth,
+      llm,
       onComplete: ({ usage }) => {
         recordUsage(usageSummary, options.subModel, usage);
       },
@@ -514,41 +559,48 @@ async function runRLMInternal(options: InternalRLMRunOptions): Promise<RLMRunRes
           signal: request.signal,
           subModel: request.subModel,
         });
-        mergeUsageSummaries(usageSummary, nested.usage);
+        try {
+          mergeUsageSummaries(usageSummary, nested.usage);
 
-        await appendSubqueryEntry(options.logger, {
-          answer: resolveSubqueryAnswerValue(nested),
-          createdAt: clock().toISOString(),
-          depth: request.depth,
-          journalPath: getLoggerJournalPath(request.logger),
-          model: request.rootModel,
-          prompt: request.prompt,
-          steps: nested.steps,
-          type: 'subquery',
-        });
+          await appendSubqueryEntry(options.logger, {
+            answer: resolveSubqueryAnswerValue(nested),
+            createdAt: clock().toISOString(),
+            depth: request.depth,
+            journalPath: getLoggerJournalPath(request.logger),
+            model: request.rootModel,
+            prompt: request.prompt,
+            steps: nested.steps,
+            type: 'subquery',
+          });
 
-        return {
-          answer: nested.answer,
-          steps: nested.steps,
-          usage: nested.usage,
-          value: nested.finalValue,
-        };
+          return {
+            answer: nested.answer,
+            steps: nested.steps,
+            usage: nested.usage,
+            value: nested.finalValue,
+          };
+        } finally {
+          await nested.session.close();
+        }
       },
       subModel: options.subModel,
     }),
   });
+  let turnState: unknown = undefined;
 
   for (let index = 0; index < options.maxSteps; index += 1) {
     throwIfAborted(options.signal);
     const step = index + 1;
     const baseInput = buildRLMTurnInput({
       context: options.context,
+      currentStep: step,
       outputCharLimit: options.outputCharLimit,
       prompt: options.prompt,
       role,
+      totalSteps: options.maxSteps,
       transcript,
     });
-    let completion: LLMCompletionResponse | null = null;
+    let completion: LLMCallerResponse | null = null;
     let codeBlocks: ReplCodeBlock[] = [];
     let finalSignal: FinalSignal | null = null;
 
@@ -560,20 +612,26 @@ async function runRLMInternal(options: InternalRLMRunOptions): Promise<RLMRunRes
 
     for (let attempt = 0; attempt < recoveryPrompts.length; attempt += 1) {
       const input = recoveryPrompts[attempt]!;
-      completion = await options.adapter.complete({
+      completion = await llm.complete({
         input,
+        kind: role === 'root' ? 'root_turn' : 'child_turn',
+        metadata: {
+          depth: options.depth,
+          step,
+        },
         model: options.rootModel,
         signal: options.signal,
         systemPrompt,
+        turnState,
       });
       throwIfAborted(options.signal);
       recordUsage(usageSummary, options.rootModel, completion.usage);
+      turnState = completion.turnState;
 
       await appendAssistantTurnEntry(options.logger, {
         assistantText: completion.outputText,
         createdAt: clock().toISOString(),
         model: options.rootModel,
-        responseId: completion.responseId,
         step,
         type: 'assistant_turn',
       });
@@ -588,7 +646,6 @@ async function runRLMInternal(options: InternalRLMRunOptions): Promise<RLMRunRes
         return {
           answer: finalSignal.value,
           finalValue: finalSignal.value,
-          responseId: completion.responseId,
           session,
           steps: step,
           usage: cloneUsageSummary(usageSummary),
@@ -630,7 +687,6 @@ async function runRLMInternal(options: InternalRLMRunOptions): Promise<RLMRunRes
         return {
           answer: execution.finalAnswer,
           finalValue: extractFinalJsonValue(execution.finalResult),
-          responseId: completion.responseId,
           session,
           steps: step,
           usage: cloneUsageSummary(usageSummary),
@@ -655,6 +711,8 @@ async function runRLMInternal(options: InternalRLMRunOptions): Promise<RLMRunRes
 export const __rlmRunnerTestables = {
   extractFinalJsonValue,
   resolveControllerRole,
+  resolveProviderAwareCellTimeoutMs,
+  resolveRLMCaller,
   resolveOpenAIRunLogger,
   resolveRunLimit,
   resolveSubqueryAnswerValue,

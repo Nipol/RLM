@@ -1,19 +1,36 @@
+import { createServer } from 'node:http';
 import { isAbsolute, join, resolve } from 'node:path';
 
-import { loadRLMConfig } from '../env.ts';
+import { loadProviderRequestTimeoutMs, loadRLMConfig, loadRLMRuntimeConfig } from '../env.ts';
+import type { LLMCaller } from '../llm_adapter.ts';
 import { JsonlFileLogger } from '../logger.ts';
-import { OpenAIResponsesAdapter } from '../openai_adapter.ts';
-import { runOpenAIRLM } from '../rlm_runner.ts';
-import type { RunOpenAIRLMOptions } from '../rlm_runner.ts';
+import { OpenAIResponsesProvider } from '../openai_adapter.ts';
+import { estimateOpenAIRunCostUsd } from '../openai_pricing.ts';
+import {
+  type CodexOAuthAuthorizationCodeResult,
+  type CodexOAuthAuthorizationReceiver,
+  type CodexOAuthAuthorizationSession,
+  CodexOAuthProvider,
+  extractAuthorizationCodeFromCallbackUrl,
+} from '../providers/codex_oauth.ts';
+import { runOpenAIRLM, runRLM } from '../rlm_runner.ts';
+import type { RLMRunOptions, RunOpenAIRLMOptions } from '../rlm_runner.ts';
 import type {
   AssistantTurnEntry,
   CellEntry,
   JournalEntry,
   JsonValue,
   RLMLogger,
+  RLMUsageSummary,
   SessionEntry,
+  StandaloneErrorEntry,
   SubqueryEntry,
 } from '../types.ts';
+
+/**
+ * Identifies which standalone provider bootstrap path should be used.
+ */
+export type StandaloneProviderName = 'codex-oauth' | 'openai';
 
 /**
  * Captures the required command-line arguments for the standalone runner.
@@ -28,10 +45,17 @@ import type {
  * ```
  */
 export interface ParsedStandaloneCLIArgs {
-  inputPath: string;
+  cellTimeoutMs?: number;
+  inputPath?: string;
+  listModels?: boolean;
+  login?: boolean;
   logPath?: string;
-  query: string;
-  systemPromptPath: string;
+  provider: StandaloneProviderName;
+  query?: string;
+  requestTimeoutMs?: number;
+  rootModel?: string;
+  subModel?: string;
+  systemPromptPath?: string;
 }
 
 /**
@@ -48,10 +72,38 @@ export interface ParsedStandaloneCLIArgs {
  * ```
  */
 export interface ResolvedStandaloneCLIOptions {
-  inputPath: string;
+  cellTimeoutMs?: number;
+  inputPath?: string;
+  listModels?: boolean;
+  login?: boolean;
   logPath: string;
-  query: string;
-  systemPromptPath: string;
+  provider: StandaloneProviderName;
+  query?: string;
+  requestTimeoutMs?: number;
+  rootModel?: string;
+  subModel?: string;
+  systemPromptPath?: string;
+}
+
+interface StandaloneRunResult {
+  answer: string;
+  finalValue?: JsonValue | null;
+  session?: {
+    close?(): Promise<void> | void;
+  };
+  usage?: RLMUsageSummary;
+}
+
+interface StandaloneCodexOAuthProviderLike {
+  createCaller(config?: { requestTimeoutMs?: number }): Pick<LLMCaller, 'complete'>;
+  listModels(): Promise<string[]>;
+  login(
+    options?: {
+      force?: boolean;
+      onAuthUrl?: (url: string) => void | Promise<void>;
+      receiveAuthorizationCode?: CodexOAuthAuthorizationReceiver;
+    },
+  ): Promise<unknown>;
 }
 
 /**
@@ -66,25 +118,25 @@ export interface ResolvedStandaloneCLIOptions {
  * ```
  */
 export interface StandaloneCLIDependencies {
-  adapter?: {
-    complete(request: {
-      input: string;
-      model: string;
-      systemPrompt: string;
-    }): Promise<{ outputText: string }>;
-  };
   clock?: () => Date;
+  createCodexOAuthProvider?: () => StandaloneCodexOAuthProviderLike;
   cwd?: string;
+  /**
+   * @deprecated Use `llm`.
+   */
+  adapter?: Pick<LLMCaller, 'complete'>;
+  fetcher?: typeof fetch;
+  llm?: Pick<LLMCaller, 'complete'>;
+  readLoginLine?: (signal?: AbortSignal) => Promise<string | null>;
   readTextFile?: typeof Deno.readTextFile;
+  receiveLoopbackAuthorizationCode?: (
+    session: CodexOAuthAuthorizationSession,
+    signal?: AbortSignal,
+  ) => Promise<CodexOAuthAuthorizationCodeResult>;
   render?: (input: StandaloneFinalRenderInput) => Promise<string>;
   rootModel?: string;
-  run?: (options: RunOpenAIRLMOptions) => Promise<{
-    answer: string;
-    finalValue?: JsonValue | null;
-    session?: {
-      close?(): Promise<void> | void;
-    };
-  }>;
+  run?: (options: RunOpenAIRLMOptions) => Promise<StandaloneRunResult>;
+  runGeneric?: (options: RLMRunOptions) => Promise<StandaloneRunResult>;
   writeLine?: (line: string) => void;
 }
 
@@ -116,10 +168,210 @@ function resolveStandaloneReadTextFile(
   return readTextFile ?? Deno.readTextFile;
 }
 
+function resolveStandaloneReadLoginLine(
+  readLoginLine: StandaloneCLIDependencies['readLoginLine'],
+): NonNullable<StandaloneCLIDependencies['readLoginLine']> {
+  return readLoginLine ?? readStandaloneLoginLine;
+}
+
+async function readStandaloneLoginLine(signal?: AbortSignal): Promise<string | null> {
+  const reader = Deno.stdin.readable
+    .pipeThrough(new TextDecoderStream())
+    .getReader();
+  const abortHandler = () => {
+    void reader.cancel(new DOMException('Aborted', 'AbortError'));
+  };
+  signal?.addEventListener('abort', abortHandler, { once: true });
+
+  let buffer = '';
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        const finalValue = buffer.replace(/\r$/u, '');
+        return finalValue.length > 0 ? finalValue : null;
+      }
+
+      buffer += value;
+      const newlineIndex = buffer.indexOf('\n');
+      if (newlineIndex >= 0) {
+        return buffer.slice(0, newlineIndex).replace(/\r$/u, '');
+      }
+    }
+  } finally {
+    signal?.removeEventListener('abort', abortHandler);
+    reader.releaseLock();
+  }
+}
+
+async function receiveStandaloneLoopbackAuthorizationCode(
+  session: CodexOAuthAuthorizationSession,
+  signal?: AbortSignal,
+  serverFactory: typeof createServer = createServer,
+): Promise<CodexOAuthAuthorizationCodeResult> {
+  return await new Promise<CodexOAuthAuthorizationCodeResult>((resolve, reject) => {
+    let settled = false;
+    const sockets = new Set<{
+      destroy(): void;
+      once(event: 'close', listener: () => void): void;
+    }>();
+
+    const finish = (
+      action: 'reject' | 'resolve',
+      value: CodexOAuthAuthorizationCodeResult | Error | DOMException,
+    ) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      signal?.removeEventListener('abort', abortHandler);
+
+      for (const socket of sockets) {
+        socket.destroy();
+      }
+
+      server.close(() => {
+        if (action === 'resolve') {
+          resolve(value as CodexOAuthAuthorizationCodeResult);
+          return;
+        }
+
+        reject(value);
+      });
+    };
+
+    const server = serverFactory((request, response) => {
+      const fullUrl = new URL(
+        request.url ?? '/',
+        `http://${request.headers.host ?? `127.0.0.1:${session.callbackPort}`}`,
+      );
+      const callback = extractAuthorizationCodeFromCallbackUrl(fullUrl.toString());
+
+      if (callback === null) {
+        response.writeHead(202, {
+          'Content-Type': 'text/plain; charset=utf-8',
+        });
+        response.end(
+          'Codex OAuth callback is waiting for the final code and state. Return to the browser login and try again, or paste the full callback URL into the CLI.',
+        );
+        return;
+      }
+
+      response.writeHead(200, {
+        'Content-Type': 'text/plain; charset=utf-8',
+      });
+      response.end(
+        'Codex OAuth login complete. You can close this tab and return to the CLI.',
+        () => finish('resolve', callback),
+      );
+    });
+
+    server.on('connection', (socket) => {
+      sockets.add(socket);
+      socket.once('close', () => {
+        sockets.delete(socket);
+      });
+    });
+
+    const abortHandler = () => {
+      finish('reject', new DOMException('Aborted', 'AbortError'));
+    };
+    signal?.addEventListener('abort', abortHandler, { once: true });
+
+    server.on('error', (error) => {
+      signal?.removeEventListener('abort', abortHandler);
+      if (settled) {
+        return;
+      }
+      settled = true;
+      reject(error);
+    });
+    server.listen(session.callbackPort, '127.0.0.1');
+  });
+}
+
+function createStandaloneCodexOAuthAuthorizationReceiver(
+  options: {
+    readLoginLine?: StandaloneCLIDependencies['readLoginLine'];
+    receiveLoopbackAuthorizationCode?:
+      StandaloneCLIDependencies['receiveLoopbackAuthorizationCode'];
+    writeLine?: (line: string) => void;
+  } = {},
+): CodexOAuthAuthorizationReceiver {
+  const writeLine = resolveStandaloneWriteLine(options.writeLine);
+  const readLoginLine = resolveStandaloneReadLoginLine(options.readLoginLine);
+  const receiveLoopbackAuthorizationCode = options.receiveLoopbackAuthorizationCode ??
+    receiveStandaloneLoopbackAuthorizationCode;
+
+  return async (session) => {
+    writeLine(`[login] waiting for callback: ${session.redirectUri}`);
+    writeLine(
+      '[login] 브라우저가 자동으로 완료되지 않으면 최종 callback URL 전체를 이 터미널에 붙여넣고 Enter를 누르세요.',
+    );
+
+    const controller = new AbortController();
+    const readPastedCallback = async (): Promise<CodexOAuthAuthorizationCodeResult> => {
+      while (true) {
+        const pastedValue = await readLoginLine(controller.signal);
+        if (pastedValue === null) {
+          throw new DOMException('Aborted', 'AbortError');
+        }
+
+        const callback = extractAuthorizationCodeFromCallbackUrl(pastedValue.trim());
+        if (callback !== null) {
+          return callback;
+        }
+
+        writeLine(
+          '[login] 붙여넣은 값에 code 와 state 가 없습니다. 브라우저가 연 최종 callback URL 전체를 붙여넣어 주세요.',
+        );
+      }
+    };
+
+    const swallowAbortError = async <T>(promise: Promise<T>): Promise<void> => {
+      try {
+        await promise;
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') {
+          return;
+        }
+      }
+    };
+
+    const loopbackPromise = receiveLoopbackAuthorizationCode(session, controller.signal);
+    const pastedPromise = readPastedCallback();
+
+    try {
+      const result = await Promise.race([loopbackPromise, pastedPromise]);
+      controller.abort();
+      await Promise.all([
+        swallowAbortError(loopbackPromise),
+        swallowAbortError(pastedPromise),
+      ]);
+      return result;
+    } finally {
+      controller.abort();
+    }
+  };
+}
+
 function resolveStandaloneRun(
   run: StandaloneCLIDependencies['run'],
 ): NonNullable<StandaloneCLIDependencies['run']> {
   return run ?? runOpenAIRLM;
+}
+
+function resolveStandaloneGenericRun(
+  run: StandaloneCLIDependencies['runGeneric'],
+): NonNullable<StandaloneCLIDependencies['runGeneric']> {
+  return run ?? runRLM;
+}
+
+function resolveCodexOAuthProvider(
+  createProvider: StandaloneCLIDependencies['createCodexOAuthProvider'],
+): StandaloneCodexOAuthProviderLike {
+  return createProvider?.() ?? new CodexOAuthProvider();
 }
 
 function resolveStandaloneWriteLine(
@@ -135,6 +387,7 @@ function resolveStandaloneRender(
     (async (input: StandaloneFinalRenderInput) =>
       await renderStandaloneFinalAnswer(input, {
         adapter: dependencies.adapter,
+        llm: dependencies.llm,
         rootModel: dependencies.rootModel,
       }));
 }
@@ -168,6 +421,65 @@ function resolveStandalonePath(path: string, cwd: string): string {
   return isAbsolute(path) ? path : resolve(cwd, path);
 }
 
+function pickPreferredModel(
+  models: string[],
+  preferred: string[],
+): string | undefined {
+  for (const candidate of preferred) {
+    if (models.includes(candidate)) {
+      return candidate;
+    }
+  }
+
+  return models[0];
+}
+
+function resolveCodexOAuthModels(
+  availableModels: string[],
+  overrides: {
+    rootModel?: string;
+    subModel?: string;
+  },
+): { rootModel: string; subModel: string } {
+  const ensureExactModel = (requestedModel: string | undefined): string | undefined => {
+    if (requestedModel === undefined) {
+      return undefined;
+    }
+
+    if (availableModels.includes(requestedModel)) {
+      return requestedModel;
+    }
+
+    throw new Error(
+      [
+        `Requested Codex model is unavailable: ${requestedModel}.`,
+        'Configure an exact model id from the current profile catalog.',
+        `Available models: ${[...availableModels].sort().join(', ')}`,
+      ].join(' '),
+    );
+  };
+
+  const rootModel = ensureExactModel(overrides.rootModel) ??
+    pickPreferredModel(
+      availableModels,
+      ['gpt-5-4-t-mini', 'gpt-5-mini', 'gpt-5-4-thinking', 'gpt-5', 'gpt-5-3'],
+    );
+  if (rootModel === undefined) {
+    throw new Error('Codex OAuth provider did not return any usable models.');
+  }
+
+  const subModel = (ensureExactModel(overrides.subModel) ??
+    pickPreferredModel(
+      availableModels,
+      ['gpt-5-3-instant', 'gpt-5-t-mini', rootModel, 'gpt-5-mini', 'gpt-5-2-instant'],
+    ))!;
+
+  return {
+    rootModel,
+    subModel,
+  };
+}
+
 /**
  * Narrows an arbitrary journal entry to a session header entry.
  */
@@ -196,6 +508,10 @@ function isSubqueryEntry(entry: JournalEntry): entry is SubqueryEntry {
   return entry.type === 'subquery';
 }
 
+function isStandaloneErrorEntry(entry: JournalEntry): entry is StandaloneErrorEntry {
+  return entry.type === 'standalone_error';
+}
+
 /**
  * Summarizes one captured final answer so long multiline values do not flood progress output.
  */
@@ -212,12 +528,39 @@ function formatStandaloneFinalSuffix(finalAnswer: string | null): string {
 }
 
 /**
+ * Combines the provider request timeout with extra REPL cell slack for standalone runs.
+ *
+ * The CLI treats `--cell-timeout-ms` as additional time beyond the provider request timeout
+ * so cells that await one model call do not timeout before the provider request itself.
+ *
+ * @example
+ * ```ts
+ * const totalCellTimeoutMs = resolveStandaloneCellTimeoutMs(15_000, 30_000, 5_000);
+ * // 45_000
+ * ```
+ */
+function resolveStandaloneCellTimeoutMs(
+  additionalTimeoutMs: number | undefined,
+  providerRequestTimeoutMs: number,
+  defaultAdditionalTimeoutMs: number,
+): number {
+  return providerRequestTimeoutMs + (additionalTimeoutMs ?? defaultAdditionalTimeoutMs);
+}
+
+/**
  * Parses standalone CLI flags into a typed argument object.
  *
  * Supported flags:
+ * - `--provider <openai|codex-oauth>` (optional)
+ * - `--login` (Codex OAuth only)
+ * - `--list-models` (Codex OAuth only)
  * - `--input <path>`
  * - `--query <text>`
  * - `--system-prompt <path>`
+ * - `--root-model <model>` (optional)
+ * - `--sub-model <model>` (optional)
+ * - `--request-timeout-ms <milliseconds>` (optional)
+ * - `--cell-timeout-ms <milliseconds>` (optional)
  * - `--log <path>` (optional)
  *
  * @example
@@ -233,11 +576,37 @@ function formatStandaloneFinalSuffix(finalAnswer: string | null): string {
  * ```
  */
 export function parseStandaloneCLIArgs(args: string[]): ParsedStandaloneCLIArgs {
-  const values: Partial<ParsedStandaloneCLIArgs> = {};
+  const values: Partial<ParsedStandaloneCLIArgs> = {
+    provider: 'openai',
+  };
 
   for (let index = 0; index < args.length; index += 1) {
     const flag = args[index];
     const value = args[index + 1];
+
+    if (flag === '--provider') {
+      if (value === undefined) {
+        throw new Error('Missing value for --provider.');
+      }
+
+      if (value !== 'openai' && value !== 'codex-oauth') {
+        throw new Error(`Unknown provider: ${value}`);
+      }
+
+      values.provider = value;
+      index += 1;
+      continue;
+    }
+
+    if (flag === '--login') {
+      values.login = true;
+      continue;
+    }
+
+    if (flag === '--list-models') {
+      values.listModels = true;
+      continue;
+    }
 
     if (flag === '--input') {
       if (value === undefined) {
@@ -275,14 +644,72 @@ export function parseStandaloneCLIArgs(args: string[]): ParsedStandaloneCLIArgs 
       continue;
     }
 
+    if (flag === '--cell-timeout-ms') {
+      if (value === undefined) {
+        throw new Error('Missing value for --cell-timeout-ms.');
+      }
+
+      if (!/^[0-9]+$/u.test(value)) {
+        throw new Error('--cell-timeout-ms must be a positive integer.');
+      }
+
+      const parsedTimeout = Number.parseInt(value, 10);
+      if (parsedTimeout <= 0) {
+        throw new Error('--cell-timeout-ms must be a positive integer.');
+      }
+
+      values.cellTimeoutMs = parsedTimeout;
+      index += 1;
+      continue;
+    }
+
+    if (flag === '--request-timeout-ms') {
+      if (value === undefined) {
+        throw new Error('Missing value for --request-timeout-ms.');
+      }
+
+      if (!/^[0-9]+$/u.test(value)) {
+        throw new Error('--request-timeout-ms must be a positive integer.');
+      }
+
+      const parsedTimeout = Number.parseInt(value, 10);
+      if (parsedTimeout <= 0) {
+        throw new Error('--request-timeout-ms must be a positive integer.');
+      }
+
+      values.requestTimeoutMs = parsedTimeout;
+      index += 1;
+      continue;
+    }
+
+    if (flag === '--root-model') {
+      if (value === undefined) {
+        throw new Error('Missing value for --root-model.');
+      }
+      values.rootModel = value;
+      index += 1;
+      continue;
+    }
+
+    if (flag === '--sub-model') {
+      if (value === undefined) {
+        throw new Error('Missing value for --sub-model.');
+      }
+      values.subModel = value;
+      index += 1;
+      continue;
+    }
+
     throw new Error(`Unknown CLI flag: ${flag}`);
   }
 
-  if (
-    values.inputPath === undefined || values.query === undefined ||
-    values.systemPromptPath === undefined
-  ) {
-    throw new Error('Missing required CLI flags: --input, --query, --system-prompt.');
+  if (values.login !== true && values.listModels !== true) {
+    if (
+      values.inputPath === undefined || values.query === undefined ||
+      values.systemPromptPath === undefined
+    ) {
+      throw new Error('Missing required CLI flags: --input, --query, --system-prompt.');
+    }
   }
 
   return values as ParsedStandaloneCLIArgs;
@@ -334,17 +761,31 @@ export function resolveStandaloneCLIOptions(
 ): ResolvedStandaloneCLIOptions {
   const cwd = options.cwd ?? Deno.cwd();
   return {
-    inputPath: resolveStandalonePath(args.inputPath, cwd),
+    cellTimeoutMs: args.cellTimeoutMs,
+    inputPath: args.inputPath === undefined
+      ? undefined
+      : resolveStandalonePath(args.inputPath, cwd),
+    listModels: args.listModels,
+    login: args.login,
     logPath: args.logPath === undefined
       ? createStandaloneLogPath({ clock: options.clock, cwd })
       : resolveStandalonePath(args.logPath, cwd),
+    provider: args.provider,
     query: args.query,
-    systemPromptPath: resolveStandalonePath(args.systemPromptPath, cwd),
+    requestTimeoutMs: args.requestTimeoutMs,
+    rootModel: args.rootModel,
+    subModel: args.subModel,
+    systemPromptPath: args.systemPromptPath === undefined
+      ? undefined
+      : resolveStandalonePath(args.systemPromptPath, cwd),
   };
 }
 
 /**
  * Wraps any logger with user-facing progress lines for standalone execution.
+ *
+ * The returned logger preserves journal persistence while also emitting concise
+ * session, step, subquery, and standalone error lines for the terminal UI.
  *
  * @example
  * ```ts
@@ -390,6 +831,11 @@ export function createStandaloneProgressLogger(
 
       if (isSubqueryEntry(entry)) {
         writeLine(`[step ${currentStep}] subquery depth=${entry.depth} steps=${entry.steps}`);
+        return;
+      }
+
+      if (isStandaloneErrorEntry(entry)) {
+        writeLine(`[error] ${entry.stage}: ${entry.message}`);
       }
     },
     close: async () => {
@@ -401,6 +847,9 @@ export function createStandaloneProgressLogger(
 
 /**
  * Renders the final user-facing standalone answer with the external system prompt file.
+ *
+ * When no `llm` or `adapter` dependency is supplied, this helper boots the
+ * default OpenAI Responses caller from the local `.env`-backed config.
  *
  * @example
  * ```ts
@@ -415,13 +864,14 @@ export function createStandaloneProgressLogger(
  */
 export async function renderStandaloneFinalAnswer(
   input: StandaloneFinalRenderInput,
-  dependencies: Pick<StandaloneCLIDependencies, 'adapter' | 'rootModel'> = {},
+  dependencies: Pick<StandaloneCLIDependencies, 'adapter' | 'fetcher' | 'llm' | 'rootModel'> = {},
 ): Promise<string> {
-  const adapter = dependencies.adapter ?? new OpenAIResponsesAdapter({
-    config: loadRLMConfig().openAI,
-  });
+  const llm = dependencies.llm ?? dependencies.adapter ??
+    new OpenAIResponsesProvider({
+      fetcher: dependencies.fetcher,
+    }).createCaller(loadRLMConfig().openAI);
   const model = dependencies.rootModel ?? loadRLMConfig().openAI.rootModel;
-  const response = await adapter.complete({
+  const response = await llm.complete({
     input: [
       'User query:',
       input.query,
@@ -437,6 +887,10 @@ export async function renderStandaloneFinalAnswer(
       '',
       'Write the final user-facing answer now.',
     ].join('\n'),
+    kind: 'plain_query',
+    metadata: {
+      depth: 0,
+    },
     model,
     systemPrompt: input.systemPrompt,
   });
@@ -444,9 +898,74 @@ export async function renderStandaloneFinalAnswer(
   return response.outputText.trim();
 }
 
+function createStandaloneFetchLogger(
+  writeLine: (line: string) => void,
+  fetcher: typeof fetch = fetch,
+): typeof fetch {
+  return async (input, init) => {
+    const requestInit = init as RequestInit | undefined;
+    const method = String(requestInit?.method ?? 'GET').toUpperCase();
+    const url = typeof input === 'string'
+      ? input
+      : input instanceof URL
+      ? input.toString()
+      : input.url;
+    writeLine(`[https] ${method} ${url}`);
+    const body = requestInit?.body;
+    if (body !== undefined && body !== null) {
+      if (typeof body === 'string') {
+        writeLine(`[https-body] ${body}`);
+      } else {
+        writeLine('[https-body] <non-text body>');
+      }
+    }
+    return await fetcher(input, init);
+  };
+}
+
+function formatUsd(value: number): string {
+  return `$${value.toFixed(6)}`;
+}
+
+function buildStandaloneUsageLines(usage: RLMUsageSummary | undefined): string[] {
+  if (usage === undefined) {
+    return [];
+  }
+
+  const lines = [
+    `[usage] input_tokens=${usage.inputTokens} output_tokens=${usage.outputTokens} total_tokens=${usage.totalTokens}`,
+  ];
+  const estimate = estimateOpenAIRunCostUsd(usage);
+  const inputCostUsd = estimate.byModel.reduce(
+    (sum, entry) => sum + entry.cachedInputCostUsd + entry.inputCostUsd,
+    0,
+  );
+  const outputCostUsd = estimate.byModel.reduce((sum, entry) => sum + entry.outputCostUsd, 0);
+
+  if (estimate.missingPricingModels.length > 0) {
+    lines.push(
+      `[cost] input_usd=n/a output_usd=n/a total_usd=n/a missing_pricing_models=${
+        estimate.missingPricingModels.join(', ')
+      }`,
+    );
+    return lines;
+  }
+
+  lines.push(
+    `[cost] input_usd=${formatUsd(inputCostUsd)} output_usd=${formatUsd(outputCostUsd)} total_usd=${
+      formatUsd(estimate.totalCostUsd)
+    }`,
+  );
+  return lines;
+}
+
 /**
- * Runs the standalone CLI workflow by loading one document, one system prompt file,
- * and one user query into the existing OpenAI-backed core runner.
+ * Runs the standalone CLI workflow for document QA, provider login, or model listing.
+ *
+ * Run mode loads one document, one system prompt file, and one user query, then
+ * delegates execution to the provider-neutral core runner. `openai` uses the
+ * OpenAI convenience path, while `codex-oauth` resolves exact catalog model ids
+ * and runs through a generic injected caller.
  *
  * @example
  * ```ts
@@ -458,23 +977,75 @@ export async function renderStandaloneFinalAnswer(
  *   '--system-prompt',
  *   './prompts/answer.txt',
  * ]);
+ *
+ * await runStandaloneCLI([
+ *   '--provider',
+ *   'codex-oauth',
+ *   '--login',
+ * ]);
  * ```
  */
 export async function runStandaloneCLI(
   args: string[],
   dependencies: StandaloneCLIDependencies = {},
 ): Promise<{ answer: string }> {
+  const cwd = dependencies.cwd ?? Deno.cwd();
+  const envPath = join(cwd, '.env');
   const parsed = parseStandaloneCLIArgs(args);
   const resolved = resolveStandaloneCLIOptions(parsed, {
     clock: dependencies.clock,
-    cwd: dependencies.cwd,
+    cwd,
   });
   const readTextFile = resolveStandaloneReadTextFile(dependencies.readTextFile);
-  const run = resolveStandaloneRun(dependencies.run);
-  const render = resolveStandaloneRender(dependencies);
   const writeLine = resolveStandaloneWriteLine(dependencies.writeLine);
-  const document = await readTextFile(resolved.inputPath);
-  const systemPrompt = await readTextFile(resolved.systemPromptPath);
+  const runOpenAI = resolveStandaloneRun(dependencies.run);
+  const runGeneric = resolveStandaloneGenericRun(dependencies.runGeneric);
+  const fetcher = dependencies.fetcher ?? fetch;
+
+  if (resolved.provider === 'codex-oauth' && resolved.login === true) {
+    const provider = dependencies.createCodexOAuthProvider?.() ??
+      new CodexOAuthProvider({
+        fetcher,
+      });
+    writeLine('[login] provider: codex-oauth');
+    await provider.login({
+      onAuthUrl: async (url) => {
+        writeLine(`[login] open: ${url}`);
+      },
+      receiveAuthorizationCode: createStandaloneCodexOAuthAuthorizationReceiver({
+        readLoginLine: dependencies.readLoginLine,
+        receiveLoopbackAuthorizationCode: dependencies.receiveLoopbackAuthorizationCode,
+        writeLine,
+      }),
+    });
+    writeLine('[login] success');
+
+    const models = await provider.listModels();
+    for (const model of models) {
+      writeLine(`[model] ${model}`);
+    }
+
+    return { answer: '' };
+  }
+
+  if (resolved.provider === 'codex-oauth' && resolved.listModels === true) {
+    const provider = dependencies.createCodexOAuthProvider?.() ??
+      new CodexOAuthProvider({
+        fetcher,
+      });
+    writeLine('[models] provider: codex-oauth');
+    const models = await provider.listModels();
+    for (const model of models) {
+      writeLine(`[model] ${model}`);
+    }
+    return { answer: '' };
+  }
+
+  const inputPath = resolved.inputPath!;
+  const query = resolved.query!;
+  const systemPromptPath = resolved.systemPromptPath!;
+  const document = await readTextFile(inputPath);
+  const systemPrompt = await readTextFile(systemPromptPath);
   const baseLogger = new JsonlFileLogger(resolved.logPath);
   const logger = createStandaloneProgressLogger({
     baseLogger,
@@ -486,32 +1057,115 @@ export async function runStandaloneCLI(
     }
     | undefined;
 
-  writeLine(`[standalone] input: ${resolved.inputPath}`);
-  writeLine(`[standalone] system prompt: ${resolved.systemPromptPath}`);
+  writeLine(`[standalone] provider: ${resolved.provider}`);
+  writeLine(`[standalone] input: ${inputPath}`);
+  writeLine(`[standalone] system prompt: ${systemPromptPath}`);
   writeLine(`[standalone] log: ${resolved.logPath}`);
 
   try {
-    const result = await run({
-      context: {
-        document,
-        inputFilePath: resolved.inputPath,
-      },
-      logger,
-      prompt: resolved.query,
-    });
-    resultSession = result.session;
-    const renderedAnswer = await render({
-      finalValue: result.finalValue,
-      inputFilePath: resolved.inputPath,
-      query: resolved.query,
-      rlmAnswer: result.answer,
+    const context = {
+      document,
+      inputFilePath: inputPath,
+    };
+    const result = resolved.provider === 'codex-oauth'
+      ? await (async () => {
+        const runtime = loadRLMRuntimeConfig({ path: envPath });
+        const requestTimeoutMs = resolved.requestTimeoutMs ??
+          loadProviderRequestTimeoutMs({ path: envPath });
+        const provider = dependencies.createCodexOAuthProvider?.() ??
+          new CodexOAuthProvider({
+            fetcher,
+          });
+        const availableModels = await provider.listModels();
+        const models = resolveCodexOAuthModels(availableModels, {
+          rootModel: resolved.rootModel,
+          subModel: resolved.subModel,
+        });
+        const llm = provider.createCaller({
+          requestTimeoutMs,
+        });
+        const cellTimeoutMs = resolveStandaloneCellTimeoutMs(
+          resolved.cellTimeoutMs,
+          requestTimeoutMs,
+          runtime.cellTimeoutMs,
+        );
+        const render = dependencies.render ??
+          (async (input: StandaloneFinalRenderInput) =>
+            await renderStandaloneFinalAnswer(input, {
+              fetcher,
+              llm,
+              rootModel: models.rootModel,
+            }));
+
+        const runResult = await runGeneric({
+          cellTimeoutMs,
+          context,
+          llm,
+          logger,
+          prompt: query,
+          rootModel: models.rootModel,
+          subModel: models.subModel,
+        });
+
+        return { render, runResult };
+      })()
+      : await (async () => {
+        const needsProviderConfig = dependencies.run === undefined ||
+          dependencies.render === undefined ||
+          resolved.requestTimeoutMs !== undefined;
+        const config = needsProviderConfig ? loadRLMConfig({ path: envPath }) : undefined;
+        const requestTimeoutMs = resolved.requestTimeoutMs ?? config?.openAI.requestTimeoutMs;
+        const effectiveConfig = config === undefined ? undefined : {
+          ...config,
+          openAI: {
+            ...config.openAI,
+            requestTimeoutMs: requestTimeoutMs as number,
+          },
+        };
+        const render = dependencies.render ??
+          (async (input: StandaloneFinalRenderInput) =>
+            await renderStandaloneFinalAnswer(input, {
+              fetcher,
+              llm: new OpenAIResponsesProvider({
+                fetcher,
+              }).createCaller(effectiveConfig!.openAI),
+              rootModel: effectiveConfig!.openAI.rootModel,
+            }));
+        const runResult = await runOpenAI({
+          cellTimeoutMs: resolved.cellTimeoutMs,
+          config: effectiveConfig,
+          context,
+          fetcher,
+          logger,
+          prompt: query,
+        });
+        return { render, runResult };
+      })();
+    resultSession = result.runResult.session;
+    const renderedAnswer = await result.render({
+      finalValue: result.runResult.finalValue,
+      inputFilePath: inputPath,
+      query,
+      rlmAnswer: result.runResult.answer,
       systemPrompt,
     });
 
     writeLine(`[final] ${renderedAnswer}`);
+    for (const usageLine of buildStandaloneUsageLines(result.runResult.usage)) {
+      writeLine(usageLine);
+    }
     return {
       answer: renderedAnswer,
     };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await logger.append({
+      createdAt: (dependencies.clock ?? (() => new Date()))().toISOString(),
+      message,
+      stage: 'run',
+      type: 'standalone_error',
+    });
+    throw error;
   } finally {
     await resultSession?.close?.();
     await logger.close?.();
@@ -519,9 +1173,18 @@ export async function runStandaloneCLI(
 }
 
 export const __standaloneCLITestables = {
+  buildStandaloneUsageLines,
+  createStandaloneCodexOAuthAuthorizationReceiver,
   closeStandaloneBaseLogger,
   formatStandaloneFinalSuffix,
   formatStandaloneTimestamp,
+  readStandaloneLoginLine,
+  receiveStandaloneLoopbackAuthorizationCode,
+  resolveCodexOAuthModels,
+  resolveCodexOAuthProvider,
+  resolveStandaloneGenericRun,
+  createStandaloneFetchLogger,
+  resolveStandaloneReadLoginLine,
   resolveStandaloneReadTextFile,
   resolveStandaloneRender,
   resolveStandaloneRun,

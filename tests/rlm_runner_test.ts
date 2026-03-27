@@ -1,12 +1,9 @@
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
 
+import { createDefaultExecutionBackend } from '../src/execution_backend.ts';
 import { loadJournal } from '../src/jsonl_journal.ts';
-import type {
-  LLMAdapter,
-  LLMCompletionRequest,
-  LLMCompletionResponse,
-} from '../src/llm_adapter.ts';
+import type { LLMCaller, LLMCallerRequest, LLMCallerResponse } from '../src/llm_adapter.ts';
 import {
   __rlmRunnerTestables,
   RLMMaxStepsError,
@@ -14,6 +11,7 @@ import {
   runOpenAIRLM,
   runRLM,
 } from '../src/rlm_runner.ts';
+import type { ExecutionBackend, PersistentRuntimeLike } from '../src/types.ts';
 
 function createClock(start = Date.parse('2026-03-24T00:00:00.000Z')): () => Date {
   let current = start;
@@ -34,15 +32,15 @@ async function createSessionPath(testName: string): Promise<string> {
   return join(root, testName, 'session.jsonl');
 }
 
-class MockAdapter implements LLMAdapter {
-  readonly requests: LLMCompletionRequest[] = [];
-  readonly #responses: LLMCompletionResponse[];
+class MockCaller implements LLMCaller {
+  readonly requests: LLMCallerRequest[] = [];
+  readonly #responses: LLMCallerResponse[];
 
-  constructor(responses: LLMCompletionResponse[]) {
+  constructor(responses: LLMCallerResponse[]) {
     this.#responses = [...responses];
   }
 
-  async complete(request: LLMCompletionRequest): Promise<LLMCompletionResponse> {
+  async complete(request: LLMCallerRequest): Promise<LLMCallerResponse> {
     this.requests.push(request);
     const next = this.#responses.shift();
     if (next === undefined) {
@@ -53,17 +51,41 @@ class MockAdapter implements LLMAdapter {
   }
 }
 
+class TrackingExecutionBackend implements ExecutionBackend {
+  readonly runtimes: Array<{ closeCalls: number; runtime: PersistentRuntimeLike }> = [];
+  readonly #delegate = createDefaultExecutionBackend();
+
+  createRuntime(
+    options: Parameters<ExecutionBackend['createRuntime']>[0],
+  ): PersistentRuntimeLike {
+    const runtime = this.#delegate.createRuntime(options);
+    const tracked = {
+      closeCalls: 0,
+      runtime,
+    };
+    this.runtimes.push(tracked);
+
+    return {
+      close: async () => {
+        tracked.closeCalls += 1;
+        await runtime.close?.();
+      },
+      execute: runtime.execute.bind(runtime),
+    };
+  }
+}
+
 Deno.test('runner executes a repl turn and returns the final answer captured inside the session', async () => {
-  const adapter = new MockAdapter([
+  const llm = new MockCaller([
     {
       outputText: '```repl\nconst answer = 6 * 7;\nFINAL_VAR(answer);\n```',
-      responseId: 'resp_root_1',
+      turnState: { conversation: 'root-1' },
     },
   ]);
 
   const journalPath = await createSessionPath('single-turn');
   const result = await runRLM({
-    adapter,
+    llm,
     clock: createClock(),
     context: { source: 'unit-test' },
     idGenerator: createIdGenerator(),
@@ -79,15 +101,60 @@ Deno.test('runner executes a repl turn and returns the final answer captured ins
   assert.equal(result.answer, '42');
   assert.equal(result.steps, 1);
   assert.equal(result.session.history.length, 1);
-  assert.equal(adapter.requests[0]?.model, 'gpt-5-nano');
+  assert.equal(llm.requests[0]?.model, 'gpt-5-nano');
+  assert.equal(llm.requests[0]?.kind, 'root_turn');
+  assert.equal('responseId' in result, false);
+});
+
+Deno.test('runner keeps provider turnState opaque and forwards it across root turns', async () => {
+  const llm = new MockCaller([
+    {
+      outputText: '```repl\nconst subtotal = 40 + 2;\nsubtotal\n```',
+      turnState: { opaque: 'root-1' },
+    },
+    {
+      outputText: '```repl\nFINAL_VAR(subtotal + 8);\n```',
+      turnState: { opaque: 'root-2' },
+    },
+  ]);
+
+  const result = await runRLM({
+    llm,
+    clock: createClock(),
+    context: null,
+    idGenerator: createIdGenerator(),
+    maxSteps: 3,
+    maxSubcallDepth: 1,
+    outputCharLimit: 120,
+    prompt: 'Add eight after the first computation.',
+    rootModel: 'gpt-5-nano',
+    subModel: 'gpt-5-mini',
+  });
+
+  assert.equal(result.answer, '50');
+  assert.match(llm.requests[0]?.input ?? '', /Step budget: 1 \/ 3/u);
+  assert.match(llm.requests[1]?.input ?? '', /Step budget: 2 \/ 3/u);
+  assert.equal(llm.requests[0]?.turnState, undefined);
+  assert.deepEqual(llm.requests[1]?.turnState, { opaque: 'root-1' });
 });
 
 Deno.test('runner helper utilities cover limit resolution, final acceptance, and abort handling', () => {
   assert.equal(__rlmRunnerTestables.resolveRunLimit(undefined, 12), 12);
   assert.equal(__rlmRunnerTestables.resolveRunLimit(5, 12), 5);
+  assert.equal(__rlmRunnerTestables.resolveProviderAwareCellTimeoutMs(undefined, 30_000), 35_000);
+  assert.equal(__rlmRunnerTestables.resolveProviderAwareCellTimeoutMs(undefined, 4_000), 9_000);
+  assert.equal(__rlmRunnerTestables.resolveProviderAwareCellTimeoutMs(45_000, 30_000), 75_000);
+  assert.equal(
+    __rlmRunnerTestables.resolveProviderAwareCellTimeoutMs(undefined, 30_000, 7_000),
+    37_000,
+  );
   assert.equal(__rlmRunnerTestables.resolveControllerRole(undefined), 'root');
   assert.equal(__rlmRunnerTestables.resolveControllerRole(0), 'root');
   assert.equal(__rlmRunnerTestables.resolveControllerRole(1), 'child');
+  assert.throws(
+    () => __rlmRunnerTestables.resolveRLMCaller(undefined, undefined),
+    /llm caller or legacy adapter/u,
+  );
 
   assert.equal(__rlmRunnerTestables.shouldAcceptExecutionFinalAnswer('success', '42'), true);
   assert.equal(__rlmRunnerTestables.shouldAcceptExecutionFinalAnswer('success', null), false);
@@ -139,14 +206,14 @@ Deno.test('runner resolves an explicit journal path into a logger when OpenAI co
 });
 
 Deno.test('runner feeds execution feedback into the next model turn so later code can build on it', async () => {
-  const adapter = new MockAdapter([
+  const adapter = new MockCaller([
     {
       outputText: '```repl\nconst subtotal = 40 + 2;\nsubtotal\n```',
-      responseId: 'resp_root_1',
+      turnState: 'resp_root_1',
     },
     {
       outputText: '```repl\nFINAL_VAR(subtotal + 8);\n```',
-      responseId: 'resp_root_2',
+      turnState: 'resp_root_2',
     },
   ]);
 
@@ -171,15 +238,15 @@ Deno.test('runner feeds execution feedback into the next model turn so later cod
 });
 
 Deno.test('runner carries exact nested result signals into the next turn so root can see propagated leaf values', async () => {
-  const adapter = new MockAdapter([
+  const adapter = new MockCaller([
     {
       outputText:
         '```repl\n({ operatorId: "op-7", routing: { lockerId: "locker-9", accessCode: "7318452", missingLockerId: undefined } })\n```',
-      responseId: 'resp_root_1',
+      turnState: 'resp_root_1',
     },
     {
       outputText: '```repl\nFINAL_VAR("done");\n```',
-      responseId: 'resp_root_2',
+      turnState: 'resp_root_2',
     },
   ]);
 
@@ -209,15 +276,15 @@ Deno.test('runner carries exact nested result signals into the next turn so root
 });
 
 Deno.test('runner routes llm_query through the sub-model as a plain completion without spawning a nested RLM journal', async () => {
-  const adapter = new MockAdapter([
+  const adapter = new MockCaller([
     {
       outputText:
         '```repl\nconst nested = await llm_query("Compute 6 * 7.");\nFINAL_VAR(nested.trim());\n```',
-      responseId: 'resp_root_1',
+      turnState: 'resp_root_1',
     },
     {
       outputText: '42',
-      responseId: 'resp_sub_1',
+      turnState: 'resp_sub_1',
     },
   ]);
 
@@ -251,14 +318,14 @@ Deno.test('runner routes llm_query through the sub-model as a plain completion w
 });
 
 Deno.test('runner retries once with a protocol recovery hint when the model returns no repl block', async () => {
-  const adapter = new MockAdapter([
+  const adapter = new MockCaller([
     {
       outputText: '',
-      responseId: 'resp_root_invalid',
+      turnState: 'resp_root_invalid',
     },
     {
       outputText: '```repl\nFINAL_VAR("42");\n```',
-      responseId: 'resp_root_recovered',
+      turnState: 'resp_root_recovered',
     },
   ]);
 
@@ -284,24 +351,24 @@ Deno.test('runner retries once with a protocol recovery hint when the model retu
 });
 
 Deno.test('runner surfaces delegated contract mismatches into the next turn so root can retry with a narrower contract', async () => {
-  const adapter = new MockAdapter([
+  const adapter = new MockCaller([
     {
       outputText:
         '```repl\nconst child = await rlm_query({ task: "Return an object containing vaultKey and approvalCount.", payload: [{ vaultKey: "V-554" }], expect: { vaultKey: "string", approvalCount: "number" } });\nFINAL_VAR(child.vaultKey);\n```',
-      responseId: 'resp_root_1',
+      turnState: 'resp_root_1',
     },
     {
       outputText: '```repl\nFINAL_VAR("V-554");\n```',
-      responseId: 'resp_sub_1',
+      turnState: 'resp_sub_1',
     },
     {
       outputText:
         '```repl\nconst child = await rlm_query({ task: "Return only the vaultKey string.", payload: [{ vaultKey: "V-554" }], expect: "string" });\nFINAL_VAR(child);\n```',
-      responseId: 'resp_root_2',
+      turnState: 'resp_root_2',
     },
     {
       outputText: '```repl\nFINAL_VAR("V-554");\n```',
-      responseId: 'resp_sub_2',
+      turnState: 'resp_sub_2',
     },
   ]);
 
@@ -327,15 +394,15 @@ Deno.test('runner surfaces delegated contract mismatches into the next turn so r
 });
 
 Deno.test('runner routes rlm_query through the sub-model and records the nested subquery in the journal', async () => {
-  const adapter = new MockAdapter([
+  const adapter = new MockCaller([
     {
       outputText:
         '```repl\nconst nested = await rlm_query("Compute 6 * 7.");\nFINAL_VAR(nested);\n```',
-      responseId: 'resp_root_1',
+      turnState: 'resp_root_1',
     },
     {
       outputText: '```repl\nFINAL_VAR("42");\n```',
-      responseId: 'resp_sub_1',
+      turnState: 'resp_sub_1',
     },
   ]);
 
@@ -376,16 +443,54 @@ Deno.test('runner routes rlm_query through the sub-model and records the nested 
   assert.match(childJournalText, /"task":"Compute 6 \* 7\."/u);
 });
 
-Deno.test('runner appends a custom system prompt extension to both root and child model calls', async () => {
-  const adapter = new MockAdapter([
+Deno.test('runner closes nested child sessions after rlm_query returns so only the root session remains live', async () => {
+  const adapter = new MockCaller([
     {
       outputText:
         '```repl\nconst nested = await rlm_query("Compute 6 * 7.");\nFINAL_VAR(nested);\n```',
-      responseId: 'resp_root_1',
+      turnState: 'resp_root_1',
     },
     {
       outputText: '```repl\nFINAL_VAR("42");\n```',
-      responseId: 'resp_sub_1',
+      turnState: 'resp_sub_1',
+    },
+  ]);
+  const executionBackend = new TrackingExecutionBackend();
+
+  const result = await runRLM({
+    adapter,
+    clock: createClock(),
+    context: { source: 'nested-close-test' },
+    executionBackend,
+    idGenerator: createIdGenerator(),
+    maxSteps: 4,
+    maxSubcallDepth: 2,
+    outputCharLimit: 120,
+    prompt: 'Use rlm_query to solve the task.',
+    rootModel: 'gpt-5-nano',
+    subModel: 'gpt-5-mini',
+  });
+
+  assert.equal(result.answer, '42');
+  assert.equal(executionBackend.runtimes.length, 2);
+  assert.equal(executionBackend.runtimes[0]?.closeCalls, 0);
+  assert.equal(executionBackend.runtimes[1]?.closeCalls, 1);
+
+  await result.session.close();
+  assert.equal(executionBackend.runtimes[0]?.closeCalls, 1);
+  assert.equal(executionBackend.runtimes[1]?.closeCalls, 1);
+});
+
+Deno.test('runner appends a custom system prompt extension to both root and child model calls', async () => {
+  const adapter = new MockCaller([
+    {
+      outputText:
+        '```repl\nconst nested = await rlm_query("Compute 6 * 7.");\nFINAL_VAR(nested);\n```',
+      turnState: 'resp_root_1',
+    },
+    {
+      outputText: '```repl\nFINAL_VAR("42");\n```',
+      turnState: 'resp_sub_1',
     },
   ]);
 
@@ -416,15 +521,15 @@ Deno.test('runner appends a custom system prompt extension to both root and chil
 });
 
 Deno.test('runner lets root inspect structured values returned by rlm_query before extracting a field', async () => {
-  const adapter = new MockAdapter([
+  const adapter = new MockCaller([
     {
       outputText:
         '```repl\nconst nested = await rlm_query(JSON.stringify({ targetProfile: "orion", candidates: [{ profile: "orion", vaultKey: "V-554" }] }));\nFINAL_VAR(nested.vaultKey);\n```',
-      responseId: 'resp_root_1',
+      turnState: 'resp_root_1',
     },
     {
       outputText: '```repl\nFINAL_VAR({ vaultKey: "V-554", profile: "orion" });\n```',
-      responseId: 'resp_sub_1',
+      turnState: 'resp_sub_1',
     },
   ]);
 
@@ -445,11 +550,11 @@ Deno.test('runner lets root inspect structured values returned by rlm_query befo
 });
 
 Deno.test('runner aggregates usage across root plain llm_query calls and nested rlm_query completions', async () => {
-  const adapter = new MockAdapter([
+  const adapter = new MockCaller([
     {
       outputText:
         '```repl\nconst plain = await llm_query("Compute 6 * 7.");\nconst nested = await rlm_query("Return the same value again.");\nFINAL_VAR(String(Number(plain) + Number(nested)));\n```',
-      responseId: 'resp_root_1',
+      turnState: 'resp_root_1',
       usage: {
         cachedInputTokens: 2,
         inputTokens: 20,
@@ -459,7 +564,7 @@ Deno.test('runner aggregates usage across root plain llm_query calls and nested 
     },
     {
       outputText: '42',
-      responseId: 'resp_plain_1',
+      turnState: 'resp_plain_1',
       usage: {
         inputTokens: 9,
         outputTokens: 4,
@@ -468,7 +573,7 @@ Deno.test('runner aggregates usage across root plain llm_query calls and nested 
     },
     {
       outputText: '```repl\nFINAL_VAR("42");\n```',
-      responseId: 'resp_sub_1',
+      turnState: 'resp_sub_1',
       usage: {
         inputTokens: 7,
         outputTokens: 3,
@@ -522,14 +627,14 @@ Deno.test('runner aggregates usage across root plain llm_query calls and nested 
 });
 
 Deno.test('runner ignores FINAL_VAR values from a cell that later errors and asks for another turn', async () => {
-  const adapter = new MockAdapter([
+  const adapter = new MockCaller([
     {
       outputText: '```repl\nFINAL_VAR("wrong");\nthrow new Error("boom");\n```',
-      responseId: 'resp_root_1',
+      turnState: 'resp_root_1',
     },
     {
       outputText: '```repl\nFINAL_VAR("fixed");\n```',
-      responseId: 'resp_root_2',
+      turnState: 'resp_root_2',
     },
   ]);
 
@@ -553,14 +658,14 @@ Deno.test('runner ignores FINAL_VAR values from a cell that later errors and ask
 });
 
 Deno.test('runner ignores FINAL_VAR(undefined) and asks the model to keep working', async () => {
-  const adapter = new MockAdapter([
+  const adapter = new MockCaller([
     {
       outputText: '```repl\nconst answer = undefined;\nFINAL_VAR(answer);\n```',
-      responseId: 'resp_root_1',
+      turnState: 'resp_root_1',
     },
     {
       outputText: '```repl\nFINAL_VAR("42");\n```',
-      responseId: 'resp_root_2',
+      turnState: 'resp_root_2',
     },
   ]);
 
@@ -583,7 +688,7 @@ Deno.test('runner ignores FINAL_VAR(undefined) and asks the model to keep workin
 });
 
 Deno.test('runner stops executing later repl blocks in the same assistant turn after a failed block', async () => {
-  const adapter = new MockAdapter([
+  const adapter = new MockCaller([
     {
       outputText: [
         '```repl',
@@ -594,11 +699,11 @@ Deno.test('runner stops executing later repl blocks in the same assistant turn a
         'FINAL_VAR("wrong");',
         '```',
       ].join('\n'),
-      responseId: 'resp_root_1',
+      turnState: 'resp_root_1',
     },
     {
       outputText: '```repl\nFINAL_VAR("fixed");\n```',
-      responseId: 'resp_root_2',
+      turnState: 'resp_root_2',
     },
   ]);
 
@@ -624,10 +729,10 @@ Deno.test('runner stops executing later repl blocks in the same assistant turn a
 });
 
 Deno.test('runner accepts explicit FINAL text when the assistant finishes without a repl block', async () => {
-  const adapter = new MockAdapter([
+  const adapter = new MockCaller([
     {
       outputText: 'FINAL("done")',
-      responseId: 'resp_root_1',
+      turnState: 'resp_root_1',
     },
   ]);
 
@@ -650,18 +755,18 @@ Deno.test('runner accepts explicit FINAL text when the assistant finishes withou
 });
 
 Deno.test('runner raises a protocol error when the assistant never emits repl code or a final signal', async () => {
-  const adapter = new MockAdapter([
+  const adapter = new MockCaller([
     {
       outputText: 'I think the answer is probably 42.',
-      responseId: 'resp_root_1',
+      turnState: 'resp_root_1',
     },
     {
       outputText: 'Still just prose.',
-      responseId: 'resp_root_2',
+      turnState: 'resp_root_2',
     },
     {
       outputText: '',
-      responseId: 'resp_root_3',
+      turnState: 'resp_root_3',
     },
   ]);
 
@@ -688,10 +793,10 @@ Deno.test('runner raises a protocol error when the assistant never emits repl co
 });
 
 Deno.test('runner raises a max-steps error when no turn reaches FINAL within the budget', async () => {
-  const adapter = new MockAdapter([
+  const adapter = new MockCaller([
     {
       outputText: '```repl\nconst subtotal = 40 + 2;\n```',
-      responseId: 'resp_root_1',
+      turnState: 'resp_root_1',
     },
   ]);
 
@@ -718,10 +823,10 @@ Deno.test('runner raises a max-steps error when no turn reaches FINAL within the
 });
 
 Deno.test('runner journaling stays backward-compatible with the existing session loader', async () => {
-  const adapter = new MockAdapter([
+  const adapter = new MockCaller([
     {
       outputText: '```repl\nFINAL_VAR("ok");\n```',
-      responseId: 'resp_root_1',
+      turnState: 'resp_root_1',
     },
   ]);
 
@@ -756,6 +861,7 @@ Deno.test('runOpenAIRLM boots the OpenAI adapter from env-backed config without 
         'OPENAI_API_KEY=sk-test',
         'RLM_OPENAI_ROOT_MODEL=gpt-5-nano',
         'RLM_OPENAI_SUB_MODEL=gpt-5-mini',
+        'RLM_CELL_TIMEOUT_MS=2222',
         'RLM_REQUEST_TIMEOUT_MS=54321',
         'RLM_MAX_STEPS=2',
         'RLM_MAX_SUBCALL_DEPTH=1',
@@ -783,7 +889,7 @@ Deno.test('runOpenAIRLM boots the OpenAI adapter from env-backed config without 
     });
 
     assert.equal(result.answer, 'ok');
-    assert.equal(result.session.session.defaultTimeoutMs, 54_321);
+    assert.equal(result.session.session.defaultTimeoutMs, 56_543);
   } finally {
     Deno.chdir(previousCwd);
   }
@@ -816,5 +922,5 @@ Deno.test('runOpenAIRLM accepts explicit OpenAI config without loading repositor
   });
 
   assert.equal(result.answer, 'ok');
-  assert.equal(result.session.session.defaultTimeoutMs, 12_345);
+  assert.equal(result.session.session.defaultTimeoutMs, 17_345);
 });

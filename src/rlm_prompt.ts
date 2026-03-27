@@ -60,9 +60,11 @@ export interface RLMTranscriptTurn {
  */
 export interface BuildRLMTurnInputOptions {
   context: JsonValue | null;
+  currentStep?: number;
   outputCharLimit: number;
   prompt: string;
   role?: RLMControllerRole;
+  totalSteps?: number;
   transcript: RLMTranscriptTurn[];
 }
 
@@ -510,9 +512,12 @@ export function buildRLMSystemPrompt(options: BuildRLMSystemPromptOptions = {}):
     'When multiple narrowed candidates still share the main identifier, keep the distinguishing fields in the payload or delegated task.',
     'Preserve the source field names that carry the selection rule when you narrow rows or build delegated payloads.',
     'If narrowed rows still differ on positive selector fields such as active, current, enabled, or primaryDispatch, carry those exact field names and desired truth values into the delegated task.',
+    'Base each conclusion on values you can point to in `context`, prior execution signals, or delegated evidence.',
+    'Prefer extracting existing rows, fields, spans, or aggregates over inventing missing data.',
     'Keep `expect` concrete and singular when you need a runtime-checked return shape.',
     'Prefer the smallest named value that directly powers the next step: use field-specific scalar expects such as `"vaultKey"` or `"index"` for lookup keys, use generic scalar expects like `"string"` or `"number"` only when no field name exists, and use object expects only when the named fields themselves are needed in root.',
     'When narrowed records already contain the requested answer field, read that existing field instead of inventing a new field name.',
+    'If a required value is not yet present, gather more evidence in code or issue a narrower delegated task before FINAL.',
     'Treat child returns as validated JavaScript values or delegated evidence.',
     'Inspect the child return in code before FINAL or the next delegation.',
     'After a dependent lookup returns a record or object, continue to the requested scalar field before FINAL.',
@@ -530,8 +535,10 @@ export function buildRLMSystemPrompt(options: BuildRLMSystemPromptOptions = {}):
  * ```ts
  * const input = buildRLMTurnInput({
  *   context: { document: 'Chapter 1\\nThe answer is 42.' },
+ *   currentStep: 1,
  *   outputCharLimit: 4_000,
  *   prompt: 'Extract the answer.',
+ *   totalSteps: 6,
  *   transcript: [],
  * });
  * ```
@@ -560,15 +567,27 @@ export function buildRLMTurnInput(options: BuildRLMTurnInputOptions): string {
         '- prefer `rlm_query({ task, payload, expect })` once the evidence is narrowed.',
         '- keep distinguishing fields in the payload or delegated task when multiple narrowed candidates still share the main identifier.',
         '- preserve the actual source field names used by the selection rule instead of inventing aliases while narrowing rows.',
+        '- ground each step in rows, fields, spans, or aggregates that you can actually read from `context`, prior signals, or delegated evidence.',
         '- if narrowed rows still differ on positive selector fields such as `active`, `current`, `enabled`, or `primaryDispatch`, copy those exact fields and desired truth values into the delegated task.',
         '- if the next step is a dependent lookup by a named key or index field, prefer a field-specific scalar `expect` such as `"vaultKey"` or `"index"`.',
         '- when a narrowed record already exposes the requested scalar field, read that existing field name directly.',
+        '- if the needed value is not yet present, narrow further and extract more evidence before FINAL instead of inventing a filler value.',
         '- when exact prefix and suffix anchors exist, prefer `findAnchoredValue(...)` before broad regex or whole-document scans.',
         '- for repeated text templates, build a target-specific anchor or filter in code before you scan all matches.',
         '- after a dependent lookup returns a record, continue to the requested scalar field before FINAL.',
         '- treat child returns as validated JavaScript values or delegated evidence and inspect them in code before FINAL or the next delegation.',
       ].join('\n'),
     );
+    if (options.currentStep !== undefined && options.totalSteps !== undefined) {
+      sections.push(
+        [
+          `Step budget: ${options.currentStep} / ${options.totalSteps}`,
+          'Use the remaining steps to maximize progress toward the exact user answer.',
+          'Prefer the highest-yield narrowing, verification, or finalization step now.',
+          'When the budget is tight, finalize from verified evidence instead of starting a broad new search.',
+        ].join('\n'),
+      );
+    }
   }
 
   sections.push(
@@ -576,11 +595,6 @@ export function buildRLMTurnInput(options: BuildRLMTurnInputOptions): string {
     'The external context is available only through the REPL variable `context`.',
     `Context summary:\n${buildContextSummary(options.context)}`,
   );
-  const previews = role === 'root' ? buildContextPreviews(options.context) : null;
-
-  if (previews !== null) {
-    sections.push(`Context previews:\n${previews}`);
-  }
 
   if (role === 'root') {
     const questionHints = buildQuestionHints(options.context);

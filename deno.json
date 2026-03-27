@@ -1,6 +1,6 @@
 {
   "name": "@yoonsung/rlm",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "license": "LGPL-3.0-only",
   "exports": "./mod.ts",
   "compilerOptions": {
@@ -22,10 +22,11 @@
   },
   "tasks": {
     "test": "deno test --allow-read --allow-write --unstable-worker-options",
-    "standalone": "deno run --allow-read --allow-write --allow-net=api.openai.com --unstable-worker-options src/standalone/main.ts",
+    "standalone": "deno run --allow-read --allow-write --allow-net=api.openai.com,auth.openai.com,chatgpt.com --unstable-worker-options src/standalone/main.ts",
     "coverage": "deno test --allow-read --allow-write --unstable-worker-options --coverage=coverage/raw && deno coverage --lcov --output=coverage/lcov.info coverage/raw && deno coverage --html coverage/raw",
     "coverage:raw": "deno test --allow-read --allow-write --unstable-worker-options --coverage=coverage/raw",
     "coverage:report": "deno coverage --lcov --output=coverage/lcov.info coverage/raw && deno coverage --html coverage/raw",
+    "test:codex": "deno test --allow-read --allow-write --allow-net=auth.openai.com,chatgpt.com --unstable-worker-options tests/codex_oauth_ping_live.ts",
     "test:openai": "deno test --allow-read --allow-write --allow-net=api.openai.com --unstable-worker-options tests/openai_live_test.ts",
     "test:openai:integration": "deno test --allow-read --allow-write --allow-net=api.openai.com --unstable-worker-options --filter='^OpenAI integration' tests/openai_live_test.ts",
     "test:openai:synthetic": "deno test --allow-read --allow-write --allow-net=api.openai.com --unstable-worker-options --filter='^Synthetic ' tests/openai_live_test.ts",

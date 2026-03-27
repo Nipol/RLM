@@ -2,9 +2,9 @@ import assert from 'node:assert/strict';
 
 import { InMemoryRLMLogger } from '../src/index.ts';
 import type {
-  LLMAdapter,
-  LLMCompletionRequest,
-  LLMCompletionResponse,
+  LLMCaller,
+  LLMCallerRequest,
+  LLMCallerResponse,
 } from '../src/llm_adapter.ts';
 import {
   createLLMQueryHandler,
@@ -17,15 +17,15 @@ import {
 import { createUsageSummary } from '../src/usage_summary.ts';
 import type { JsonValue } from '../src/types.ts';
 
-class MockAdapter implements LLMAdapter {
-  readonly requests: LLMCompletionRequest[] = [];
-  readonly #responses: LLMCompletionResponse[];
+class MockCaller implements LLMCaller {
+  readonly requests: LLMCallerRequest[] = [];
+  readonly #responses: LLMCallerResponse[];
 
-  constructor(responses: LLMCompletionResponse[]) {
+  constructor(responses: LLMCallerResponse[]) {
     this.#responses = [...responses];
   }
 
-  async complete(request: LLMCompletionRequest): Promise<LLMCompletionResponse> {
+  async complete(request: LLMCallerRequest): Promise<LLMCallerResponse> {
     this.requests.push(request);
     const next = this.#responses.shift();
     if (next === undefined) {
@@ -54,10 +54,10 @@ function createDeferred<T>() {
 }
 
 Deno.test('llm_query forwards prompts into plain sub-model completions', async () => {
-  const adapter = new MockAdapter([
+  const llm = new MockCaller([
     {
       outputText: '42',
-      responseId: 'resp_sub_1',
+      turnState: 'plain-turn-1',
       usage: {
         inputTokens: 9,
         outputTokens: 4,
@@ -67,7 +67,7 @@ Deno.test('llm_query forwards prompts into plain sub-model completions', async (
   ]);
   const captured: Array<{
     model: string;
-    responseId: string | null;
+    turnState?: unknown;
     usage?: {
       inputTokens?: number;
       outputTokens?: number;
@@ -75,7 +75,7 @@ Deno.test('llm_query forwards prompts into plain sub-model completions', async (
     };
   }> = [];
   const handler = createLLMQueryHandler({
-    adapter,
+    llm,
     onComplete: (completion) => {
       captured.push(completion);
     },
@@ -85,14 +85,19 @@ Deno.test('llm_query forwards prompts into plain sub-model completions', async (
   const answer = await handler('solve 6 * 7');
 
   assert.equal(answer, '42');
-  assert.equal(adapter.requests.length, 1);
-  assert.equal(adapter.requests[0]?.model, 'gpt-5-nano');
-  assert.match(adapter.requests[0]?.systemPrompt ?? '', /plain language model subcall/u);
-  assert.match(adapter.requests[0]?.input ?? '', /solve 6 \* 7/u);
+  assert.equal(llm.requests.length, 1);
+  assert.equal(llm.requests[0]?.model, 'gpt-5-nano');
+  assert.equal(llm.requests[0]?.kind, 'plain_query');
+  assert.deepEqual(llm.requests[0]?.metadata, {
+    depth: 0,
+    queryIndex: 0,
+  });
+  assert.match(llm.requests[0]?.systemPrompt ?? '', /plain language model subcall/u);
+  assert.match(llm.requests[0]?.input ?? '', /solve 6 \* 7/u);
   assert.deepEqual(captured, [
     {
       model: 'gpt-5-nano',
-      responseId: 'resp_sub_1',
+      turnState: 'plain-turn-1',
       usage: {
         inputTokens: 9,
         outputTokens: 4,
@@ -100,6 +105,51 @@ Deno.test('llm_query forwards prompts into plain sub-model completions', async (
       },
     },
   ]);
+});
+
+Deno.test('llm_query keeps provider turnState opaque and forwards it through completion callbacks', async () => {
+  const llm = new MockCaller([
+    {
+      outputText: 'done',
+      turnState: { cursor: 'opaque-1' },
+    },
+  ]);
+  const states: unknown[] = [];
+  const handler = createLLMQueryHandler({
+    llm,
+    onComplete: (completion) => {
+      states.push(completion.turnState);
+    },
+    subModel: 'gpt-5-mini',
+  });
+
+  const result = await handler('return done');
+
+  assert.equal(result, 'done');
+  assert.deepEqual(states, [{ cursor: 'opaque-1' }]);
+});
+
+Deno.test('llm_query can report parent depth and monotonically increasing query indices to the caller', async () => {
+  const llm = new MockCaller([
+    { outputText: 'first' },
+    { outputText: 'second' },
+  ]);
+  const handler = createLLMQueryHandler({
+    currentDepth: 2,
+    llm,
+    subModel: 'gpt-5-mini',
+  });
+
+  await handler('first prompt');
+  await handler('second prompt');
+
+  assert.deepEqual(
+    llm.requests.map((request) => request.metadata),
+    [
+      { depth: 2, queryIndex: 0 },
+      { depth: 2, queryIndex: 1 },
+    ],
+  );
 });
 
 Deno.test('rlm_query forwards delegated prompts into nested RLM runs with narrowed child context', async () => {

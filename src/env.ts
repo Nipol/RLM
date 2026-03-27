@@ -42,6 +42,7 @@ export interface OpenAIProviderConfig {
  * @example
  * ```ts
  * const runtime: RLMRuntimeConfig = {
+ *   cellTimeoutMs: 5_000,
  *   maxSteps: 12,
  *   maxSubcallDepth: 1,
  *   outputCharLimit: 4_000,
@@ -49,6 +50,11 @@ export interface OpenAIProviderConfig {
  * ```
  */
 export interface RLMRuntimeConfig {
+  /**
+   * Additional REPL cell budget appended to provider request timeouts in provider-backed
+   * convenience paths such as `runOpenAIRLM(...)` and the standalone CLI.
+   */
+  cellTimeoutMs: number;
   maxSteps: number;
   maxSubcallDepth: number;
   outputCharLimit: number;
@@ -91,6 +97,7 @@ const DEFAULT_BASE_URL = 'https://api.openai.com/v1';
 const DEFAULT_ENV_PATH = '.env';
 const DEFAULT_MAX_OUTPUT_CHARS = 4_000;
 const DEFAULT_MAX_STEPS = 12;
+const DEFAULT_CELL_TIMEOUT_MS = 5_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_SUBCALL_DEPTH = 3;
 
@@ -140,13 +147,7 @@ function parseDotEnvValue(rawValue: string, lineNumber: number): string {
         throw new Error(`Invalid .env line ${lineNumber}: unfinished escape sequence.`);
       }
 
-      decoded += escaped === 'n'
-        ? '\n'
-        : escaped === 'r'
-        ? '\r'
-        : escaped === 't'
-        ? '\t'
-        : escaped;
+      decoded += escaped === 'n' ? '\n' : escaped === 'r' ? '\r' : escaped === 't' ? '\t' : escaped;
       index += 1;
       continue;
     }
@@ -191,6 +192,29 @@ function readPositiveIntegerEnv(
   }
 
   return parsed;
+}
+
+function readRuntimeConfig(
+  values: Record<string, string | undefined>,
+): RLMRuntimeConfig {
+  return {
+    cellTimeoutMs: readPositiveIntegerEnv(
+      values,
+      'RLM_CELL_TIMEOUT_MS',
+      DEFAULT_CELL_TIMEOUT_MS,
+    ),
+    maxSteps: readPositiveIntegerEnv(values, 'RLM_MAX_STEPS', DEFAULT_MAX_STEPS),
+    maxSubcallDepth: readPositiveIntegerEnv(
+      values,
+      'RLM_MAX_SUBCALL_DEPTH',
+      DEFAULT_SUBCALL_DEPTH,
+    ),
+    outputCharLimit: readPositiveIntegerEnv(
+      values,
+      'RLM_MAX_OUTPUT_CHARS',
+      DEFAULT_MAX_OUTPUT_CHARS,
+    ),
+  };
 }
 
 /**
@@ -270,6 +294,69 @@ export function loadOpenAIProviderConfig(
 }
 
 /**
+ * Loads the provider request timeout used by standalone convenience paths.
+ *
+ * This timeout is provider-facing and separate from the extra REPL cell budget
+ * loaded through `RLM_CELL_TIMEOUT_MS`.
+ *
+ * @example
+ * ```ts
+ * const requestTimeoutMs = loadProviderRequestTimeoutMs({
+ *   env: {
+ *     RLM_REQUEST_TIMEOUT_MS: '45000',
+ *   },
+ * });
+ * ```
+ */
+export function loadProviderRequestTimeoutMs(
+  options: LoadRLMConfigOptions = {},
+): number {
+  const fileValues = loadDotEnvFile({
+    path: options.path,
+    readTextFileSync: options.readTextFileSync,
+  });
+  const values: Record<string, string | undefined> = {
+    ...fileValues,
+    ...(options.env ?? {}),
+  };
+
+  return readPositiveIntegerEnv(
+    values,
+    'RLM_REQUEST_TIMEOUT_MS',
+    DEFAULT_REQUEST_TIMEOUT_MS,
+  );
+}
+
+/**
+ * Loads only runtime orchestration limits from `.env` and explicit overrides.
+ *
+ * This helper does not require provider credentials, so standalone flows that use
+ * non-OpenAI providers can still reuse the same runtime defaults.
+ *
+ * @example
+ * ```ts
+ * const runtime = loadRLMRuntimeConfig({
+ *   env: {
+ *     RLM_CELL_TIMEOUT_MS: '7000',
+ *     RLM_MAX_STEPS: '12',
+ *   },
+ * });
+ * ```
+ */
+export function loadRLMRuntimeConfig(options: LoadRLMConfigOptions = {}): RLMRuntimeConfig {
+  const fileValues = loadDotEnvFile({
+    path: options.path,
+    readTextFileSync: options.readTextFileSync,
+  });
+  const values: Record<string, string | undefined> = {
+    ...fileValues,
+    ...(options.env ?? {}),
+  };
+
+  return readRuntimeConfig(values);
+}
+
+/**
  * Loads the complete repository configuration from `.env` and explicit overrides.
  *
  * @example
@@ -305,19 +392,7 @@ export function loadRLMConfig(options: LoadRLMConfigOptions = {}): RLMConfig {
     subModel: readRequiredEnv(values, 'RLM_OPENAI_SUB_MODEL'),
   };
 
-  const runtime: RLMRuntimeConfig = {
-    maxSteps: readPositiveIntegerEnv(values, 'RLM_MAX_STEPS', DEFAULT_MAX_STEPS),
-    maxSubcallDepth: readPositiveIntegerEnv(
-      values,
-      'RLM_MAX_SUBCALL_DEPTH',
-      DEFAULT_SUBCALL_DEPTH,
-    ),
-    outputCharLimit: readPositiveIntegerEnv(
-      values,
-      'RLM_MAX_OUTPUT_CHARS',
-      DEFAULT_MAX_OUTPUT_CHARS,
-    ),
-  };
+  const runtime = readRuntimeConfig(values);
 
   return { openAI, runtime };
 }

@@ -11,3 +11,5 @@ coverage-pass-*-cache/
 *.log
 tmp/
 logs/
+.rlm/
+docs/

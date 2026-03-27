@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 
-import { buildRLMSystemPrompt, buildRLMTurnInput } from '../src/rlm_prompt.ts';
+import {
+  __rlmPromptTestables,
+  buildRLMSystemPrompt,
+  buildRLMTurnInput,
+} from '../src/rlm_prompt.ts';
 
 Deno.test('RLM system prompts stay protocol-focused and role-specific', () => {
   const rootPrompt = buildRLMSystemPrompt();
@@ -23,9 +27,12 @@ Deno.test('RLM system prompts stay protocol-focused and role-specific', () => {
   assert.match(rootPrompt, /When multiple narrowed candidates still share the main identifier, keep the distinguishing fields in the payload or delegated task/u);
   assert.match(rootPrompt, /Preserve the source field names that carry the selection rule/u);
   assert.match(rootPrompt, /If narrowed rows still differ on positive selector fields such as active, current, enabled, or primaryDispatch/u);
+  assert.match(rootPrompt, /Base each conclusion on values you can point to in `context`, prior execution signals, or delegated evidence/u);
+  assert.match(rootPrompt, /Prefer extracting existing rows, fields, spans, or aggregates over inventing missing data/u);
   assert.match(rootPrompt, /Prefer the smallest named value that directly powers the next step/u);
   assert.match(rootPrompt, /field-specific scalar expects such as `"vaultKey"` or `"index"`/u);
   assert.match(rootPrompt, /read that existing field instead of inventing a new field name/u);
+  assert.match(rootPrompt, /If a required value is not yet present, gather more evidence in code or issue a narrower delegated task before FINAL/u);
   assert.match(rootPrompt, /Treat child returns as validated JavaScript values or delegated evidence/u);
   assert.match(rootPrompt, /After a dependent lookup returns a record or object, continue to the requested scalar field before FINAL/u);
   assert.match(rootPrompt, /finish with that scalar value rather than the enclosing record/u);
@@ -55,8 +62,10 @@ Deno.test('RLM turn input keeps root hints compact and state-oriented', () => {
       document: 'alpha beta gamma delta',
       question: 'Which token matters?',
     },
+    currentStep: 2,
     outputCharLimit: 10,
     prompt: 'Solve the task.',
+    totalSteps: 5,
     transcript: [
       {
         assistantText: 'This assistant text is intentionally long.',
@@ -84,6 +93,15 @@ Deno.test('RLM turn input keeps root hints compact and state-oriented', () => {
 
   assert.match(turnInput, /\.\.\.\[truncated/u);
   assert.match(turnInput, /Task summary:/u);
+  assert.match(turnInput, /Step budget: 2 \/ 5/u);
+  assert.match(
+    turnInput,
+    /Use the remaining steps to maximize progress toward the exact user answer/u,
+  );
+  assert.match(
+    turnInput,
+    /When the budget is tight, finalize from verified evidence instead of starting a broad new search/u,
+  );
   assert.match(turnInput, /prompt: string \(15 chars, 3 words\)/u);
   assert.match(turnInput, /Root checklist:/u);
   assert.match(turnInput, /define or refine a `query_contract` variable in code before broad search/u);
@@ -92,9 +110,11 @@ Deno.test('RLM turn input keeps root hints compact and state-oriented', () => {
   assert.match(turnInput, /prefer `rlm_query\(\{ task, payload, expect \}\)` once the evidence is narrowed/u);
   assert.match(turnInput, /keep distinguishing fields in the payload or delegated task when multiple narrowed candidates still share the main identifier/u);
   assert.match(turnInput, /preserve the actual source field names used by the selection rule instead of inventing aliases while narrowing rows/u);
+  assert.match(turnInput, /ground each step in rows, fields, spans, or aggregates that you can actually read from `context`, prior signals, or delegated evidence/u);
   assert.match(turnInput, /if narrowed rows still differ on positive selector fields such as `active`, `current`, `enabled`, or `primaryDispatch`, copy those exact fields and desired truth values into the delegated task/u);
   assert.match(turnInput, /if the next step is a dependent lookup by a named key or index field, prefer a field-specific scalar `expect` such as `"vaultKey"` or `"index"`/u);
   assert.match(turnInput, /when a narrowed record already exposes the requested scalar field, read that existing field name directly/u);
+  assert.match(turnInput, /if the needed value is not yet present, narrow further and extract more evidence before FINAL instead of inventing a filler value/u);
   assert.match(turnInput, /when exact prefix and suffix anchors exist, prefer `findAnchoredValue\(\.\.\.\)` before broad regex or whole-document scans/u);
   assert.match(turnInput, /build a target-specific anchor or filter in code before you scan all matches/u);
   assert.match(turnInput, /after a dependent lookup returns a record, continue to the requested scalar field before FINAL/u);
@@ -145,6 +165,17 @@ Deno.test('RLM turn input surfaces actual field names for top-level arrays of re
   );
 });
 
+Deno.test('RLM prompt helpers ignore non-string large-context fields when building previews', () => {
+  assert.equal(
+    __rlmPromptTestables.buildContextPreviews({
+      document: 'short',
+      metadata: 42,
+      nested: { value: 'ignored' },
+    }),
+    null,
+  );
+});
+
 Deno.test('RLM turn input keeps large-context, recovery, repeated-failure, and child guidance concise', () => {
   const largeContextTurnInput = buildRLMTurnInput({
     context: {
@@ -157,8 +188,6 @@ Deno.test('RLM turn input keeps large-context, recovery, repeated-failure, and c
 
   assert.match(largeContextTurnInput, /Large-context mode is active/u);
   assert.match(largeContextTurnInput, /Inspect size and structure before broad search/u);
-  assert.match(largeContextTurnInput, /document head preview/u);
-  assert.match(largeContextTurnInput, /document tail preview/u);
   assert.match(largeContextTurnInput, /The response should begin with a ```repl block/u);
 
   const recoveryTurnInput = buildRLMTurnInput({
@@ -263,9 +292,11 @@ Deno.test('RLM turn input keeps large-context, recovery, repeated-failure, and c
       task: 'Return only the vaultKey for the active primary dispatch dossier.',
       type: 'rlm_delegated_task',
     },
+    currentStep: 1,
     outputCharLimit: 80,
     prompt: 'Extract the exact code from the narrowed excerpt.',
     role: 'child',
+    totalSteps: 4,
     transcript: [],
   });
 
@@ -275,6 +306,7 @@ Deno.test('RLM turn input keeps large-context, recovery, repeated-failure, and c
   assert.match(childTurnInput, /If `context\.expect` is present, return a JavaScript value that satisfies that runtime-checked contract/u);
   assert.match(childTurnInput, /If `context\.selectionHints\.positiveSelectors` is present, use those source field names as decisive positive selectors/u);
   assert.doesNotMatch(childTurnInput, /Task summary:/u);
+  assert.doesNotMatch(childTurnInput, /Step budget:/u);
   assert.doesNotMatch(childTurnInput, /Root checklist:/u);
   assert.doesNotMatch(childTurnInput, /head preview/u);
   assert.doesNotMatch(childTurnInput, /tail preview/u);

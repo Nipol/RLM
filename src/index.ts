@@ -1,5 +1,12 @@
 export { ReplSession } from './repl_session.ts';
-export { loadDotEnvFile, loadOpenAIProviderConfig, loadRLMConfig, parseDotEnv } from './env.ts';
+export {
+  loadDotEnvFile,
+  loadOpenAIProviderConfig,
+  loadProviderRequestTimeoutMs,
+  loadRLMConfig,
+  loadRLMRuntimeConfig,
+  parseDotEnv,
+} from './env.ts';
 export { createDefaultExecutionBackend, WorkerExecutionBackend } from './execution_backend.ts';
 export {
   createSubqueryLogger,
@@ -17,7 +24,12 @@ export {
   RLMSubqueryDepthError,
   RLMSubqueryResultError,
 } from './llm_query.ts';
-export { OpenAIResponsesAdapter, OpenAIResponsesError } from './openai_adapter.ts';
+export {
+  OpenAIResponsesAdapter,
+  OpenAIResponsesError,
+  OpenAIResponsesProvider,
+} from './openai_adapter.ts';
+export { CodexOAuthProvider } from './providers/codex_oauth.ts';
 export { extractFinalSignal, extractReplCodeBlocks } from './repl_protocol.ts';
 export {
   createStandaloneLogPath,
@@ -57,13 +69,37 @@ export type {
   PlainLLMQueryCompletion,
   RLMQueryBridgeOptions,
 } from './llm_query.ts';
-export type { LLMAdapter, LLMCompletionRequest, LLMCompletionResponse } from './llm_adapter.ts';
-export type { LLMUsage } from './llm_adapter.ts';
+export type {
+  LLMAdapter,
+  LLMCaller,
+  LLMCallerRequest,
+  LLMCallerResponse,
+  LLMCallKind,
+  LLMCallMetadata,
+  LLMCompletionRequest,
+  LLMCompletionResponse,
+  LLMProvider,
+  LLMUsage,
+} from './llm_adapter.ts';
 export type {
   OpenAIRunCostEstimate,
   OpenAITextModelPricing,
   OpenAIUsageCostEstimate,
 } from './openai_pricing.ts';
+export type {
+  OpenAIResponsesAdapterOptions,
+  OpenAIResponsesProviderOptions,
+} from './openai_adapter.ts';
+export type {
+  CodexOAuthAuthorizationCodeResult,
+  CodexOAuthAuthorizationReceiver,
+  CodexOAuthAuthorizationSession,
+  CodexOAuthAuthRecord,
+  CodexOAuthCallerConfig,
+  CodexOAuthLoginOptions,
+  CodexOAuthProviderOptions,
+  CodexOAuthTokenBundle,
+} from './providers/codex_oauth.ts';
 export type { FinalSignal, ReplCodeBlock } from './repl_protocol.ts';
 export type { RLMRunOptions, RLMRunResult, RunOpenAIRLMOptions } from './rlm_runner.ts';
 export type {

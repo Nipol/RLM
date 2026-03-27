@@ -19,6 +19,22 @@ Deno.test('OpenAI pricing exposes the current GPT-5 nano context and token rates
   });
 });
 
+Deno.test('OpenAI pricing normalizes common dated and dashed GPT-5.4 aliases before lookup', () => {
+  assert.equal(resolveOpenAITextModelPricing('   '), null);
+  assert.deepEqual(
+    resolveOpenAITextModelPricing('gpt-5-4-mini'),
+    resolveOpenAITextModelPricing('gpt-5.4-mini'),
+  );
+  assert.deepEqual(
+    resolveOpenAITextModelPricing('gpt-5-4-mini-2026-03-17'),
+    resolveOpenAITextModelPricing('gpt-5.4-mini'),
+  );
+  assert.deepEqual(
+    resolveOpenAITextModelPricing('gpt-5-4-pro'),
+    resolveOpenAITextModelPricing('gpt-5.4-pro'),
+  );
+});
+
 Deno.test('OpenAI pricing estimates per-model and aggregate cost from usage summaries', () => {
   const rootEstimate = estimateOpenAIUsageCostUsd({
     model: 'gpt-5-nano',

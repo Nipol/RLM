@@ -1,5 +1,5 @@
 import type { OpenAIProviderConfig } from './env.ts';
-import type { LLMAdapter } from './llm_adapter.ts';
+import type { LLMAdapter, LLMCaller } from './llm_adapter.ts';
 import type { ExecutionBackend, RLMLogger } from './types.ts';
 import type { JsonValue } from './types.ts';
 import type { RLMRunResult } from './rlm_runner.ts';
@@ -55,7 +55,7 @@ export interface RLMDefaults {
  * @example
  * ```ts
  * const clientOptions: RLMClientOptions = {
- *   adapter,
+ *   llm,
  *   models: {
  *     root: 'gpt-5-nano',
  *     sub: 'gpt-5-mini',
@@ -64,11 +64,12 @@ export interface RLMDefaults {
  * ```
  */
 export interface RLMClientOptions {
-  adapter: LLMAdapter;
+  adapter?: LLMAdapter;
   clock?: () => Date;
   defaults?: RLMDefaults;
   executionBackend?: ExecutionBackend;
   idGenerator?: () => string;
+  llm?: LLMCaller;
   logger?: RLMLogger;
   models: RLMModels;
 }
@@ -127,7 +128,7 @@ export interface RLMClient {
  * Describes the provider-specific inputs needed to build an OpenAI-backed RLM client.
  *
  * This is the provider-specific convenience variant of `RLMClientOptions`.
- * It exists so callers do not need to manually assemble an adapter just to use OpenAI.
+ * It exists so callers do not need to manually assemble an OpenAI-backed caller just to use OpenAI.
  *
  * @example
  * ```ts

@@ -133,7 +133,6 @@ export interface AssistantTurnEntry {
   assistantText: string;
   createdAt: string;
   model: string;
-  responseId: string | null;
   step: number;
   type: 'assistant_turn';
 }
@@ -149,7 +148,19 @@ export interface SubqueryEntry {
   type: 'subquery';
 }
 
-export type JournalEntry = AssistantTurnEntry | CellEntry | SessionEntry | SubqueryEntry;
+export interface StandaloneErrorEntry {
+  createdAt: string;
+  message: string;
+  stage: 'login' | 'models' | 'render' | 'run';
+  type: 'standalone_error';
+}
+
+export type JournalEntry =
+  | AssistantTurnEntry
+  | CellEntry
+  | SessionEntry
+  | StandaloneErrorEntry
+  | SubqueryEntry;
 
 export interface RLMLogger {
   append(entry: JournalEntry): Promise<void> | void;

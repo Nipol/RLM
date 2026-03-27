@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import {
   loadDotEnvFile,
   loadOpenAIProviderConfig,
+  loadProviderRequestTimeoutMs,
   loadRLMConfig,
+  loadRLMRuntimeConfig,
   parseDotEnv,
 } from '../src/env.ts';
 
@@ -142,6 +144,17 @@ RLM_OPENAI_SUB_MODEL=gpt-5-nano
   assert.equal(config.subModel, 'gpt-5.2');
 });
 
+Deno.test('provider request timeout loader can read standalone request limits without provider credentials', () => {
+  const requestTimeoutMs = loadProviderRequestTimeoutMs({
+    env: {
+      RLM_REQUEST_TIMEOUT_MS: '65000',
+    },
+    ...createMissingEnvFileOptions(),
+  });
+
+  assert.equal(requestTimeoutMs, 65_000);
+});
+
 Deno.test('OpenAI config loader refuses to boot without an API key', () => {
   assert.throws(
     () =>
@@ -187,6 +200,7 @@ Deno.test('OpenAI config loader refuses to boot without a sub model', () => {
 Deno.test('runtime config normalizes optional numeric limits for later RLM orchestration', () => {
   const config = loadRLMConfig({
     env: {
+      RLM_CELL_TIMEOUT_MS: '7000',
       OPENAI_API_KEY: 'sk-test',
       RLM_MAX_OUTPUT_CHARS: '2048',
       RLM_MAX_STEPS: '12',
@@ -199,12 +213,41 @@ Deno.test('runtime config normalizes optional numeric limits for later RLM orche
   });
 
   assert.equal(config.openAI.requestTimeoutMs, 45_000);
+  assert.equal(config.runtime.cellTimeoutMs, 7_000);
   assert.equal(config.runtime.maxSteps, 12);
   assert.equal(config.runtime.maxSubcallDepth, 4);
   assert.equal(config.runtime.outputCharLimit, 2_048);
 });
 
+Deno.test('runtime-only config can load standalone limits without requiring provider credentials', () => {
+  const runtime = loadRLMRuntimeConfig({
+    env: {
+      RLM_CELL_TIMEOUT_MS: '6500',
+      RLM_MAX_STEPS: '10',
+    },
+    ...createMissingEnvFileOptions(),
+  });
+
+  assert.equal(runtime.cellTimeoutMs, 6_500);
+  assert.equal(runtime.maxSteps, 10);
+  assert.equal(runtime.maxSubcallDepth, 3);
+  assert.equal(runtime.outputCharLimit, 4_000);
+});
+
 Deno.test('runtime config rejects non-positive numeric limits before a run starts', () => {
+  assert.throws(
+    () =>
+      loadRLMConfig({
+        env: {
+          OPENAI_API_KEY: 'sk-test',
+          RLM_CELL_TIMEOUT_MS: '0',
+          RLM_OPENAI_ROOT_MODEL: 'gpt-5-nano',
+          RLM_OPENAI_SUB_MODEL: 'gpt-5-mini',
+        },
+        ...createMissingEnvFileOptions(),
+      }),
+    /RLM_CELL_TIMEOUT_MS/u,
+  );
   assert.throws(
     () =>
       loadRLMConfig({

@@ -1,4 +1,4 @@
-import type { LLMAdapter, LLMUsage } from './llm_adapter.ts';
+import type { LLMCaller, LLMCallKind, LLMUsage } from './llm_adapter.ts';
 import { NullRLMLogger } from './logger.ts';
 import { createSubqueryJournalPath } from './subquery_path.ts';
 import type {
@@ -82,13 +82,13 @@ export type NestedRLMRunner = (
  * ```ts
  * const completion: PlainLLMQueryCompletion = {
  *   model: 'gpt-5-mini',
- *   responseId: 'resp_123',
+ *   turnState: { cursor: 'opaque-provider-state' },
  * };
  * ```
  */
 export interface PlainLLMQueryCompletion {
   model: string;
-  responseId: string | null;
+  turnState?: unknown;
   usage?: LLMUsage;
 }
 
@@ -98,13 +98,14 @@ export interface PlainLLMQueryCompletion {
  * @example
  * ```ts
  * const options: LLMQueryBridgeOptions = {
- *   adapter,
+ *   llm,
  *   subModel: 'gpt-5-mini',
  * };
  * ```
  */
 export interface LLMQueryBridgeOptions {
-  adapter: LLMAdapter;
+  currentDepth?: number;
+  llm: LLMCaller;
   onComplete?: (completion: PlainLLMQueryCompletion) => void | Promise<void>;
   subModel: string;
 }
@@ -790,7 +791,7 @@ export function buildLLMQuerySystemPrompt(): string {
  * @example
  * ```ts
  * const llmQuery = createLLMQueryHandler({
- *   adapter,
+ *   llm,
  *   subModel: 'gpt-5-mini',
  * });
  *
@@ -798,10 +799,18 @@ export function buildLLMQuerySystemPrompt(): string {
  * ```
  */
 export function createLLMQueryHandler(options: LLMQueryBridgeOptions): LLMQueryHandler {
+  let queryCount = 0;
+
   return async (prompt: string, invocationOptions = {}) => {
     throwIfAborted(invocationOptions.signal);
-    const completion = await options.adapter.complete({
+    const queryIndex = queryCount++;
+    const completion = await options.llm.complete({
       input: String(prompt),
+      kind: 'plain_query' satisfies LLMCallKind,
+      metadata: {
+        depth: options.currentDepth ?? 0,
+        queryIndex,
+      },
       model: options.subModel,
       signal: invocationOptions.signal,
       systemPrompt: buildLLMQuerySystemPrompt(),
@@ -810,7 +819,7 @@ export function createLLMQueryHandler(options: LLMQueryBridgeOptions): LLMQueryH
 
     await options.onComplete?.({
       model: options.subModel,
-      responseId: completion.responseId,
+      turnState: completion.turnState,
       usage: completion.usage,
     });
 

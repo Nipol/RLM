@@ -1,5 +1,5 @@
 import type { OpenAIProviderConfig } from './env.ts';
-import type { LLMAdapter, LLMCompletionRequest, LLMCompletionResponse } from './llm_adapter.ts';
+import type { LLMCaller, LLMCallerRequest, LLMCallerResponse, LLMProvider } from './llm_adapter.ts';
 
 type FetchLike = typeof fetch;
 
@@ -50,6 +50,20 @@ interface OpenAIResponsePayload {
  */
 export interface OpenAIResponsesAdapterOptions {
   config: OpenAIProviderConfig;
+  fetcher?: FetchLike;
+}
+
+/**
+ * Describes the constructor options for the OpenAI provider factory.
+ *
+ * @example
+ * ```ts
+ * const provider = new OpenAIResponsesProvider({
+ *   fetcher: fetch,
+ * });
+ * ```
+ */
+export interface OpenAIResponsesProviderOptions {
   fetcher?: FetchLike;
 }
 
@@ -121,7 +135,7 @@ function extractOutputText(payload: OpenAIResponsePayload): string {
 /**
  * Normalizes token accounting from the provider payload.
  */
-function normalizeUsage(payload: OpenAIResponsePayload): LLMCompletionResponse['usage'] {
+function normalizeUsage(payload: OpenAIResponsePayload): LLMCallerResponse['usage'] {
   if (payload.usage === undefined) {
     return undefined;
   }
@@ -187,7 +201,7 @@ function cleanupCompletionRequest(
  * });
  * ```
  */
-export class OpenAIResponsesAdapter implements LLMAdapter {
+export class OpenAIResponsesAdapter implements LLMCaller {
   readonly #config: OpenAIProviderConfig;
   readonly #fetcher: FetchLike;
 
@@ -230,7 +244,7 @@ export class OpenAIResponsesAdapter implements LLMAdapter {
    * });
    * ```
    */
-  async complete(request: LLMCompletionRequest): Promise<LLMCompletionResponse> {
+  async complete(request: LLMCallerRequest): Promise<LLMCallerResponse> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.#config.requestTimeoutMs);
     const handleExternalAbort = () => controller.abort();
@@ -242,8 +256,8 @@ export class OpenAIResponsesAdapter implements LLMAdapter {
         instructions: request.systemPrompt,
         model: request.model,
       };
-      if (request.previousResponseId !== undefined) {
-        requestBody.previous_response_id = request.previousResponseId;
+      if (typeof request.turnState === 'string' && request.turnState.length > 0) {
+        requestBody.previous_response_id = request.turnState;
       }
 
       const response = await this.#fetcher(
@@ -274,14 +288,14 @@ export class OpenAIResponsesAdapter implements LLMAdapter {
         throw new OpenAIResponsesError(response.status, providerMessage);
       }
 
-      let responseId: string | null = null;
+      let turnState: unknown = undefined;
       if (typeof payload.id === 'string') {
-        responseId = payload.id;
+        turnState = payload.id;
       }
 
       const normalizedResponse = {
         outputText: extractOutputText(payload),
-        responseId,
+        turnState,
         usage: normalizeUsage(payload),
       };
 
@@ -309,6 +323,55 @@ export class OpenAIResponsesAdapter implements LLMAdapter {
         message,
       );
     }
+  }
+}
+
+/**
+ * Builds provider-neutral callers backed by the OpenAI Responses API.
+ *
+ * This keeps authentication and transport concerns outside the RLM core while still
+ * allowing provider-specific convenience wiring.
+ *
+ * @example
+ * ```ts
+ * const provider = new OpenAIResponsesProvider();
+ * const llm = provider.createCaller({
+ *   apiKey: 'sk-test',
+ *   baseUrl: 'https://api.openai.com/v1',
+ *   requestTimeoutMs: 30_000,
+ *   rootModel: 'gpt-5-nano',
+ *   subModel: 'gpt-5-mini',
+ * });
+ * ```
+ */
+export class OpenAIResponsesProvider implements LLMProvider<OpenAIProviderConfig> {
+  readonly #fetcher?: FetchLike;
+
+  /**
+   * Stores shared transport dependencies used when creating callers.
+   *
+   * @example
+   * ```ts
+   * const provider = new OpenAIResponsesProvider({
+   *   fetcher: fetch,
+   * });
+   * ```
+   */
+  constructor(options: OpenAIResponsesProviderOptions = {}) {
+    this.#fetcher = options.fetcher;
+  }
+
+  /**
+   * Creates one provider-neutral caller bound to the supplied OpenAI configuration.
+   *
+   * @param config Provider credentials and model defaults.
+   * @returns A caller ready to inject into `createRLM(...)`.
+   */
+  createCaller(config: OpenAIProviderConfig): LLMCaller {
+    return new OpenAIResponsesAdapter({
+      config,
+      fetcher: this.#fetcher,
+    });
   }
 }
 

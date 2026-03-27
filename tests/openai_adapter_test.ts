@@ -4,7 +4,19 @@ import {
   __openAIAdapterTestables,
   OpenAIResponsesAdapter,
   OpenAIResponsesError,
+  OpenAIResponsesProvider,
 } from '../src/openai_adapter.ts';
+import type { LLMCallerRequest } from '../src/llm_adapter.ts';
+
+function createRequest(overrides: Partial<LLMCallerRequest> = {}): LLMCallerRequest {
+  return {
+    input: 'Solve the task.',
+    kind: 'root_turn',
+    model: 'gpt-5-nano',
+    systemPrompt: 'Use the REPL.',
+    ...overrides,
+  };
+}
 
 Deno.test('OpenAI adapter posts model instructions and input to the Responses API', async () => {
   let capturedUrl = '';
@@ -53,11 +65,7 @@ Deno.test('OpenAI adapter posts model instructions and input to the Responses AP
     },
   });
 
-  const response = await adapter.complete({
-    input: 'Solve the task.',
-    model: 'gpt-5-nano',
-    systemPrompt: 'Use the REPL.',
-  });
+  const response = await adapter.complete(createRequest());
 
   assert.equal(capturedUrl, 'https://api.openai.com/v1/responses');
   assert.equal(capturedInit?.method, 'POST');
@@ -71,7 +79,7 @@ Deno.test('OpenAI adapter posts model instructions and input to the Responses AP
   assert.equal(payload.instructions, 'Use the REPL.');
   assert.equal(payload.input, 'Solve the task.');
   assert.equal(response.outputText, '```repl\nFINAL_VAR(42)\n```');
-  assert.equal(response.responseId, 'resp_123');
+  assert.equal(response.turnState, 'resp_123');
   assert.deepEqual(response.usage, {
     cachedInputTokens: 4,
     inputTokens: 10,
@@ -105,17 +113,13 @@ Deno.test('OpenAI adapter surfaces API failures with the provider message intact
 
   await assert.rejects(
     async () => {
-      await adapter.complete({
-        input: 'Solve the task.',
-        model: 'gpt-5-nano',
-        systemPrompt: 'Use the REPL.',
-      });
+      await adapter.complete(createRequest());
     },
     OpenAIResponsesError,
   );
 });
 
-Deno.test('OpenAI adapter accepts direct output_text payloads and forwards previous response ids', async () => {
+Deno.test('OpenAI adapter accepts direct output_text payloads and forwards opaque turn state to provider continuation state', async () => {
   let capturedInit: RequestInit | undefined;
   const adapter = new OpenAIResponsesAdapter({
     config: {
@@ -141,12 +145,10 @@ Deno.test('OpenAI adapter accepts direct output_text payloads and forwards previ
     },
   });
 
-  const response = await adapter.complete({
+  const response = await adapter.complete(createRequest({
     input: 'Continue the conversation.',
-    model: 'gpt-5-nano',
-    previousResponseId: 'resp_prev',
-    systemPrompt: 'Use the REPL.',
-  });
+    turnState: 'resp_prev',
+  }));
 
   const payload = JSON.parse(String(capturedInit?.body)) as Record<string, unknown>;
   assert.equal(payload.previous_response_id, 'resp_prev');
@@ -182,11 +184,7 @@ Deno.test('OpenAI adapter rejects responses that never contain assistant text', 
 
   await assert.rejects(
     async () => {
-      await adapter.complete({
-        input: 'Solve the task.',
-        model: 'gpt-5-nano',
-        systemPrompt: 'Use the REPL.',
-      });
+      await adapter.complete(createRequest());
     },
     OpenAIResponsesError,
   );
@@ -221,21 +219,13 @@ Deno.test('OpenAI adapter maps aborts and unexpected transport failures into sta
 
   await assert.rejects(
     async () => {
-      await timeoutAdapter.complete({
-        input: 'Solve the task.',
-        model: 'gpt-5-nano',
-        systemPrompt: 'Use the REPL.',
-      });
+      await timeoutAdapter.complete(createRequest());
     },
     /timed out/u,
   );
   await assert.rejects(
     async () => {
-      await transportAdapter.complete({
-        input: 'Solve the task.',
-        model: 'gpt-5-nano',
-        systemPrompt: 'Use the REPL.',
-      });
+      await transportAdapter.complete(createRequest());
     },
     /socket closed/u,
   );
@@ -262,12 +252,9 @@ Deno.test('OpenAI adapter forwards already-aborted external signals into the pro
 
   await assert.rejects(
     async () => {
-      await adapter.complete({
-        input: 'Solve the task.',
-        model: 'gpt-5-nano',
+      await adapter.complete(createRequest({
         signal: controller.signal,
-        systemPrompt: 'Use the REPL.',
-      });
+      }));
     },
     /timed out/u,
   );
@@ -301,12 +288,9 @@ Deno.test('OpenAI adapter reacts to an external abort that fires after the reque
     },
   });
 
-  const pending = adapter.complete({
-    input: 'Solve the task.',
-    model: 'gpt-5-nano',
+  const pending = adapter.complete(createRequest({
     signal: controller.signal,
-    systemPrompt: 'Use the REPL.',
-  });
+  }));
   controller.abort();
 
   await assert.rejects(async () => await pending, /timed out/u);
@@ -378,30 +362,18 @@ Deno.test('OpenAI adapter reads plain text message content and falls back to def
     },
   });
 
-  const response = await textContentAdapter.complete({
-    input: 'Solve the task.',
-    model: 'gpt-5-nano',
-    systemPrompt: 'Use the REPL.',
-  });
+  const response = await textContentAdapter.complete(createRequest());
 
   assert.equal(response.outputText, 'FINAL("text path")');
   await assert.rejects(
     async () => {
-      await defaultStatusAdapter.complete({
-        input: 'Solve the task.',
-        model: 'gpt-5-nano',
-        systemPrompt: 'Use the REPL.',
-      });
+      await defaultStatusAdapter.complete(createRequest());
     },
     /status 500/u,
   );
   await assert.rejects(
     async () => {
-      await nonErrorAdapter.complete({
-        input: 'Solve the task.',
-        model: 'gpt-5-nano',
-        systemPrompt: 'Use the REPL.',
-      });
+      await nonErrorAdapter.complete(createRequest());
     },
     /transport exploded/u,
   );
@@ -468,21 +440,13 @@ Deno.test('OpenAI adapter falls back from empty output_text and treats payload-l
       ),
   });
 
-  const missingIdResponse = await fallbackAdapter.complete({
-    input: 'Solve the task.',
-    model: 'gpt-5-nano',
-    systemPrompt: 'Use the REPL.',
-  });
+  const missingIdResponse = await fallbackAdapter.complete(createRequest());
 
   assert.equal(missingIdResponse.outputText, 'FINAL("fallback")');
-  assert.equal(missingIdResponse.responseId, null);
+  assert.equal(missingIdResponse.turnState, undefined);
   await assert.rejects(
     async () => {
-      await payloadErrorAdapter.complete({
-        input: 'Solve the task.',
-        model: 'gpt-5-nano',
-        systemPrompt: 'Use the REPL.',
-      });
+      await payloadErrorAdapter.complete(createRequest());
     },
     /payload says no/u,
   );
@@ -527,11 +491,7 @@ Deno.test('OpenAI adapter can use the global fetch and skip message items withou
       },
     });
 
-    const response = await adapter.complete({
-      input: 'Solve the task.',
-      model: 'gpt-5-nano',
-      systemPrompt: 'Use the REPL.',
-    });
+    const response = await adapter.complete(createRequest());
 
     assert.equal(response.outputText, 'FINAL("global fetch")');
   } finally {
@@ -555,11 +515,7 @@ Deno.test('OpenAI adapter treats non-timeout DOMExceptions like ordinary transpo
 
   await assert.rejects(
     async () => {
-      await adapter.complete({
-        input: 'Solve the task.',
-        model: 'gpt-5-nano',
-        systemPrompt: 'Use the REPL.',
-      });
+      await adapter.complete(createRequest());
     },
     /dns failed/u,
   );
@@ -588,17 +544,13 @@ Deno.test('OpenAI adapter falls back to a default HTTP status message when the p
 
   await assert.rejects(
     async () => {
-      await adapter.complete({
-        input: 'Solve the task.',
-        model: 'gpt-5-nano',
-        systemPrompt: 'Use the REPL.',
-      });
+      await adapter.complete(createRequest());
     },
     /status 502/u,
   );
 });
 
-Deno.test('OpenAI adapter returns a null response id and ignores non-string content chunks', async () => {
+Deno.test('OpenAI adapter returns an undefined turn state and ignores non-string content chunks', async () => {
   const adapter = new OpenAIResponsesAdapter({
     config: {
       apiKey: 'sk-test',
@@ -628,13 +580,9 @@ Deno.test('OpenAI adapter returns a null response id and ignores non-string cont
       ),
   });
 
-  const response = await adapter.complete({
-    input: 'Solve the task.',
-    model: 'gpt-5-nano',
-    systemPrompt: 'Use the REPL.',
-  });
+  const response = await adapter.complete(createRequest());
 
-  assert.equal(response.responseId, null);
+  assert.equal(response.turnState, undefined);
   assert.equal(response.outputText, 'FINAL("fallback text")');
   assert.deepEqual(response.usage, {
     cachedInputTokens: undefined,
@@ -642,6 +590,43 @@ Deno.test('OpenAI adapter returns a null response id and ignores non-string cont
     outputTokens: undefined,
     totalTokens: undefined,
   });
+});
+
+Deno.test('OpenAI provider builds a provider-neutral caller that reuses the shared fetcher', async () => {
+  let capturedAuthorization = '';
+  const provider = new OpenAIResponsesProvider({
+    fetcher: async (_input, init) => {
+      const requestInit = init as globalThis.RequestInit | undefined;
+      capturedAuthorization = new Headers(requestInit?.headers).get('Authorization') ?? '';
+
+      return new Response(
+        JSON.stringify({
+          id: 'resp_provider_1',
+          output_text: 'FINAL("provider")',
+        }),
+        {
+          headers: { 'Content-Type': 'application/json' },
+          status: 200,
+        },
+      );
+    },
+  });
+
+  const llm = provider.createCaller({
+    apiKey: 'sk-provider',
+    baseUrl: 'https://api.openai.com/v1',
+    requestTimeoutMs: 30_000,
+    rootModel: 'gpt-5-nano',
+    subModel: 'gpt-5-mini',
+  });
+
+  const response = await llm.complete(createRequest({
+    input: 'Use the provider-created caller.',
+  }));
+
+  assert.equal(capturedAuthorization, 'Bearer sk-provider');
+  assert.equal(response.outputText, 'FINAL("provider")');
+  assert.equal(response.turnState, 'resp_provider_1');
 });
 
 Deno.test('OpenAI adapter rejects payloads whose output container is not an array', async () => {
@@ -671,11 +656,7 @@ Deno.test('OpenAI adapter rejects payloads whose output container is not an arra
 
   await assert.rejects(
     async () => {
-      await adapter.complete({
-        input: 'Solve the task.',
-        model: 'gpt-5-nano',
-        systemPrompt: 'Use the REPL.',
-      });
+      await adapter.complete(createRequest());
     },
     /did not contain assistant text/u,
   );

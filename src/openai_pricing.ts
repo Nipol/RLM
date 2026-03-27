@@ -108,11 +108,30 @@ const OPENAI_TEXT_MODEL_PRICING = new Map<string, OpenAITextModelPricing>([
   ],
 ]);
 
+function normalizePricingModelId(model: string): string {
+  const trimmed = model.trim();
+  if (trimmed.length === 0) {
+    return trimmed;
+  }
+
+  const withoutDateSuffix = trimmed.replace(/-\d{4}-\d{2}-\d{2}$/u, '');
+  if (OPENAI_TEXT_MODEL_PRICING.has(withoutDateSuffix)) {
+    return withoutDateSuffix;
+  }
+
+  const dottedGpt54 = withoutDateSuffix.replace(/^gpt-5-4(?=$|-)/u, 'gpt-5.4');
+  if (OPENAI_TEXT_MODEL_PRICING.has(dottedGpt54)) {
+    return dottedGpt54;
+  }
+
+  return withoutDateSuffix;
+}
+
 /**
  * Looks up the static pricing metadata for one supported OpenAI text model.
  */
 export function resolveOpenAITextModelPricing(model: string): OpenAITextModelPricing | null {
-  return OPENAI_TEXT_MODEL_PRICING.get(model) ?? null;
+  return OPENAI_TEXT_MODEL_PRICING.get(normalizePricingModelId(model)) ?? null;
 }
 
 function roundUsd(value: number): number {

@@ -33,6 +33,9 @@ Deno.test('deno.json contains the metadata needed for JSR publishing', async () 
     publish?: {
       include?: string[];
     };
+    tasks?: {
+      standalone?: string;
+    };
     version?: string;
   };
 
@@ -47,4 +50,8 @@ Deno.test('deno.json contains the metadata needed for JSR publishing', async () 
     'src/**/*.ts',
     '.env.example',
   ]);
+  assert.equal(
+    config.tasks?.standalone,
+    'deno run --allow-read --allow-write --allow-net=api.openai.com,auth.openai.com,chatgpt.com --unstable-worker-options src/standalone/main.ts',
+  );
 });
