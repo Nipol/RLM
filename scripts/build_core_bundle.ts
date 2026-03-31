@@ -1,32 +1,55 @@
-const OUTPUT_DIR = new URL('../dist/core/', import.meta.url);
-const OUTPUT_FILE = new URL('./index.mjs', OUTPUT_DIR);
-const ENTRY_FILE = new URL('../core.ts', import.meta.url);
+interface BundleTarget {
+  entryFile: URL;
+  outputDir: URL;
+  outputFile: URL;
+}
+
+const BUNDLE_TARGETS: BundleTarget[] = [
+  {
+    entryFile: new URL('../core.ts', import.meta.url),
+    outputDir: new URL('../dist/core/', import.meta.url),
+    outputFile: new URL('./index.mjs', new URL('../dist/core/', import.meta.url)),
+  },
+  {
+    entryFile: new URL('../openai.ts', import.meta.url),
+    outputDir: new URL('../dist/providers/openai/', import.meta.url),
+    outputFile: new URL('./index.mjs', new URL('../dist/providers/openai/', import.meta.url)),
+  },
+  {
+    entryFile: new URL('../ollama.ts', import.meta.url),
+    outputDir: new URL('../dist/providers/ollama/', import.meta.url),
+    outputFile: new URL('./index.mjs', new URL('../dist/providers/ollama/', import.meta.url)),
+  },
+];
 
 /**
- * Builds the browser-safe core library bundle as one ESM artifact.
+ * Builds the browser-safe public bundles as ESM artifacts.
  *
- * The generated file intentionally excludes standalone and provider-specific entrypoints.
+ * The generated files intentionally exclude standalone-only paths and keep
+ * the browser-consumable entrypoints importable without local file access.
  */
-async function buildCoreBundle(): Promise<void> {
-  await Deno.mkdir(OUTPUT_DIR, { recursive: true });
+async function buildBrowserBundles(): Promise<void> {
+  for (const target of BUNDLE_TARGETS) {
+    await Deno.mkdir(target.outputDir, { recursive: true });
 
-  const command = new Deno.Command(Deno.execPath(), {
-    args: [
-      'bundle',
-      '--platform=browser',
-      '--output',
-      OUTPUT_FILE.pathname,
-      ENTRY_FILE.pathname,
-    ],
-    cwd: new URL('..', import.meta.url).pathname,
-    stderr: 'inherit',
-    stdout: 'inherit',
-  });
+    const command = new Deno.Command(Deno.execPath(), {
+      args: [
+        'bundle',
+        '--platform=browser',
+        '--output',
+        target.outputFile.pathname,
+        target.entryFile.pathname,
+      ],
+      cwd: new URL('..', import.meta.url).pathname,
+      stderr: 'inherit',
+      stdout: 'inherit',
+    });
 
-  const result = await command.output();
-  if (!result.success) {
-    Deno.exit(result.code);
+    const result = await command.output();
+    if (!result.success) {
+      Deno.exit(result.code);
+    }
   }
 }
 
-await buildCoreBundle();
+await buildBrowserBundles();

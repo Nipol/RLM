@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 
 import * as root from '../mod.ts';
 import * as codexOAuthProvider from '../codex-oauth.ts';
+import * as ollamaProvider from '../ollama.ts';
 import * as openAIProvider from '../openai.ts';
 
 Deno.test('root mod entrypoint re-exports the library surface used by JSR consumers', () => {
@@ -21,6 +22,9 @@ Deno.test('provider subpath entrypoints expose provider-specific helpers without
   assert.equal(typeof openAIProvider.createOpenAIRLM, 'function');
   assert.equal(typeof openAIProvider.runOpenAIRLM, 'function');
   assert.equal(typeof openAIProvider.OpenAIResponsesProvider, 'function');
+  assert.equal(typeof ollamaProvider.createOllamaRLM, 'function');
+  assert.equal(typeof ollamaProvider.runOllamaRLM, 'function');
+  assert.equal(typeof ollamaProvider.OllamaGenerateProvider, 'function');
   assert.equal(typeof codexOAuthProvider.CodexOAuthProvider, 'function');
 });
 
@@ -31,6 +35,7 @@ Deno.test('deno.json contains the metadata needed for JSR publishing', async () 
       '.': string;
       './core': string;
       './providers/codex-oauth': string;
+      './providers/ollama': string;
       './providers/openai': string;
     };
     license?: string;
@@ -55,6 +60,7 @@ Deno.test('deno.json contains the metadata needed for JSR publishing', async () 
     '.': './mod.ts',
     './core': './core.ts',
     './providers/codex-oauth': './codex-oauth.ts',
+    './providers/ollama': './ollama.ts',
     './providers/openai': './openai.ts',
   });
   assert.deepEqual(config.publish?.include, [
@@ -63,6 +69,7 @@ Deno.test('deno.json contains the metadata needed for JSR publishing', async () 
     'codex-oauth.ts',
     'core.ts',
     'mod.ts',
+    'ollama.ts',
     'openai.ts',
     'prompts/rlm_system.ts',
     'src/**/*.ts',

@@ -9,7 +9,9 @@ Deno.test('core entrypoint exposes browser-safe core exports without standalone 
   assert.equal(typeof core.InMemoryRLMLogger, 'function');
   assert.equal(typeof core.NullRLMLogger, 'function');
   assert.equal('createOpenAIRLM' in core, false);
+  assert.equal('createOllamaRLM' in core, false);
   assert.equal('OpenAIResponsesProvider' in core, false);
+  assert.equal('OllamaGenerateProvider' in core, false);
   assert.equal('CodexOAuthProvider' in core, false);
   assert.equal('runStandaloneCLI' in core, false);
 });

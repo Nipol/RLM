@@ -6,6 +6,7 @@
     ".": "./mod.ts",
     "./core": "./core.ts",
     "./providers/codex-oauth": "./codex-oauth.ts",
+    "./providers/ollama": "./ollama.ts",
     "./providers/openai": "./openai.ts"
   },
   "compilerOptions": {
@@ -23,6 +24,7 @@
       "codex-oauth.ts",
       "core.ts",
       "mod.ts",
+      "ollama.ts",
       "openai.ts",
       "prompts/rlm_system.ts",
       "src/**/*.ts",

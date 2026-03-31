@@ -10,6 +10,18 @@ const indexFile = path.join(__dirname, 'index.html');
 const appFile = path.join(__dirname, 'app.mjs');
 const coreFile = path.resolve(__dirname, '..', '..', 'dist', 'core', 'index.mjs');
 const sharedScenarioFile = path.resolve(__dirname, '..', 'shared', 'runtime_scenario.mjs');
+const sharedOllamaProviderScenarioFile = path.resolve(
+  __dirname,
+  '..',
+  'shared',
+  'ollama_provider_scenario.mjs',
+);
+const sharedOpenAIProviderScenarioFile = path.resolve(
+  __dirname,
+  '..',
+  'shared',
+  'openai_provider_scenario.mjs',
+);
 
 const server = http.createServer(async (request, response) => {
   let requestPath = indexFile;
@@ -21,8 +33,20 @@ const server = http.createServer(async (request, response) => {
   } else if (request.url === '/shared/runtime_scenario.mjs') {
     requestPath = sharedScenarioFile;
     contentType = 'application/javascript; charset=utf-8';
+  } else if (request.url === '/shared/ollama_provider_scenario.mjs') {
+    requestPath = sharedOllamaProviderScenarioFile;
+    contentType = 'application/javascript; charset=utf-8';
+  } else if (request.url === '/shared/openai_provider_scenario.mjs') {
+    requestPath = sharedOpenAIProviderScenarioFile;
+    contentType = 'application/javascript; charset=utf-8';
   } else if (request.url === '/dist/core/index.mjs') {
     requestPath = coreFile;
+    contentType = 'application/javascript; charset=utf-8';
+  } else if (request.url === '/dist/providers/openai/index.mjs') {
+    requestPath = path.resolve(__dirname, '..', '..', 'dist', 'providers', 'openai', 'index.mjs');
+    contentType = 'application/javascript; charset=utf-8';
+  } else if (request.url === '/dist/providers/ollama/index.mjs') {
+    requestPath = path.resolve(__dirname, '..', '..', 'dist', 'providers', 'ollama', 'index.mjs');
     contentType = 'application/javascript; charset=utf-8';
   }
 
