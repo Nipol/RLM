@@ -1,313 +1,168 @@
 import assert from 'node:assert/strict';
+import { DEFAULT_RLM_SYSTEM_PROMPT_MARKDOWN } from '../prompts/rlm_system.ts';
 
 import {
   __rlmPromptTestables,
   buildRLMSystemPrompt,
   buildRLMTurnInput,
+  loadDefaultRLMSystemPromptMarkdown,
 } from '../src/rlm_prompt.ts';
 
-Deno.test('RLM system prompts stay protocol-focused and role-specific', () => {
-  const rootPrompt = buildRLMSystemPrompt();
-  assert.match(rootPrompt, /persistent JavaScript\/TypeScript REPL/u);
-  assert.match(rootPrompt, /top-level await/u);
-  assert.match(rootPrompt, /Keep the user query as the success condition/u);
-  assert.match(rootPrompt, /REPL interface: `context`, `history`, `FINAL\(value\)`, `FINAL_VAR\(value\)`, `llm_query\(prompt\)`, `rlm_query\(prompt\)`, `normalizeTarget\(value\)`, `findAnchoredValue\(text, prefix, suffix\)`, and `console\.log\(\.\.\.\)`/u);
-  assert.match(rootPrompt, /`context` and `history` are read-only inputs/u);
-  assert.match(rootPrompt, /`normalizeTarget\(value\)` returns a clean lookup string, returns `""` when a non-null input does not resolve to one, and returns `null` only for nullish input/u);
-  assert.match(rootPrompt, /`findAnchoredValue\(text, prefix, suffix\)` returns the substring between exact anchors, returns `""` when a non-null search misses, and returns `null` only for nullish input/u);
-  assert.match(rootPrompt, /store derived state in ordinary top-level variables/u);
-  assert.match(rootPrompt, /blocks run sequentially/u);
-  assert.match(rootPrompt, /structured result signals/u);
-  assert.match(rootPrompt, /prefer the built-in helpers directly over broad regex or whole-document scans/u);
-  assert.match(rootPrompt, /You are the root controller/u);
-  assert.match(rootPrompt, /Define or refine a `query_contract` variable in code before broad search/u);
-  assert.match(rootPrompt, /Delegate only narrowed subproblems/u);
-  assert.match(rootPrompt, /Call `rlm_query` either with a task string or with `\{ task, payload, expect \}`/u);
-  assert.match(rootPrompt, /object form is preferred when the delegated evidence is structured/u);
-  assert.match(rootPrompt, /When multiple narrowed candidates still share the main identifier, keep the distinguishing fields in the payload or delegated task/u);
-  assert.match(rootPrompt, /Preserve the source field names that carry the selection rule/u);
-  assert.match(rootPrompt, /If narrowed rows still differ on positive selector fields such as active, current, enabled, or primaryDispatch/u);
-  assert.match(rootPrompt, /Base each conclusion on values you can point to in `context`, prior execution signals, or delegated evidence/u);
-  assert.match(rootPrompt, /Prefer extracting existing rows, fields, spans, or aggregates over inventing missing data/u);
-  assert.match(rootPrompt, /Prefer the smallest named value that directly powers the next step/u);
-  assert.match(rootPrompt, /field-specific scalar expects such as `"vaultKey"` or `"index"`/u);
-  assert.match(rootPrompt, /read that existing field instead of inventing a new field name/u);
-  assert.match(rootPrompt, /If a required value is not yet present, gather more evidence in code or issue a narrower delegated task before FINAL/u);
-  assert.match(rootPrompt, /Treat child returns as validated JavaScript values or delegated evidence/u);
-  assert.match(rootPrompt, /After a dependent lookup returns a record or object, continue to the requested scalar field before FINAL/u);
-  assert.match(rootPrompt, /finish with that scalar value rather than the enclosing record/u);
-  assert.match(rootPrompt, /Keep `rlm_query` calls sequential/u);
-  assert.doesNotMatch(rootPrompt, /decimal digits/u);
-  assert.doesNotMatch(rootPrompt, /Date\.parse/u);
-  assert.doesNotMatch(rootPrompt, /regex literals directly/u);
-  assert.doesNotMatch(rootPrompt, /Example:/u);
+Deno.test('system prompts load from embedded markdown source and render injected templates', async () => {
+  const markdown = await loadDefaultRLMSystemPromptMarkdown();
+  const rootPrompt = await buildRLMSystemPrompt({ maxSteps: 7 });
+  const childPrompt = await buildRLMSystemPrompt({ role: 'child' });
+  const injectedPrompt = await buildRLMSystemPrompt({
+    markdown: '# 사용자 정의 시스템\n{{MAX_STEPS_SENTENCE}}\n동적 프롬프트입니다.',
+    maxSteps: 3,
+  });
 
-  const childPrompt = buildRLMSystemPrompt({ role: 'child' });
-  assert.match(childPrompt, /focused child controller/u);
-  assert.match(childPrompt, /narrow delegated task/u);
-  assert.match(childPrompt, /`context\.task` is the authoritative delegated task/u);
-  assert.match(childPrompt, /`context\.payload` is the complete delegated evidence/u);
-  assert.match(childPrompt, /`context\.expect` is a runtime-checked return contract/u);
-  assert.match(childPrompt, /`context\.selectionHints\.positiveSelectors` is present/u);
-  assert.match(childPrompt, /Return the smallest JavaScript value that satisfies the delegated task or `context\.expect`/u);
-  assert.match(childPrompt, /This child run is terminal for recursion/u);
-  assert.match(childPrompt, /use `llm_query` only if plain model help is necessary/u);
-  assert.doesNotMatch(childPrompt, /query_contract/u);
-  assert.doesNotMatch(childPrompt, /delegate only narrowed subproblems/u);
+  assert.match(rootPrompt, /^# Recursive Language Agent/mu);
+  assert.match(rootPrompt, /REPL 환경은 다음과 같이 초기화되어 있습니다\./u);
+  assert.match(rootPrompt, /\*\*문제 분해:\*\*/u);
+  assert.match(rootPrompt, /프로그래밍 가능한 전략/u);
+  assert.doesNotMatch(rootPrompt, /\{\{MAX_STEPS_SENTENCE\}\}/u);
+  assert.match(markdown, /^# Recursive Language Agent/mu);
+  assert.equal(markdown, DEFAULT_RLM_SYSTEM_PROMPT_MARKDOWN);
+
+  assert.equal(childPrompt, await buildRLMSystemPrompt());
+  assert.doesNotMatch(childPrompt, /# Root Controller/u);
+  assert.doesNotMatch(childPrompt, /# Focused Child Controller/u);
+  assert.match(injectedPrompt, /^# 사용자 정의 시스템/mu);
+  assert.match(injectedPrompt, /사용할 수 있는 최대 단계 예산은 3입니다\./u);
+  assert.match(injectedPrompt, /동적 프롬프트입니다\./u);
 });
 
-Deno.test('RLM turn input keeps root hints compact and state-oriented', () => {
-  const turnInput = buildRLMTurnInput({
+Deno.test('surfaced execution feedback renders as plain-text transcript sections', () => {
+  const record = __rlmPromptTestables.buildExecutionFeedbackText(
+    2,
+    1,
+    {
+      code: '({ pivot: "Project Selene" })',
+      finalAnswer: null,
+      resultPreview: '{"pivot":"Project Selene"}',
+      resultSignals: [{
+        kind: 'string',
+        path: '$.pivot',
+        preview: 'Project Selene',
+      }],
+      status: 'success',
+      stderr: '',
+      stdout: 'Project Selene',
+    },
+    240,
+  );
+
+  assert.match(record, /^현재 단계: 2/mu);
+  assert.match(record, /^실행: 1/mu);
+  assert.match(record, /^상태: success/mu);
+  assert.match(record, /REPL 표준 출력:/u);
+  assert.match(record, /Project Selene/u);
+});
+
+Deno.test('root turn input reflects the current compact prompt shape', () => {
+  const input = buildRLMTurnInput({
     context: {
-      document: 'alpha beta gamma delta',
-      question: 'Which token matters?',
+      document: 'Project Selene moved into dossier Silver Fern.',
+      question: 'Which dossier now contains the moon garden initiative?',
     },
     currentStep: 2,
-    outputCharLimit: 10,
-    prompt: 'Solve the task.',
-    totalSteps: 5,
-    transcript: [
-      {
-        assistantText: 'This assistant text is intentionally long.',
-        executions: [
-          {
-            code: 'const longValue = "123456789012345";',
-            finalAnswer: null,
-            resultPreview: '123456789012345',
-            resultSignals: [
-              {
-                kind: 'string',
-                path: '$',
-                preview: '123456789012345',
-              },
-            ],
-            status: 'success',
-            stderr: '',
-            stdout: '123456789012345',
-          },
-        ],
-        step: 1,
-      },
-    ],
+    outputCharLimit: 240,
+    prompt: 'Find the dossier for the moon garden initiative.',
+    totalSteps: 6,
+    transcript: [{
+      assistantText: '```repl\n({ pivot: "Project Selene" })\n```',
+      evaluatorFeedback: 'Use the pivot for a dependent lookup.',
+      executions: [{
+        code: '({ pivot: "Project Selene" })',
+        finalAnswer: null,
+        resultPreview: '{"pivot":"Project Selene"}',
+        resultSignals: [{
+          kind: 'string',
+          path: '$.pivot',
+          preview: 'Project Selene',
+        }],
+        status: 'success',
+        stderr: '',
+        stdout: 'Project Selene',
+      }],
+      step: 1,
+    }],
   });
 
-  assert.match(turnInput, /\.\.\.\[truncated/u);
-  assert.match(turnInput, /Task summary:/u);
-  assert.match(turnInput, /Step budget: 2 \/ 5/u);
-  assert.match(
-    turnInput,
-    /Use the remaining steps to maximize progress toward the exact user answer/u,
-  );
-  assert.match(
-    turnInput,
-    /When the budget is tight, finalize from verified evidence instead of starting a broad new search/u,
-  );
-  assert.match(turnInput, /prompt: string \(15 chars, 3 words\)/u);
-  assert.match(turnInput, /Root checklist:/u);
-  assert.match(turnInput, /define or refine a `query_contract` variable in code before broad search/u);
-  assert.match(turnInput, /solve direct structured filtering, indexing, and aggregation in root before delegating/u);
-  assert.match(turnInput, /read that field first and extract the target entity in code before broad scanning/u);
-  assert.match(turnInput, /prefer `rlm_query\(\{ task, payload, expect \}\)` once the evidence is narrowed/u);
-  assert.match(turnInput, /keep distinguishing fields in the payload or delegated task when multiple narrowed candidates still share the main identifier/u);
-  assert.match(turnInput, /preserve the actual source field names used by the selection rule instead of inventing aliases while narrowing rows/u);
-  assert.match(turnInput, /ground each step in rows, fields, spans, or aggregates that you can actually read from `context`, prior signals, or delegated evidence/u);
-  assert.match(turnInput, /if narrowed rows still differ on positive selector fields such as `active`, `current`, `enabled`, or `primaryDispatch`, copy those exact fields and desired truth values into the delegated task/u);
-  assert.match(turnInput, /if the next step is a dependent lookup by a named key or index field, prefer a field-specific scalar `expect` such as `"vaultKey"` or `"index"`/u);
-  assert.match(turnInput, /when a narrowed record already exposes the requested scalar field, read that existing field name directly/u);
-  assert.match(turnInput, /if the needed value is not yet present, narrow further and extract more evidence before FINAL instead of inventing a filler value/u);
-  assert.match(turnInput, /when exact prefix and suffix anchors exist, prefer `findAnchoredValue\(\.\.\.\)` before broad regex or whole-document scans/u);
-  assert.match(turnInput, /build a target-specific anchor or filter in code before you scan all matches/u);
-  assert.match(turnInput, /after a dependent lookup returns a record, continue to the requested scalar field before FINAL/u);
-  assert.match(turnInput, /treat child returns as validated JavaScript values or delegated evidence and inspect them in code before FINAL or the next delegation/u);
-  assert.match(turnInput, /REPL interface reminder:/u);
-  assert.match(turnInput, /`normalizeTarget\(value\)` returns a clean string target, `""` when a non-null input stays unresolved, and `null` only for nullish input/u);
-  assert.match(turnInput, /`findAnchoredValue\(text, prefix, suffix\)` returns the substring between exact anchors, `""` when a non-null search misses, and `null` only for nullish input/u);
-  assert.match(turnInput, /`context` and `history` are read-only inputs/u);
-  assert.match(turnInput, /store derived values in top-level variables/u);
-  assert.match(turnInput, /Context summary:/u);
-  assert.match(turnInput, /document: string \(22 chars, 4 words\)/u);
-  assert.match(turnInput, /Question-like context fields:/u);
-  assert.match(turnInput, /question: Which token matters\?/u);
-  assert.match(turnInput, /signals:/u);
-  assert.match(turnInput, /\$ \(string\): 123456789012345/u);
-  assert.match(turnInput, /If one of the previous executions already exposed the exact requested value, finalize now/u);
-  assert.match(turnInput, /When a child return is incomplete, build the next narrower delegated task from that returned value/u);
-  assert.doesNotMatch(turnInput, /decimal digits/u);
-  assert.doesNotMatch(turnInput, /Date\.parse/u);
-  assert.doesNotMatch(turnInput, /regex literals directly/u);
+  assert.match(input, /## REPL 목표 :\nFind the dossier for the moon garden initiative\./u);
+  assert.match(input, /질문형 문맥 필드:\n- question: Which dossier now contains the moon garden initiative\?/u);
+  assert.match(input, /단계 예산: 2 \/ 6/u);
+  assert.doesNotMatch(input, /## REPL 기록 형식/u);
+  assert.doesNotMatch(input, /## 최신 REPL 실행/u);
+  assert.doesNotMatch(input, /## 이전 REPL 기록/u);
+  assert.doesNotMatch(input, /다음 행동:/u);
+  assert.doesNotMatch(input, /surfaceType/u);
 });
 
-Deno.test('RLM turn input surfaces actual field names for top-level arrays of records', () => {
-  const turnInput = buildRLMTurnInput({
+Deno.test('delegated turn input keeps recursive note and plain feedback format', () => {
+  const input = buildRLMTurnInput({
     context: {
-      dossiers: [
-        { active: false, primaryDispatch: false, profile: 'shape-profile-17', vaultKey: 'VS-17-A' },
-        { active: true, primaryDispatch: true, profile: 'shape-profile-17', vaultKey: 'VS-17-B' },
-      ],
-      targetProfile: 'shape-profile-17',
-      vaultRegister: {
-        'VC-17-A': { code: '769365' },
-        'VC-17-B': { code: '448840' },
-      },
+      expect: 'string',
+      payload: { alias: 'moon garden', canonical: 'Project Selene' },
+      task: 'Resolve the dossier name for the canonical project.',
     },
-    outputCharLimit: 80,
-    prompt: 'Return the 6-digit access code for context.targetProfile.',
-    transcript: [],
-  });
-
-  assert.match(
-    turnInput,
-    /dossiers: array \(2 items; sample keys: active, primaryDispatch, profile, vaultKey\); varying boolean fields: active, primaryDispatch/u,
-  );
-  assert.match(
-    turnInput,
-    /vaultRegister: object \(2 keys: VC-17-A, VC-17-B; sample value keys: code\)/u,
-  );
-});
-
-Deno.test('RLM prompt helpers ignore non-string large-context fields when building previews', () => {
-  assert.equal(
-    __rlmPromptTestables.buildContextPreviews({
-      document: 'short',
-      metadata: 42,
-      nested: { value: 'ignored' },
-    }),
-    null,
-  );
-});
-
-Deno.test('RLM turn input keeps large-context, recovery, repeated-failure, and child guidance concise', () => {
-  const largeContextTurnInput = buildRLMTurnInput({
-    context: {
-      document: 'alpha '.repeat(4_000),
-    },
-    outputCharLimit: 20,
-    prompt: 'Solve the task.',
-    transcript: [],
-  });
-
-  assert.match(largeContextTurnInput, /Large-context mode is active/u);
-  assert.match(largeContextTurnInput, /Inspect size and structure before broad search/u);
-  assert.match(largeContextTurnInput, /The response should begin with a ```repl block/u);
-
-  const recoveryTurnInput = buildRLMTurnInput({
-    context: {
-      document: 'alpha beta gamma delta',
-    },
-    outputCharLimit: 40,
-    prompt: 'Recover from the last failed execution.',
-    transcript: [
-      {
-        assistantText: '```repl\nFINAL_VAR("wrong");\nthrow new Error("boom");\n```',
-        executions: [
-          {
-            code: 'FINAL_VAR("wrong");\nthrow new Error("boom");',
-            finalAnswer: 'wrong',
-            resultPreview: 'undefined',
-            status: 'error',
-            stderr: 'Error: boom',
-            stdout: '',
-          },
-        ],
-        step: 1,
-      },
-    ],
-  });
-
-  assert.match(recoveryTurnInput, /Execution recovery is active/u);
-  assert.match(recoveryTurnInput, /Repair the failing code using the recorded stderr and prior outputs/u);
-
-  const repeatedFailureTurnInput = buildRLMTurnInput({
-    context: {
-      document: 'alpha beta gamma delta',
-    },
-    outputCharLimit: 80,
-    prompt: 'Find the current release code.',
-    transcript: [
-      {
-        assistantText: '```repl\nfunction helper() {}\n```',
-        executions: [
-          {
-            code: 'function helper() {}',
-            finalAnswer: null,
-            resultPreview: 'undefined',
-            status: 'error',
-            stderr: 'TypeError: helper is not a function',
-            stdout: '',
-          },
-        ],
-        step: 1,
-      },
-    ],
-  });
-
-  assert.match(repeatedFailureTurnInput, /Strategy shift is active/u);
-  assert.match(repeatedFailureTurnInput, /Use one self-contained block for the next attempt/u);
-
-  const contractFailureTurnInput = buildRLMTurnInput({
-    context: {
-      dossiers: [{ profile: 'orion', vaultKey: 'V-554' }],
-      targetProfile: 'orion',
-    },
-    outputCharLimit: 80,
-    prompt: 'Return the enabled 6-digit access code for context.targetProfile.',
-    transcript: [
-      {
-        assistantText: '```repl\nawait rlm_query({ task: "Pick the dossier.", expect: "vaultKey" })\n```',
-        executions: [
-          {
-            code: 'await rlm_query({ task: "Pick the dossier.", expect: "vaultKey" })',
-            finalAnswer: null,
-            resultPreview: 'undefined',
-            status: 'error',
-            stderr:
-              'RLMSubqueryContractError: rlm_query contract mismatch for "Pick the dossier.": expected object but received string.',
-            stdout: '',
-          },
-        ],
-        step: 1,
-      },
-    ],
-  });
-
-  assert.match(contractFailureTurnInput, /Delegated contract recovery is active/u);
-  assert.match(
-    contractFailureTurnInput,
-    /Rewrite the next `rlm_query` call with a concrete `expect` contract/u,
-  );
-  assert.match(
-    contractFailureTurnInput,
-    /If multiple candidates still share the main identifier, carry the remaining distinguishing fields/u,
-  );
-
-  const childTurnInput = buildRLMTurnInput({
-    context: {
-      expect: { type: 'string' },
-      payload: {
-        dossiers: [{ profile: 'orion', primaryDispatch: true, vaultKey: 'V-554' }],
-      },
-      selectionHints: {
-        positiveSelectors: ['primaryDispatch'],
-      },
-      task: 'Return only the vaultKey for the active primary dispatch dossier.',
-      type: 'rlm_delegated_task',
-    },
-    currentStep: 1,
-    outputCharLimit: 80,
-    prompt: 'Extract the exact code from the narrowed excerpt.',
+    outputCharLimit: 240,
+    prompt: 'Unused parent prompt.',
     role: 'child',
-    totalSteps: 4,
-    transcript: [],
+    transcript: [{
+      assistantText: '```repl\n({ alias: "moon garden" })\n```',
+      executions: [{
+        code: '({ alias: "moon garden" })',
+        finalAnswer: null,
+        resultPreview: '{"alias":"moon garden"}',
+        resultSignals: [{
+          kind: 'string',
+          path: '$.alias',
+          preview: 'moon garden',
+        }],
+        status: 'success',
+        stderr: '',
+        stdout: '',
+      }],
+      step: 1,
+    }],
   });
 
-  assert.match(childTurnInput, /Child-mode constraints are active/u);
-  assert.match(childTurnInput, /If `context\.task` is present, treat it as the delegated task/u);
-  assert.match(childTurnInput, /If `context\.payload` is present, treat it as the narrowed delegated data you must inspect in code/u);
-  assert.match(childTurnInput, /If `context\.expect` is present, return a JavaScript value that satisfies that runtime-checked contract/u);
-  assert.match(childTurnInput, /If `context\.selectionHints\.positiveSelectors` is present, use those source field names as decisive positive selectors/u);
-  assert.doesNotMatch(childTurnInput, /Task summary:/u);
-  assert.doesNotMatch(childTurnInput, /Step budget:/u);
-  assert.doesNotMatch(childTurnInput, /Root checklist:/u);
-  assert.doesNotMatch(childTurnInput, /head preview/u);
-  assert.doesNotMatch(childTurnInput, /tail preview/u);
+  assert.match(input, /REPL 목표 :\nResolve the dossier name for the canonical project\./u);
+  assert.match(input, /context\.payload :/u);
+  assert.match(input, /moon garden/u);
+  assert.match(input, /context\.expect :/u);
+  assert.match(input, /```text\nstring\n```/u);
+  assert.match(input, /## 위임된 증거 안내/u);
+  assert.match(input, /좁힌 row를 고르거나 넘길 때 그 원본 필드 이름을 유지/u);
+  assert.doesNotMatch(input, /## REPL 기록 형식/u);
+  assert.doesNotMatch(input, /다음 행동:/u);
+  assert.doesNotMatch(input, /단계 예산:/u);
+});
+
+Deno.test('turn input no longer injects large-context or recovery banners', () => {
+  const input = buildRLMTurnInput({
+    context: { document: 'token '.repeat(25_000) },
+    currentStep: 1,
+    outputCharLimit: 160,
+    prompt: 'Find the identifier.',
+    totalSteps: 4,
+    transcript: [{
+      assistantText: '```repl\nFINAL_VAR("")\n```',
+      executions: [{
+        code: 'FINAL_VAR("")',
+        finalAnswer: '',
+        resultPreview: '""',
+        status: 'success',
+        stderr: '',
+        stdout: '',
+      }],
+      step: 1,
+    }],
+  });
+
+  assert.doesNotMatch(input, /대형 문맥 모드가 활성화되었습니다\./u);
+  assert.doesNotMatch(input, /최종화 복구/u);
+  assert.doesNotMatch(input, /실행 복구/u);
 });

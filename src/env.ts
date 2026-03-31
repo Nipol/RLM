@@ -1,3 +1,5 @@
+import { isNotFoundError, type ReadTextFileSync } from './platform.ts';
+
 /**
  * Describes the local `.env` file reader used by the configuration loader.
  *
@@ -11,7 +13,7 @@
  */
 export interface DotEnvFileOptions {
   path?: string;
-  readTextFileSync?: (path: string) => string;
+  readTextFileSync?: ReadTextFileSync;
 }
 
 /**
@@ -260,12 +262,21 @@ export function parseDotEnv(text: string): Record<string, string> {
  */
 export function loadDotEnvFile(options: DotEnvFileOptions = {}): Record<string, string> {
   const path = options.path ?? DEFAULT_ENV_PATH;
-  const readTextFileSync = options.readTextFileSync ?? Deno.readTextFileSync;
+  const readTextFileSync = options.readTextFileSync ??
+    ((globalThis as typeof globalThis & {
+      Deno?: {
+        readTextFileSync?: ReadTextFileSync;
+      };
+    }).Deno?.readTextFileSync);
+
+  if (readTextFileSync === undefined) {
+    return {};
+  }
 
   try {
     return parseDotEnv(readTextFileSync(path));
   } catch (error) {
-    if (error instanceof Deno.errors.NotFound) {
+    if (isNotFoundError(error)) {
       return {};
     }
 

@@ -1,12 +1,13 @@
 const RESERVED_IDENTIFIERS = [
   'FINAL',
   'FINAL_VAR',
+  'SHOW_VARS',
   'context',
-  'findAnchoredValue',
   'history',
   'llm_query',
-  'normalizeTarget',
+  'llm_query_batched',
   'rlm_query',
+  'rlm_query_batched',
 ] as const;
 
 const BLOCKED_IMPORT_PATTERNS = [/\bimport\s*\(/, /\bimport\s+/, /\bimport\.meta\b/, /\bexport\s+/];

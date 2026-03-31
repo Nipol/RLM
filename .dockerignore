@@ -1,0 +1,6 @@
+.git
+coverage
+logs
+smoke/node_modules
+book.md
+stable.md

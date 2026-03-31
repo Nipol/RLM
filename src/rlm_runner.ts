@@ -1,17 +1,14 @@
 import type {
-  OpenAIRLMClientOptions,
   RLMClient,
   RLMClientOptions,
   RLMDefaults,
+  RLMEvaluatorOptions,
   RLMRunInput,
 } from './library_entrypoint.ts';
-import { loadRLMConfig } from './env.ts';
-import type { OpenAIProviderConfig, RLMConfig } from './env.ts';
 import { createDefaultExecutionBackend } from './execution_backend.ts';
 import { createSubqueryLogger, getLoggerJournalPath, resolveRLMLogger } from './logger.ts';
 import { createLLMQueryHandler, createRLMQueryHandler } from './llm_query.ts';
 import type { LLMAdapter, LLMCaller, LLMCallerResponse } from './llm_adapter.ts';
-import { OpenAIResponsesProvider } from './openai_adapter.ts';
 import { buildRLMSystemPrompt, buildRLMTurnInput } from './rlm_prompt.ts';
 import { extractFinalSignal, extractReplCodeBlocks } from './repl_protocol.ts';
 import type { FinalSignal, ReplCodeBlock } from './repl_protocol.ts';
@@ -24,6 +21,7 @@ import {
 } from './usage_summary.ts';
 import type {
   AssistantTurnEntry,
+  EvaluatorFeedbackEntry,
   ExecutionBackend,
   JsonValue,
   RLMLogger,
@@ -72,6 +70,7 @@ export interface RLMRunOptions extends RLMRunInput {
   adapter?: LLMAdapter;
   clock?: () => Date;
   depth?: number;
+  evaluator?: RLMEvaluatorOptions;
   executionBackend?: ExecutionBackend;
   idGenerator?: () => string;
   journalPath?: string;
@@ -100,40 +99,6 @@ export interface RLMRunResult {
   session: ReplSession;
   steps: number;
   usage: RLMUsageSummary;
-}
-
-/**
- * Describes the convenience wrapper inputs for OpenAI-backed RLM runs.
- *
- * Explicit `openAI` configuration is the preferred library path.
- * `config` or implicit `.env` loading remain available for standalone convenience.
- * In this provider-backed path, `cellTimeoutMs` is interpreted as additional REPL
- * cell budget on top of the provider request timeout.
- *
- * @example
- * ```ts
- * const options: RunOpenAIRLMOptions = {
- *   context: { document: 'Chapter 1\\nThe answer is 42.' },
- *   openAI: {
- *     apiKey: 'sk-test',
- *     baseUrl: 'https://api.openai.com/v1',
- *     requestTimeoutMs: 30_000,
- *     rootModel: 'gpt-5-nano',
- *     subModel: 'gpt-5-mini',
- *   },
- *   prompt: 'Extract the answer.',
- * };
- * ```
- */
-export interface RunOpenAIRLMOptions extends RLMRunInput {
-  clock?: () => Date;
-  config?: RLMConfig;
-  executionBackend?: ExecutionBackend;
-  fetcher?: typeof fetch;
-  idGenerator?: () => string;
-  journalPath?: string;
-  logger?: RLMLogger;
-  openAI?: OpenAIProviderConfig;
 }
 
 /**
@@ -183,23 +148,6 @@ function resolveRunLimit(value: number | undefined, fallback: number): number {
   return value ?? fallback;
 }
 
-function resolveProviderAwareCellTimeoutMs(
-  additionalTimeoutMs: number | undefined,
-  providerRequestTimeoutMs: number,
-  defaultAdditionalTimeoutMs = DEFAULT_CELL_TIMEOUT_MS,
-): number {
-  return providerRequestTimeoutMs + (additionalTimeoutMs ?? defaultAdditionalTimeoutMs);
-}
-
-function resolveOpenAIRunLogger(
-  logger: RLMLogger | undefined,
-  journalPath: string | undefined,
-): RLMLogger | undefined {
-  return logger ?? (journalPath === undefined ? undefined : resolveRLMLogger({
-    journalPath,
-  }));
-}
-
 function resolveRLMCaller(
   llm: LLMCaller | undefined,
   adapter: LLMAdapter | undefined,
@@ -222,6 +170,20 @@ function resolveSubqueryAnswerValue(
   return nested.finalValue ?? nested.answer;
 }
 
+function readLatestAcceptedFinalStdout(
+  history: Array<{
+    finalAnswer: string | null;
+    finalResult?: ValueSnapshot | null;
+    status: 'error' | 'success' | 'timeout';
+    stdout: string;
+  }>,
+): string {
+  const latest = [...history].reverse().find((cell) =>
+    shouldAcceptExecutionFinalAnswer(cell.status, cell.finalAnswer, cell.finalResult)
+  );
+  return latest?.stdout ?? '';
+}
+
 /**
  * Accepts only terminal values that represent a successful, usable final answer.
  *
@@ -232,6 +194,7 @@ function resolveSubqueryAnswerValue(
 function shouldAcceptExecutionFinalAnswer(
   status: 'error' | 'success' | 'timeout',
   finalAnswer: string | null,
+  finalResult?: ValueSnapshot | null,
 ): boolean {
   if (status !== 'success') {
     return false;
@@ -241,7 +204,16 @@ function shouldAcceptExecutionFinalAnswer(
     return false;
   }
 
+  if (finalResult?.kind === 'null') {
+    return false;
+  }
+
   return finalAnswer !== 'undefined';
+}
+
+function shouldAcceptExplicitFinalSignalValue(value: string): boolean {
+  const trimmed = value.trim();
+  return trimmed !== 'null' && trimmed !== 'undefined';
 }
 
 function extractFinalJsonValue(result: ValueSnapshot | null | undefined): JsonValue | null {
@@ -250,6 +222,621 @@ function extractFinalJsonValue(result: ValueSnapshot | null | undefined): JsonVa
   }
 
   return result.json ?? null;
+}
+
+interface WeakFinalizationSummary {
+  message: string;
+  reason:
+    | 'ambiguous_projection'
+    | 'candidate_fallback'
+    | 'empty'
+    | 'multiple_choice'
+    | 'placeholder'
+    | 'truncated_scalar';
+}
+
+function isLikelyMultipleChoiceAnswer(answer: string): boolean {
+  return /^[A-Z]$/u.test(answer.trim());
+}
+
+function readContextOptions(context: JsonValue | null): Record<string, string> | null {
+  if (context === null || typeof context !== 'object' || Array.isArray(context)) {
+    return null;
+  }
+
+  if (
+    !('options' in context) || typeof context.options !== 'object' || context.options === null ||
+    Array.isArray(context.options)
+  ) {
+    return null;
+  }
+
+  const entries = Object.entries(context.options)
+    .filter((entry): entry is [string, string] => typeof entry[1] === 'string');
+  if (entries.length === 0) {
+    return null;
+  }
+
+  return Object.fromEntries(entries);
+}
+
+function readContextDocument(context: JsonValue | null): string | null {
+  if (typeof context === 'string') {
+    return context;
+  }
+
+  if (context === null || typeof context !== 'object' || Array.isArray(context)) {
+    return null;
+  }
+
+  return typeof context.document === 'string' ? context.document : null;
+}
+
+function readQuestionLikeText(context: JsonValue | null): string | null {
+  if (context === null || typeof context !== 'object' || Array.isArray(context)) {
+    return null;
+  }
+
+  const preferredKeys = ['question', 'retrievalQuestion', 'query', 'task'] as const;
+  for (const key of preferredKeys) {
+    const value = context[key];
+    if (typeof value === 'string' && value.trim().length > 0) {
+      return value;
+    }
+  }
+
+  return null;
+}
+
+function inferRequestedEntityLabel(prompt: string, context: JsonValue | null): string | null {
+  const candidates = [readQuestionLikeText(context), prompt]
+    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+
+  for (const source of candidates) {
+    const match = source.match(
+      /\bwhich\s+([a-z][a-z0-9 -]{0,40}?)(?:\s+(?:is|are|contains?|gives?|maps?|seals?|does|do|for|from|assigned|matches?)\b|\?)/iu,
+    );
+    if (match?.[1] !== undefined) {
+      return match[1].replace(/\s+/gu, ' ').trim().toLowerCase();
+    }
+  }
+
+  return null;
+}
+
+const TARGET_LABEL_LEADING_MODIFIERS = new Set([
+  'exact',
+  'correct',
+  'final',
+  'requested',
+  'resolved',
+  'matching',
+  'single',
+  'uppercase',
+  'lowercase',
+]);
+
+const TARGET_LABEL_TRAILING_GENERIC_WORDS = new Set([
+  'answer',
+  'code',
+  'id',
+  'identifier',
+  'key',
+  'label',
+  'letter',
+  'name',
+  'number',
+  'value',
+]);
+
+function stripLeadingTargetModifiers(label: string): string {
+  const parts = label.trim().toLowerCase().split(/\s+/u).filter((part) => part.length > 0);
+  while (parts.length > 1 && TARGET_LABEL_LEADING_MODIFIERS.has(parts[0]!)) {
+    parts.shift();
+  }
+
+  return parts.join(' ');
+}
+
+function stripTrailingTargetSuffixes(label: string): string {
+  const parts = label.trim().toLowerCase().split(/\s+/u).filter((part) => part.length > 0);
+  while (parts.length > 1 && TARGET_LABEL_TRAILING_GENERIC_WORDS.has(parts.at(-1)!)) {
+    parts.pop();
+  }
+
+  return parts.join(' ');
+}
+
+function collectRequestedEntityLabels(prompt: string, context: JsonValue | null): string[] {
+  const base = inferRequestedEntityLabel(prompt, context);
+  if (base === null) {
+    return [];
+  }
+
+  const labels = new Set<string>();
+  const normalized = base.replace(/\s+/gu, ' ').trim().toLowerCase();
+  const withoutLeading = stripLeadingTargetModifiers(normalized);
+  const withoutTrailing = stripTrailingTargetSuffixes(withoutLeading);
+
+  for (const candidate of [normalized, withoutLeading, withoutTrailing]) {
+    if (candidate.length > 0) {
+      labels.add(candidate);
+    }
+  }
+
+  return [...labels];
+}
+
+function normalizeCandidateValue(value: string): string {
+  return value
+    .replace(/^[`"'([{]+/gu, '')
+    .replace(/[`"')\].,;:!?-]+$/gu, '')
+    .replace(/\s+/gu, ' ')
+    .trim();
+}
+
+function extractTargetCandidatesFromEvidence(targetLabel: string, evidence: string): string[] {
+  if (targetLabel.trim().length === 0 || evidence.trim().length === 0) {
+    return [];
+  }
+
+  const escapedLabel = targetLabel
+    .split(/\s+/u)
+    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&'))
+    .join('\\s+');
+  const pattern = new RegExp(
+    `${escapedLabel}\\s*(?:is|are|=|:)?\\s*([^\\n.;,:]+)`,
+    'giu',
+  );
+  const values = new Map<string, string>();
+  for (const match of evidence.matchAll(pattern)) {
+    const raw = match[1];
+    if (raw === undefined) {
+      continue;
+    }
+
+    const normalized = normalizeCandidateValue(raw);
+    if (normalized.length === 0) {
+      continue;
+    }
+
+    if (
+      /\b(which|question|assigned to|contains|gives|maps|seals)\b/iu.test(normalized) ||
+      normalized.split(/\s+/u).length > 6
+    ) {
+      continue;
+    }
+
+    const key = normalized.toLowerCase();
+    if (!values.has(key)) {
+      values.set(key, normalized);
+    }
+  }
+
+  return [...values.values()];
+}
+
+function buildCombinedEvidenceText(input: {
+  execution: {
+    resultPreview: string;
+    resultSignals?: Array<{ preview: string }>;
+    stdout: string;
+  };
+  transcript: Array<{
+    executions: Array<{
+      resultPreview: string;
+      resultSignals?: Array<{ preview: string }>;
+      stdout: string;
+    }>;
+  }>;
+}): string {
+  return `${buildExecutionOutputEvidenceText(input.execution)}\n${buildTranscriptEvidenceText(input.transcript)}`;
+}
+
+function readCompetingTargetCandidates(input: {
+  context: JsonValue | null;
+  execution: {
+    resultPreview: string;
+    resultSignals?: Array<{ preview: string }>;
+    stdout: string;
+  };
+  prompt: string;
+  transcript: Array<{
+    executions: Array<{
+      resultPreview: string;
+      resultSignals?: Array<{ preview: string }>;
+      stdout: string;
+    }>;
+  }>;
+}): { candidates: string[]; labels: string[] } | null {
+  if (isLikelyMultipleChoiceTask(input.prompt, input.context)) {
+    return null;
+  }
+
+  const labels = collectRequestedEntityLabels(input.prompt, input.context);
+  if (labels.length === 0) {
+    return null;
+  }
+
+  const evidence = buildCombinedEvidenceText({
+    execution: input.execution,
+    transcript: input.transcript,
+  });
+  const candidates = new Map<string, string>();
+  for (const label of labels) {
+    for (const candidate of extractTargetCandidatesFromEvidence(label, evidence)) {
+      const key = candidate.toLowerCase();
+      if (!candidates.has(key)) {
+        candidates.set(key, candidate);
+      }
+    }
+  }
+
+  const values = [...candidates.values()];
+  if (values.length < 2) {
+    return null;
+  }
+
+  return {
+    candidates: values,
+    labels,
+  };
+}
+
+function readEmbeddedDocumentOptions(context: JsonValue | null): Record<string, string> | null {
+  const document = readContextDocument(context);
+  if (document === null) {
+    return null;
+  }
+
+  const matches = [
+    ...document.matchAll(/\b([A-Z])\s*[=:]\s*(.+?)(?=(?:\s+\b[A-Z]\s*[=:])|[.\n]|$)/gs),
+  ];
+  if (matches.length === 0) {
+    return null;
+  }
+
+  const options = new Map<string, string>();
+  for (const match of matches) {
+    const label = match[1]?.trim();
+    const text = match[2]?.replace(/[,\s]+$/gu, '').trim();
+    if (label === undefined || text === undefined || label.length !== 1 || text.length === 0) {
+      continue;
+    }
+
+    options.set(label, text);
+  }
+
+  if (options.size === 0) {
+    return null;
+  }
+
+  return Object.fromEntries(options);
+}
+
+function readAvailableOptions(context: JsonValue | null): Record<string, string> | null {
+  return readContextOptions(context) ?? readEmbeddedDocumentOptions(context);
+}
+
+function isLikelyMultipleChoiceTask(prompt: string, context: JsonValue | null): boolean {
+  if (readContextOptions(context) !== null) {
+    return true;
+  }
+
+  return /multiple-choice|option letter|option\b/i.test(prompt);
+}
+
+function buildExecutionOutputEvidenceText(
+  execution: {
+    code?: string;
+    resultSignals?: Array<{ preview: string }>;
+    resultPreview: string;
+    stdout: string;
+  },
+): string {
+  const signalText = execution.resultSignals?.map((signal) => signal.preview).join('\n') ?? '';
+  return [
+    execution.stdout,
+    execution.resultPreview,
+    signalText,
+  ].join('\n');
+}
+
+function buildTranscriptEvidenceText(
+  transcript: Array<{
+    executions: Array<{
+      resultPreview: string;
+      resultSignals?: Array<{ preview: string }>;
+      stdout: string;
+    }>;
+  }>,
+): string {
+  return transcript
+    .flatMap((turn) => turn.executions)
+    .map((execution) =>
+      buildExecutionOutputEvidenceText({
+        resultPreview: execution.resultPreview,
+        resultSignals: execution.resultSignals,
+        stdout: execution.stdout,
+      })
+    )
+    .join('\n');
+}
+
+function normalizeEvidenceText(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/gu, ' ')
+    .trim();
+}
+
+function matchOptionFromEvidence(
+  prompt: string,
+  context: JsonValue | null,
+  execution: {
+    code?: string;
+    resultSignals?: Array<{ preview: string }>;
+    resultPreview: string;
+    stdout: string;
+  },
+): { label: string; text: string } | null {
+  const options = readAvailableOptions(context);
+  if (options === null) {
+    return null;
+  }
+
+  const evidence = normalizeEvidenceText(buildExecutionOutputEvidenceText(execution));
+  if (evidence.length === 0) {
+    return null;
+  }
+
+  const matches = Object.entries(options)
+    .filter(([, optionText]) => {
+      const normalizedOption = normalizeEvidenceText(optionText);
+      return normalizedOption.length > 0 && evidence.includes(normalizedOption);
+    })
+    .map(([label, text]) => ({ label, text }));
+
+  if (matches.length === 1) {
+    return matches[0]!;
+  }
+
+  if (matches.length > 1 && /multiple-choice|option\b/i.test(prompt)) {
+    return null;
+  }
+
+  return null;
+}
+
+function matchOptionFromTranscriptEvidence(
+  prompt: string,
+  context: JsonValue | null,
+  transcript: Array<{
+    executions: Array<{
+      resultPreview: string;
+      resultSignals?: Array<{ preview: string }>;
+      stdout: string;
+    }>;
+  }>,
+): { label: string; text: string } | null {
+  const options = readAvailableOptions(context);
+  if (options === null) {
+    return null;
+  }
+
+  const evidence = normalizeEvidenceText(buildTranscriptEvidenceText(transcript));
+  if (evidence.length === 0) {
+    return null;
+  }
+
+  const matches = Object.entries(options)
+    .filter(([, optionText]) => {
+      const normalizedOption = normalizeEvidenceText(optionText);
+      return normalizedOption.length > 0 && evidence.includes(normalizedOption);
+    })
+    .map(([label, text]) => ({ label, text }));
+
+  return matches.length === 1 ? matches[0]! : null;
+}
+
+function hasSelectedOptionEvidence(
+  answer: string,
+  prompt: string,
+  context: JsonValue | null,
+  execution: {
+    code?: string;
+    resultSignals?: Array<{ preview: string }>;
+    resultPreview: string;
+    stdout: string;
+  },
+): boolean {
+  const evidence = buildExecutionOutputEvidenceText(execution);
+  const labelPattern = new RegExp(`(^|[^\\w\\[])${answer}\\s*[=)\\].:\\-]`, 'imu');
+  if (labelPattern.test(evidence)) {
+    return true;
+  }
+
+  const matchedOption = matchOptionFromEvidence(prompt, context, execution);
+  if (matchedOption?.label === answer) {
+    return true;
+  }
+
+  const options = readAvailableOptions(context);
+  const optionText = options?.[answer];
+  if (optionText !== undefined && evidence.toLowerCase().includes(optionText.toLowerCase())) {
+    return true;
+  }
+
+  if (options === null && /multiple-choice|option\b/i.test(prompt)) {
+    return /question options|optionMatchCount|optCount/u.test(evidence);
+  }
+
+  return false;
+}
+
+function usesLiteralFinalChoice(code: string, answer: string): boolean {
+  const escaped = answer.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+  return new RegExp(`FINAL(?:_VAR)?\\(\\s*["']${escaped}["']\\s*\\)`, 'u').test(code);
+}
+
+function isPlaceholderLikeFinalAnswer(answer: string): boolean {
+  return /^(?:unknown|pending|none|n\/a|n\\.a\\.|tbd|unset)$/iu.test(answer.trim());
+}
+
+function usesFirstCandidateFinalWithoutUniquenessGuard(code: string): boolean {
+  const hasFirstCandidateSelection =
+    /FINAL(?:_VAR)?\([\s\S]{0,240}(?:\[\s*0\s*\]|\.at\(\s*0\s*\))[\s\S]{0,240}\)/u.test(code) ||
+    /(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*[\s\S]{0,240}\.find\([\s\S]{0,240}\)\s*(?:\|\||\?\?)\s*[A-Za-z_$][\w$]*\s*\[\s*0\s*\]/u
+      .test(code) && /FINAL(?:_VAR)?\(\s*[A-Za-z_$][\w$]*\s*\)/u.test(code);
+  if (!hasFirstCandidateSelection) {
+    return false;
+  }
+
+  const hasUniquenessGuard =
+    /length\s*===\s*1|length\s*<=\s*1|\.size\s*===\s*1|candidateCount\s*===\s*1|unique(?:Count)?\s*===\s*1/u
+      .test(code);
+  return !hasUniquenessGuard;
+}
+
+function usesMergedWorkingSetProjectionWithoutUniquenessGuard(code: string): boolean {
+  const hasMergedWorkingSet = /\.join\(\s*["'`]/u.test(code) || /join\(\s*["'`][\s\S]{0,8}["'`]\s*\)/u.test(code);
+  if (!hasMergedWorkingSet || !/FINAL(?:_VAR)?\(/u.test(code)) {
+    return false;
+  }
+
+  const hasProjection =
+    /\.match\(/u.test(code);
+  if (!hasProjection) {
+    return false;
+  }
+
+  const hasUniquenessGuard =
+    /length\s*===\s*1|length\s*<=\s*1|\.size\s*===\s*1|candidateCount\s*===\s*1|unique(?:Count)?\s*===\s*1/u
+      .test(code);
+  return !hasUniquenessGuard;
+}
+
+function finalAnswerRepeatsTargetLabel(
+  finalAnswer: string,
+  labels: readonly string[],
+): boolean {
+  const normalizedAnswer = finalAnswer.trim().toLowerCase();
+  return labels.some((label) =>
+    normalizedAnswer === label ||
+    normalizedAnswer.startsWith(`${label} `) ||
+    normalizedAnswer.startsWith(`${label}:`) ||
+    normalizedAnswer.startsWith(`${label}=`)
+  );
+}
+
+function readTruncatedScalarPrefixFromEvidence(
+  finalAnswer: string,
+  evidence: string,
+): string | null {
+  const normalizedAnswer = normalizeCandidateValue(finalAnswer);
+  if (normalizedAnswer.length < 4 || /\s/u.test(normalizedAnswer)) {
+    return null;
+  }
+
+  const tokens = evidence.match(/[A-Za-z0-9-]{4,}/gu) ?? [];
+  let longestMatch: string | null = null;
+  for (const token of tokens) {
+    const normalizedToken = normalizeCandidateValue(token);
+    if (normalizedToken.length <= normalizedAnswer.length) {
+      continue;
+    }
+
+    if (!normalizedToken.startsWith(normalizedAnswer)) {
+      continue;
+    }
+
+    if (longestMatch === null || normalizedToken.length > longestMatch.length) {
+      longestMatch = normalizedToken;
+    }
+  }
+
+  return longestMatch;
+}
+
+function isScalarLikeTask(prompt: string, context: JsonValue | null): boolean {
+  if (isLikelyMultipleChoiceTask(prompt, context)) {
+    return true;
+  }
+
+  const question = readQuestionLikeText(context) ?? '';
+  const combined = `${prompt}\n${question}`.toLowerCase();
+  return /\breturn only\b|\bexact\b|\bidentifier\b|\bname\b|\bcode\b|\bdigits?\b|\bscalar\b|\bwhich\b/u
+    .test(combined);
+}
+
+function hasPositiveSurfacedCandidateEvidence(input: {
+  execution: {
+    resultPreview: string;
+    resultSignals?: Array<{ preview: string }>;
+    stdout: string;
+  };
+  transcript: Array<{
+    executions: Array<{
+      resultPreview: string;
+      resultSignals?: Array<{ preview: string }>;
+      stdout: string;
+    }>;
+  }>;
+}): boolean {
+  const evidence = `${buildExecutionOutputEvidenceText(input.execution)}\n${
+    buildTranscriptEvidenceText(input.transcript)
+  }`;
+
+  return /(hitCount|matchCount|candidateCount|rowCount)\s*["=:]\s*[1-9]\d*/iu.test(evidence) ||
+    /"sample"\s*:\s*\[/u.test(evidence) ||
+    /"candidates"\s*:\s*\[[^\]]+/u.test(evidence) ||
+    /\brows?\b/u.test(evidence) && /\[[^\]]+\]/u.test(evidence);
+}
+
+function readLatestTranscriptFinalAnswer(
+  transcript: Array<{
+    executions: Array<{
+      finalAnswer?: string | null;
+    }>;
+  }>,
+): string | null {
+  const latestTurn = transcript.at(-1);
+  if (latestTurn === undefined) {
+    return null;
+  }
+
+  const latestExecution = [...latestTurn.executions]
+    .reverse()
+    .find((execution) => execution.finalAnswer !== null && execution.finalAnswer !== undefined);
+  if (latestExecution?.finalAnswer === undefined || latestExecution.finalAnswer === null) {
+    return null;
+  }
+
+  return latestExecution.finalAnswer.trim();
+}
+
+function summarizeWeakFinalization(input: {
+  context: JsonValue | null;
+  execution: {
+    code: string;
+    finalAnswer: string | null;
+    resultPreview: string;
+    resultSignals?: Array<{ preview: string }>;
+    stdout: string;
+  };
+  prompt: string;
+  role: 'child' | 'root';
+  transcript: Array<{
+    executions: Array<{
+      finalAnswer?: string | null;
+      resultPreview: string;
+      resultSignals?: Array<{ preview: string }>;
+      stdout: string;
+    }>;
+  }>;
+}): WeakFinalizationSummary | null {
+  void input;
+  return null;
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
@@ -262,6 +849,134 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   throw error;
 }
 
+function shouldRunEvaluator(
+  evaluator: RLMEvaluatorOptions | undefined,
+): evaluator is RLMEvaluatorOptions {
+  return evaluator?.enabled !== false && evaluator?.model.trim().length !== 0;
+}
+
+function clipEvaluatorFeedback(text: string, maxChars: number): string {
+  const normalized = text.replace(/\s+/gu, ' ').trim();
+  if (normalized.length <= maxChars) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, Math.max(0, maxChars)).trimEnd()}...`;
+}
+
+function buildEvaluatorSystemPrompt(maxFeedbackChars: number): string {
+  return [
+    '당신은 완료된 RLM 한 단계만 읽는 읽기 전용 평가자입니다.',
+    '작업을 직접 해결하지 마십시오.',
+    'repl 코드, JSON 래퍼, markdown fence를 출력하지 마십시오.',
+    '간결한 평문 피드백만 반환하십시오.',
+    '누락된 증거, 파싱 실수, 수상한 0 또는 빈 결과, 너무 이른 최종화, 선택지 매핑 실수에 집중하십시오.',
+    `피드백은 ${maxFeedbackChars}자 이내로 유지하십시오.`,
+  ].join(' ');
+}
+
+function buildEvaluatorObservedValuesText(execution: {
+  resultSignals?: Array<{ kind?: string; path?: string; preview: string }>;
+}): string {
+  const lines = execution.resultSignals
+    ?.map((signal) => {
+      const path = signal.path ?? '$';
+      return `${path} (${signal.kind ?? '알 수 없음'}): ${signal.preview}`;
+    })
+    .filter((line) => line.trim().length > 0) ?? [];
+
+  return lines.length === 0 ? '(none)' : lines.join('\n');
+}
+
+function buildEvaluatorInput(input: {
+  assistantText: string;
+  executions: Array<{
+    code: string;
+    finalAnswer: string | null;
+    resultPreview: string;
+    resultSignals?: Array<{ kind?: string; path?: string; preview: string }>;
+    status: 'error' | 'success' | 'timeout';
+    stderr: string;
+    stdout: string;
+  }>;
+  prompt: string;
+  step: number;
+  totalSteps: number;
+}): string {
+  const executionSections = input.executions.map((execution, index) =>
+    [
+      `실행 ${index + 1}:`,
+      `상태: ${execution.status}`,
+      `코드:\n${execution.code}`,
+      `표준 출력:\n${execution.stdout.trim().length === 0 ? '(비어 있음)' : execution.stdout.trim()}`,
+      `표준 에러:\n${execution.stderr.trim().length === 0 ? '(비어 있음)' : execution.stderr.trim()}`,
+      `관찰된 값:\n${buildEvaluatorObservedValuesText(execution)}`,
+      `결과: ${execution.resultPreview}`,
+      `최종값: ${execution.finalAnswer ?? '(없음)'}`,
+    ].join('\n')
+  );
+
+  return [
+    `작업 프롬프트:\n${input.prompt}`,
+    `어시스턴트 텍스트:\n${input.assistantText}`,
+    executionSections.join('\n\n'),
+  ].join('\n\n');
+}
+
+async function generateEvaluatorFeedback(input: {
+  assistantText: string;
+  depth: number;
+  evaluator: RLMEvaluatorOptions | undefined;
+  executions: Array<{
+    code: string;
+    finalAnswer: string | null;
+    resultPreview: string;
+    resultSignals?: Array<{ preview: string }>;
+    status: 'error' | 'success' | 'timeout';
+    stderr: string;
+    stdout: string;
+  }>;
+  llm: LLMCaller;
+  onComplete: (response: LLMCallerResponse, model: string) => void;
+  prompt: string;
+  signal?: AbortSignal;
+  step: number;
+  totalSteps: number;
+}): Promise<string | undefined> {
+  if (!shouldRunEvaluator(input.evaluator) || input.executions.length === 0) {
+    return undefined;
+  }
+
+  try {
+    const response = await input.llm.complete({
+      input: buildEvaluatorInput({
+        assistantText: input.assistantText,
+        executions: input.executions,
+        prompt: input.prompt,
+        step: input.step,
+        totalSteps: input.totalSteps,
+      }),
+      kind: 'plain_query',
+      metadata: {
+        depth: input.depth,
+        step: input.step,
+      },
+      model: input.evaluator.model,
+      signal: input.signal,
+      systemPrompt: buildEvaluatorSystemPrompt(input.evaluator.maxFeedbackChars ?? 240),
+    });
+    input.onComplete(response, input.evaluator.model);
+
+    const feedback = clipEvaluatorFeedback(
+      response.outputText,
+      input.evaluator.maxFeedbackChars ?? 240,
+    );
+    return feedback.length === 0 ? undefined : feedback;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Appends one assistant turn entry to the configured logger.
  *
@@ -271,6 +986,13 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 async function appendAssistantTurnEntry(
   logger: RLMLogger,
   entry: AssistantTurnEntry,
+): Promise<void> {
+  await logger.append(entry);
+}
+
+async function appendEvaluatorFeedbackEntry(
+  logger: RLMLogger,
+  entry: EvaluatorFeedbackEntry,
 ): Promise<void> {
   await logger.append(entry);
 }
@@ -325,6 +1047,7 @@ export function createRLM(options: RLMClientOptions): RLMClient {
         cellTimeoutMs: input.cellTimeoutMs ?? defaults.cellTimeoutMs,
         clock: options.clock,
         context: input.context,
+        evaluator: options.evaluator,
         executionBackend: options.executionBackend,
         idGenerator: options.idGenerator,
         llm: options.llm,
@@ -335,73 +1058,8 @@ export function createRLM(options: RLMClientOptions): RLMClient {
         prompt: input.prompt,
         rootModel: options.models.root,
         subModel: options.models.sub,
+        systemPromptMarkdown: input.systemPromptMarkdown ?? options.systemPromptMarkdown,
         systemPromptExtension: input.systemPromptExtension,
-      }),
-  };
-}
-
-/**
- * Builds the OpenAI-backed convenience client from explicit provider arguments.
- *
- * This helper is meant for library consumers who want explicit provider configuration
- * without manually constructing a caller.
- * In this provider-backed path, `defaults.cellTimeoutMs` is interpreted as additional
- * REPL cell budget on top of the provider request timeout.
- *
- * @param options Explicit OpenAI configuration plus optional logger, backend, and defaults.
- * @returns An `RLMClient` configured to use the OpenAI Responses API.
- *
- * @example
- * ```ts
- * const client = createOpenAIRLM({
- *   openAI: {
- *     apiKey: 'sk-test',
- *     baseUrl: 'https://api.openai.com/v1',
- *     requestTimeoutMs: 30_000,
- *     rootModel: 'gpt-5-nano',
- *     subModel: 'gpt-5-mini',
- *   },
- * });
- * ```
- */
-export function createOpenAIRLM(options: OpenAIRLMClientOptions): RLMClient {
-  const provider = new OpenAIResponsesProvider({
-    fetcher: options.fetcher,
-  });
-  const defaultAdditionalCellTimeoutMs = options.defaults?.cellTimeoutMs ?? DEFAULT_CELL_TIMEOUT_MS;
-  const baseClient = createRLM({
-    llm: provider.createCaller(options.openAI),
-    clock: options.clock,
-    defaults: {
-      cellTimeoutMs: resolveProviderAwareCellTimeoutMs(
-        undefined,
-        options.openAI.requestTimeoutMs,
-        defaultAdditionalCellTimeoutMs,
-      ),
-      maxSteps: options.defaults?.maxSteps,
-      maxSubcallDepth: options.defaults?.maxSubcallDepth,
-      outputCharLimit: options.defaults?.outputCharLimit,
-    },
-    executionBackend: options.executionBackend,
-    idGenerator: options.idGenerator,
-    logger: options.logger,
-    models: {
-      root: options.openAI.rootModel,
-      sub: options.openAI.subModel,
-    },
-  });
-
-  return {
-    run: async (input) =>
-      await baseClient.run({
-        ...input,
-        cellTimeoutMs: input.cellTimeoutMs === undefined
-          ? undefined
-          : resolveProviderAwareCellTimeoutMs(
-            input.cellTimeoutMs,
-            options.openAI.requestTimeoutMs,
-            defaultAdditionalCellTimeoutMs,
-          ),
       }),
   };
 }
@@ -441,69 +1099,6 @@ export async function runRLM(options: RLMRunOptions): Promise<RLMRunResult> {
 }
 
 /**
- * Runs one OpenAI-backed RLM loop while keeping explicit provider args library-safe.
- *
- * When `openAI` is supplied, this function behaves as a pure library helper.
- * When `config` is supplied, it uses the already-loaded repository config.
- * When neither is supplied, it falls back to `.env` loading for standalone usage.
- *
- * @param options OpenAI configuration or config loader inputs plus one-shot run inputs.
- * @returns The final answer and resulting REPL session.
- *
- * @example
- * ```ts
- * const result = await runOpenAIRLM({
- *   context: { document: 'Chapter 1\\nThe answer is 42.' },
- *   openAI: {
- *     apiKey: 'sk-test',
- *     baseUrl: 'https://api.openai.com/v1',
- *     requestTimeoutMs: 30_000,
- *     rootModel: 'gpt-5-nano',
- *     subModel: 'gpt-5-mini',
- *   },
- *   prompt: 'Extract the answer.',
- * });
- * ```
- */
-export async function runOpenAIRLM(options: RunOpenAIRLMOptions): Promise<RLMRunResult> {
-  const loaded = options.config ??
-    (options.openAI === undefined ? loadRLMConfig() : {
-      openAI: options.openAI,
-      runtime: {
-        cellTimeoutMs: DEFAULT_CELL_TIMEOUT_MS,
-        maxSteps: DEFAULT_MAX_STEPS,
-        maxSubcallDepth: DEFAULT_MAX_SUBCALL_DEPTH,
-        outputCharLimit: DEFAULT_OUTPUT_CHAR_LIMIT,
-      },
-    });
-
-  const client = createOpenAIRLM({
-    clock: options.clock,
-    defaults: {
-      cellTimeoutMs: loaded.runtime.cellTimeoutMs,
-      maxSteps: options.maxSteps ?? loaded.runtime.maxSteps,
-      maxSubcallDepth: options.maxSubcallDepth ?? loaded.runtime.maxSubcallDepth,
-      outputCharLimit: options.outputCharLimit ?? loaded.runtime.outputCharLimit,
-    },
-    executionBackend: options.executionBackend,
-    fetcher: options.fetcher,
-    idGenerator: options.idGenerator,
-    logger: resolveOpenAIRunLogger(options.logger, options.journalPath),
-    openAI: loaded.openAI,
-  });
-
-  return await client.run({
-    cellTimeoutMs: options.cellTimeoutMs,
-    context: options.context,
-    maxSteps: options.maxSteps,
-    maxSubcallDepth: options.maxSubcallDepth,
-    outputCharLimit: options.outputCharLimit,
-    prompt: options.prompt,
-    systemPromptExtension: options.systemPromptExtension,
-  });
-}
-
-/**
  * Executes one loop instance with explicit depth so subqueries can recurse safely.
  *
  * This function owns the actual controller loop:
@@ -519,7 +1114,11 @@ async function runRLMInternal(options: InternalRLMRunOptions): Promise<RLMRunRes
   const clock = options.clock ?? (() => new Date());
   const transcript: Parameters<typeof buildRLMTurnInput>[0]['transcript'] = [];
   const role = resolveControllerRole(options.depth);
-  const baseSystemPrompt = buildRLMSystemPrompt({ role });
+  const baseSystemPrompt = await buildRLMSystemPrompt({
+    markdown: options.systemPromptMarkdown,
+    maxSteps: options.maxSteps,
+    role,
+  });
   const systemPrompt = options.systemPromptExtension === undefined ||
       options.systemPromptExtension.trim().length === 0
     ? baseSystemPrompt
@@ -561,6 +1160,7 @@ async function runRLMInternal(options: InternalRLMRunOptions): Promise<RLMRunRes
         });
         try {
           mergeUsageSummaries(usageSummary, nested.usage);
+          const nestedStdout = readLatestAcceptedFinalStdout(nested.session.history);
 
           await appendSubqueryEntry(options.logger, {
             answer: resolveSubqueryAnswerValue(nested),
@@ -576,6 +1176,7 @@ async function runRLMInternal(options: InternalRLMRunOptions): Promise<RLMRunRes
           return {
             answer: nested.answer,
             steps: nested.steps,
+            stdout: nestedStdout,
             usage: nested.usage,
             value: nested.finalValue,
           };
@@ -603,46 +1204,36 @@ async function runRLMInternal(options: InternalRLMRunOptions): Promise<RLMRunRes
     let completion: LLMCallerResponse | null = null;
     let codeBlocks: ReplCodeBlock[] = [];
     let finalSignal: FinalSignal | null = null;
+    let appendedTranscriptTurn = false;
 
-    const recoveryPrompts = [
-      baseInput,
-      `${baseInput}\n\nProtocol recovery:\nRespond with one or more \`\`\`repl blocks that advance the task, or return an explicit FINAL signal if the answer is already verified.`,
-      `${baseInput}\n\nProtocol recovery:\nStart immediately with a \`\`\`repl block. A valid next response contains one or more \`\`\`repl blocks that advance the task, or an explicit FINAL signal if the answer is already verified.`,
-    ];
-
-    for (let attempt = 0; attempt < recoveryPrompts.length; attempt += 1) {
-      const input = recoveryPrompts[attempt]!;
-      completion = await llm.complete({
-        input,
-        kind: role === 'root' ? 'root_turn' : 'child_turn',
-        metadata: {
-          depth: options.depth,
-          step,
-        },
-        model: options.rootModel,
-        signal: options.signal,
-        systemPrompt,
-        turnState,
-      });
-      throwIfAborted(options.signal);
-      recordUsage(usageSummary, options.rootModel, completion.usage);
-      turnState = completion.turnState;
-
-      await appendAssistantTurnEntry(options.logger, {
-        assistantText: completion.outputText,
-        createdAt: clock().toISOString(),
-        model: options.rootModel,
+    completion = await llm.complete({
+      input: baseInput,
+      kind: role === 'root' ? 'root_turn' : 'child_turn',
+      metadata: {
+        depth: options.depth,
         step,
-        type: 'assistant_turn',
-      });
+      },
+      model: options.rootModel,
+      signal: options.signal,
+      systemPrompt,
+      turnState,
+    });
+    throwIfAborted(options.signal);
+    recordUsage(usageSummary, options.rootModel, completion.usage);
+    turnState = completion.turnState;
 
-      codeBlocks = extractReplCodeBlocks(completion.outputText);
-      if (codeBlocks.length > 0) {
-        break;
-      }
+    await appendAssistantTurnEntry(options.logger, {
+      assistantText: completion.outputText,
+      createdAt: clock().toISOString(),
+      model: options.rootModel,
+      step,
+      type: 'assistant_turn',
+    });
 
+    codeBlocks = extractReplCodeBlocks(completion.outputText);
+    if (codeBlocks.length === 0) {
       finalSignal = extractFinalSignal(completion.outputText);
-      if (finalSignal !== null) {
+      if (finalSignal !== null && shouldAcceptExplicitFinalSignalValue(finalSignal.value)) {
         return {
           answer: finalSignal.value,
           finalValue: finalSignal.value,
@@ -674,15 +1265,64 @@ async function runRLMInternal(options: InternalRLMRunOptions): Promise<RLMRunRes
       });
 
       if (execution.finalAnswer !== null) {
-        if (!shouldAcceptExecutionFinalAnswer(execution.status, execution.finalAnswer)) {
+        if (
+          !shouldAcceptExecutionFinalAnswer(
+            execution.status,
+            execution.finalAnswer,
+            execution.finalResult,
+          )
+        ) {
           continue;
         }
 
-        transcript.push({
-          assistantText: completion.outputText,
-          executions,
-          step,
+        const weakFinalization = summarizeWeakFinalization({
+          context: options.context,
+          execution: {
+            code: block.code,
+            finalAnswer: execution.finalAnswer,
+            resultPreview: execution.result.preview,
+            resultSignals: execution.result.signals,
+            stdout: execution.stdout,
+          },
+          prompt: options.prompt,
+          role,
+          transcript,
         });
+
+        if (weakFinalization !== null) {
+          const evaluatorFeedback = await generateEvaluatorFeedback({
+            assistantText: completion.outputText,
+            depth: options.depth,
+            evaluator: options.evaluator,
+            executions,
+            llm,
+            onComplete: (response, model) => {
+              recordUsage(usageSummary, model, response.usage);
+            },
+            prompt: options.prompt,
+            signal: options.signal,
+            step,
+            totalSteps: options.maxSteps,
+          });
+          if (evaluatorFeedback !== undefined && shouldRunEvaluator(options.evaluator)) {
+            await appendEvaluatorFeedbackEntry(options.logger, {
+              createdAt: clock().toISOString(),
+              feedback: evaluatorFeedback,
+              model: options.evaluator.model,
+              step,
+              type: 'evaluator_feedback',
+            });
+          }
+
+          transcript.push({
+            assistantText: completion.outputText,
+            evaluatorFeedback,
+            executions,
+            step,
+          });
+          appendedTranscriptTurn = true;
+          break;
+        }
 
         return {
           answer: execution.finalAnswer,
@@ -693,29 +1333,71 @@ async function runRLMInternal(options: InternalRLMRunOptions): Promise<RLMRunRes
         };
       }
 
-      if (execution.status !== 'success') {
-        break;
-      }
     }
 
-    transcript.push({
-      assistantText: completion.outputText,
-      executions,
-      step,
-    });
+    if (!appendedTranscriptTurn) {
+      const evaluatorFeedback = await generateEvaluatorFeedback({
+        assistantText: completion.outputText,
+        depth: options.depth,
+        evaluator: options.evaluator,
+        executions,
+        llm,
+        onComplete: (response, model) => {
+          recordUsage(usageSummary, model, response.usage);
+        },
+        prompt: options.prompt,
+        signal: options.signal,
+        step,
+        totalSteps: options.maxSteps,
+      });
+      if (evaluatorFeedback !== undefined && shouldRunEvaluator(options.evaluator)) {
+        await appendEvaluatorFeedbackEntry(options.logger, {
+          createdAt: clock().toISOString(),
+          feedback: evaluatorFeedback,
+          model: options.evaluator.model,
+          step,
+          type: 'evaluator_feedback',
+        });
+      }
+
+      transcript.push({
+        assistantText: completion.outputText,
+        evaluatorFeedback,
+        executions,
+        step,
+      });
+    }
   }
 
   throw new RLMMaxStepsError(options.maxSteps);
 }
 
 export const __rlmRunnerTestables = {
+  buildEvaluatorInput,
+  collectRequestedEntityLabels,
   extractFinalJsonValue,
+  extractTargetCandidatesFromEvidence,
+  hasSelectedOptionEvidence,
+  isLikelyMultipleChoiceAnswer,
+  isLikelyMultipleChoiceTask,
+  matchOptionFromEvidence,
+  matchOptionFromTranscriptEvidence,
+  readLatestAcceptedFinalStdout,
+  readAvailableOptions,
+  readContextOptions,
   resolveControllerRole,
-  resolveProviderAwareCellTimeoutMs,
   resolveRLMCaller,
-  resolveOpenAIRunLogger,
   resolveRunLimit,
   resolveSubqueryAnswerValue,
+  readCompetingTargetCandidates,
+  readLatestTranscriptFinalAnswer,
+  readTruncatedScalarPrefixFromEvidence,
+  summarizeWeakFinalization,
   shouldAcceptExecutionFinalAnswer,
   throwIfAborted,
+  hasPositiveSurfacedCandidateEvidence,
+  isPlaceholderLikeFinalAnswer,
+  usesLiteralFinalChoice,
+  usesFirstCandidateFinalWithoutUniquenessGuard,
+  usesMergedWorkingSetProjectionWithoutUniquenessGuard,
 };

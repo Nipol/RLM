@@ -1,14 +1,9 @@
 import assert from 'node:assert/strict';
 
 import type { ExecutionBackend, PersistentRuntimeLike } from '../src/index.ts';
-import {
-  createOpenAIRLM,
-  createRLM,
-  InMemoryRLMLogger,
-  NullRLMLogger,
-  runRLM,
-} from '../src/index.ts';
+import { createRLM, InMemoryRLMLogger, NullRLMLogger, runRLM } from '../src/index.ts';
 import type { LLMCaller, LLMCallerRequest, LLMCallerResponse } from '../src/llm_adapter.ts';
+import { createOpenAIRLM } from '../src/providers/openai.ts';
 import type { CellEntry } from '../src/types.ts';
 
 function createClock(start = Date.parse('2026-03-24T00:00:00.000Z')): () => Date {
@@ -127,6 +122,103 @@ Deno.test('createRLM keeps legacy adapter injection available through a compatib
 
   assert.equal(result.answer, 'shimmed');
   assert.equal(adapter.requests[0]?.kind, 'root_turn');
+});
+
+Deno.test('createRLM lets callers override the base system prompt markdown per run', async () => {
+  const llm = new MockCaller([
+    {
+      outputText: '```repl\nFINAL_VAR("ok");\n```',
+      turnState: { opaque: 'root-1' },
+    },
+  ]);
+
+  const client = createRLM({
+    llm,
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    models: {
+      root: 'gpt-5-nano',
+      sub: 'gpt-5-mini',
+    },
+    systemPromptMarkdown: '# 클라이언트 기본 시스템\n기본 프롬프트입니다.',
+  });
+
+  const result = await client.run({
+    context: null,
+    prompt: 'Return ok.',
+    systemPromptMarkdown: '# 실행별 시스템\n{{MAX_STEPS_SENTENCE}}\n실행별 프롬프트입니다.',
+  });
+
+  assert.equal(result.answer, 'ok');
+  assert.match(llm.requests[0]?.systemPrompt ?? '', /^# 실행별 시스템/mu);
+  assert.match(llm.requests[0]?.systemPrompt ?? '', /실행별 프롬프트입니다\./u);
+});
+
+Deno.test('createRLM can request optional evaluator feedback through the same injected caller', async () => {
+  const llm = new MockCaller([
+    {
+      outputText: '```repl\nconst sample = "amount=120";\nconsole.log({ sample });\n```',
+      turnState: { opaque: 'root-1' },
+    },
+    {
+      outputText: 'You surfaced a sample row but have not validated the parsed numeric amount yet.',
+    },
+    {
+      outputText: '```repl\nFINAL_VAR("120");\n```',
+      turnState: { opaque: 'root-2' },
+    },
+  ]);
+  const logger = new InMemoryRLMLogger();
+
+  const client = createRLM({
+    llm,
+    clock: createClock(),
+    defaults: {
+      maxSteps: 3,
+      maxSubcallDepth: 1,
+      outputCharLimit: 120,
+    },
+    evaluator: {
+      enabled: true,
+      maxFeedbackChars: 48,
+      model: 'gpt-5-evaluator',
+    },
+    idGenerator: createIdGenerator(),
+    logger,
+    models: {
+      root: 'gpt-5-nano',
+      sub: 'gpt-5-mini',
+    },
+  });
+
+  const result = await client.run({
+    context: { document: 'Program Orion entry: status=approved amount=120 reviewer=west.' },
+    prompt: 'Extract the approved amount.',
+  });
+
+  assert.equal(result.answer, '120');
+  assert.equal(llm.requests.length, 3);
+  assert.equal(llm.requests[0]?.kind, 'root_turn');
+  assert.equal(llm.requests[0]?.model, 'gpt-5-nano');
+  assert.equal(llm.requests[1]?.kind, 'plain_query');
+  assert.equal(llm.requests[1]?.model, 'gpt-5-evaluator');
+  assert.equal(llm.requests[1]?.metadata?.step, 1);
+  assert.equal(llm.requests[2]?.kind, 'root_turn');
+  assert.match(llm.requests[2]?.input ?? '', /Evaluator feedback:/u);
+  assert.match(llm.requests[2]?.input ?? '', /You surfaced a sample row/u);
+  const evaluatorEntry = logger.entries.find(
+    (entry): entry is {
+      createdAt: string;
+      feedback: string;
+      model: string;
+      step: number;
+      type: 'evaluator_feedback';
+    } => entry.type === 'evaluator_feedback',
+  );
+  assert.ok(evaluatorEntry !== undefined);
+  assert.equal(evaluatorEntry.model, 'gpt-5-evaluator');
+  assert.equal(evaluatorEntry.step, 1);
+  assert.match(evaluatorEntry.feedback, /You surfaced a sample row/u);
 });
 
 Deno.test('runRLM accepts an injected in-memory logger and records the session without filesystem state', async () => {

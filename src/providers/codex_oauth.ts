@@ -1,12 +1,22 @@
-import { Buffer } from 'node:buffer';
-import { dirname, join } from 'node:path';
-
 import type {
   LLMCaller,
   LLMCallerRequest,
   LLMCallerResponse,
   LLMProvider,
 } from '../llm_adapter.ts';
+import {
+  decodeBase64Url,
+  type DirectoryCreateOptions,
+  dirnameFilePath,
+  encodeBase64Url,
+  importNodeBuiltin,
+  isNotFoundError,
+  joinFilePath,
+  type MakeDirectory,
+  type ReadTextFile,
+  resolveCurrentWorkingDirectory,
+  type WriteTextFile,
+} from '../platform.ts';
 
 const DEFAULT_AUTH_BASE_URL = 'https://auth.openai.com';
 const DEFAULT_API_BASE_URL = 'https://chatgpt.com/backend-api';
@@ -17,6 +27,7 @@ const DEFAULT_SCOPE = 'openid profile email offline_access';
 const DEFAULT_ORIGINATOR = 'rlm';
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const EMPTY_ASSISTANT_TEXT_RETRY_COUNT = 1;
+const MODEL_LIST_RETRY_COUNT = 1;
 const DEFAULT_USER_AGENT = 'rlm';
 const MODEL_LIST_PATH = '/codex/models';
 const REFRESH_SKEW_MS = 60_000;
@@ -76,6 +87,40 @@ interface CodexResponsePayload {
   output?: CodexMessagePayload[];
   output_text?: string;
   usage?: CodexUsagePayload;
+}
+
+interface NodeFsPromisesLike {
+  mkdir(path: string, options?: { recursive?: boolean }): Promise<void>;
+  readFile(path: string, encoding: string): Promise<string>;
+  writeFile(path: string, data: string, encoding: string): Promise<void>;
+}
+
+interface NodeHttpModuleLike {
+  createServer(
+    handler: (request: NodeHttpRequestLike, response: NodeHttpResponseLike) => void,
+  ): {
+    close(callback?: (error?: Error) => void): void;
+    listen(port: number, hostname: string, callback?: () => void): void;
+    on(event: 'connection', listener: (socket: NodeHttpSocketLike) => void): void;
+    on(event: 'error', listener: (error: Error) => void): void;
+  };
+}
+
+interface NodeHttpRequestLike {
+  headers: {
+    host?: string;
+  };
+  url?: string;
+}
+
+interface NodeHttpResponseLike {
+  end(text?: string, callback?: () => void): void;
+  writeHead(statusCode: number, headers: Record<string, string>): void;
+}
+
+interface NodeHttpSocketLike {
+  destroy(): void;
+  once(event: 'close', listener: () => void): void;
 }
 
 function tryParseJson(text: string): unknown {
@@ -480,14 +525,14 @@ export interface CodexOAuthProviderOptions {
   createCodeVerifier?: () => string | Promise<string>;
   createState?: () => string;
   fetcher?: FetchLike;
-  mkdir?: (path: string, options?: Deno.MkdirOptions) => Promise<void>;
+  mkdir?: MakeDirectory;
   originator?: string;
   openUrl?: (url: string) => void | Promise<void>;
-  readTextFile?: (path: string) => Promise<string>;
+  readTextFile?: ReadTextFile;
   receiveAuthorizationCode?: CodexOAuthAuthorizationReceiver;
   storagePath?: string;
   userAgent?: string;
-  writeTextFile?: (path: string, data: string) => Promise<void>;
+  writeTextFile?: WriteTextFile;
 }
 
 function resolveClock(clock: CodexOAuthProviderOptions['clock']): () => Date {
@@ -497,31 +542,74 @@ function resolveClock(clock: CodexOAuthProviderOptions['clock']): () => Date {
 function resolveReadTextFile(
   readTextFile: CodexOAuthProviderOptions['readTextFile'],
 ): NonNullable<CodexOAuthProviderOptions['readTextFile']> {
-  return readTextFile ?? Deno.readTextFile;
+  const defaultReadTextFile = (globalThis as typeof globalThis & {
+    Deno?: {
+      readTextFile?: ReadTextFile;
+    };
+  }).Deno?.readTextFile;
+
+  if (readTextFile !== undefined) {
+    return readTextFile;
+  }
+
+  if (defaultReadTextFile !== undefined) {
+    return defaultReadTextFile;
+  }
+
+  return async (path) => {
+    const fs = await importNodeBuiltin<NodeFsPromisesLike>('fs/promises');
+    return await fs.readFile(path, 'utf8');
+  };
 }
 
 function resolveWriteTextFile(
   writeTextFile: CodexOAuthProviderOptions['writeTextFile'],
 ): NonNullable<CodexOAuthProviderOptions['writeTextFile']> {
-  return writeTextFile ?? Deno.writeTextFile;
+  const defaultWriteTextFile = (globalThis as typeof globalThis & {
+    Deno?: {
+      writeTextFile?: WriteTextFile;
+    };
+  }).Deno?.writeTextFile;
+
+  if (writeTextFile !== undefined) {
+    return writeTextFile;
+  }
+
+  if (defaultWriteTextFile !== undefined) {
+    return defaultWriteTextFile;
+  }
+
+  return async (path, data) => {
+    const fs = await importNodeBuiltin<NodeFsPromisesLike>('fs/promises');
+    await fs.writeFile(path, data, 'utf8');
+  };
 }
 
 function resolveMkdir(
   mkdir: CodexOAuthProviderOptions['mkdir'],
 ): NonNullable<CodexOAuthProviderOptions['mkdir']> {
-  return mkdir ?? Deno.mkdir;
+  const defaultMkdir = (globalThis as typeof globalThis & {
+    Deno?: {
+      mkdir?: MakeDirectory;
+    };
+  }).Deno?.mkdir;
+
+  if (mkdir !== undefined) {
+    return mkdir;
+  }
+
+  if (defaultMkdir !== undefined) {
+    return defaultMkdir;
+  }
+
+  return async (path, options?: DirectoryCreateOptions) => {
+    const fs = await importNodeBuiltin<NodeFsPromisesLike>('fs/promises');
+    await fs.mkdir(path, options);
+  };
 }
 
 function resolveStoragePath(path: string | undefined): string {
-  return path ?? join(Deno.cwd(), '.rlm', 'codex-oauth.json');
-}
-
-function encodeBase64Url(input: Uint8Array): string {
-  return Buffer.from(input).toString('base64url');
-}
-
-function decodeBase64Url(input: string): string {
-  return Buffer.from(input, 'base64url').toString('utf8');
+  return path ?? joinFilePath(resolveCurrentWorkingDirectory(), '.rlm', 'codex-oauth.json');
 }
 
 async function createCodeChallenge(verifier: string): Promise<string> {
@@ -678,6 +766,29 @@ function normalizeModelIds(payload: ModelListResponse): string[] {
   }
 
   return ids;
+}
+
+function parseModelListPayload(rawText: string): (ModelListResponse & { error?: unknown }) | null {
+  const trimmed = rawText.trim();
+  if (trimmed.length === 0) {
+    return null;
+  }
+
+  const payload = tryParseJson(trimmed);
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    return null;
+  }
+
+  return payload as ModelListResponse & { error?: unknown };
+}
+
+function formatInvalidModelListPayloadMessage(rawText: string): string {
+  const trimmed = rawText.trim();
+  if (trimmed.length === 0) {
+    return 'Codex OAuth model listing returned an invalid response payload.';
+  }
+
+  return `Codex OAuth model listing returned an invalid response payload. raw=${trimmed}`;
 }
 
 function resolveCodexModelId(requestedModel: string, availableModels: string[]): string {
@@ -883,6 +994,61 @@ export function extractAuthorizationCodeFromCallbackUrl(
 async function defaultReceiveAuthorizationCode(
   session: CodexOAuthAuthorizationSession,
 ): Promise<CodexOAuthAuthorizationCodeResult> {
+  const denoServe = (globalThis as typeof globalThis & {
+    Deno?: {
+      serve?: (
+        options: {
+          hostname: string;
+          port: number;
+          signal: AbortSignal;
+        },
+        handler: (request: Request) => Response | Promise<Response>,
+      ) => {
+        finished: Promise<void>;
+      };
+    };
+  }).Deno?.serve;
+
+  if (typeof denoServe === 'function') {
+    const controller = new AbortController();
+    let resolveResult: ((value: CodexOAuthAuthorizationCodeResult) => void) | undefined;
+    const result = new Promise<CodexOAuthAuthorizationCodeResult>((resolve) => {
+      resolveResult = resolve;
+    });
+
+    const server = denoServe(
+      {
+        hostname: '127.0.0.1',
+        port: session.callbackPort,
+        signal: controller.signal,
+      },
+      (request) => {
+        const callback = extractAuthorizationCodeFromCallbackUrl(request.url);
+        if (callback === null) {
+          return new Response(
+            'Codex OAuth callback is waiting for the final code and state. Return to the browser login and try again, or paste the full callback URL into the CLI.',
+            { status: 202, headers: { 'Content-Type': 'text/plain; charset=utf-8' } },
+          );
+        }
+
+        resolveResult?.(callback);
+        controller.abort();
+        return new Response(
+          'Codex OAuth login complete. You can close this tab and return to the CLI.',
+          { status: 200, headers: { 'Content-Type': 'text/plain; charset=utf-8' } },
+        );
+      },
+    );
+
+    try {
+      const callback = await result;
+      await server.finished;
+      return callback;
+    } finally {
+      controller.abort();
+    }
+  }
+
   const controller = new AbortController();
   let resolveResult: ((value: CodexOAuthAuthorizationCodeResult) => void) | undefined;
   let rejectResult: ((reason?: unknown) => void) | undefined;
@@ -890,37 +1056,63 @@ async function defaultReceiveAuthorizationCode(
     resolveResult = resolve;
     rejectResult = reject;
   });
+  const nodeHttp = await importNodeBuiltin<NodeHttpModuleLike>('http');
+  const sockets = new Set<{
+    destroy(): void;
+    once(event: 'close', listener: () => void): void;
+  }>();
 
-  const server = Deno.serve(
-    {
-      hostname: '127.0.0.1',
-      port: session.callbackPort,
-      signal: controller.signal,
-    },
-    (request) => {
-      const callback = extractAuthorizationCodeFromCallbackUrl(request.url);
-      if (callback === null) {
-        return new Response(
-          'Codex OAuth callback is waiting for the final code and state. Return to the browser login and try again, or paste the full callback URL into the CLI.',
-          { status: 202, headers: { 'Content-Type': 'text/plain; charset=utf-8' } },
-        );
-      }
+  const server = nodeHttp.createServer((request, response) => {
+    const fullUrl = new URL(
+      request.url ?? '/',
+      `http://${request.headers.host ?? `127.0.0.1:${session.callbackPort}`}`,
+    );
+    const callback = extractAuthorizationCodeFromCallbackUrl(fullUrl.toString());
 
-      resolveResult?.(callback);
-      controller.abort();
-      return new Response(
-        'Codex OAuth login complete. You can close this tab and return to the CLI.',
-        { status: 200, headers: { 'Content-Type': 'text/plain; charset=utf-8' } },
+    if (callback === null) {
+      response.writeHead(202, {
+        'Content-Type': 'text/plain; charset=utf-8',
+      });
+      response.end(
+        'Codex OAuth callback is waiting for the final code and state. Return to the browser login and try again, or paste the full callback URL into the CLI.',
       );
-    },
-  );
+      return;
+    }
+
+    response.writeHead(200, {
+      'Content-Type': 'text/plain; charset=utf-8',
+    });
+    response.end(
+      'Codex OAuth login complete. You can close this tab and return to the CLI.',
+      () => {
+        resolveResult?.(callback);
+        controller.abort();
+      },
+    );
+  });
+
+  server.on('connection', (socket) => {
+    sockets.add(socket);
+    socket.once('close', () => {
+      sockets.delete(socket);
+    });
+  });
+
+  const abortHandler = () => {
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+    server.close();
+    rejectResult?.(new DOMException('Aborted', 'AbortError'));
+  };
+  controller.signal.addEventListener('abort', abortHandler, { once: true });
+  server.listen(session.callbackPort, '127.0.0.1');
 
   try {
-    const callback = await result;
-    await server.finished;
-    return callback;
+    return await result;
   } finally {
     controller.abort();
+    controller.signal.removeEventListener('abort', abortHandler);
   }
 }
 
@@ -1182,7 +1374,7 @@ export class CodexOAuthProvider implements LLMProvider<CodexOAuthCallerConfig> {
       }
       return normalized;
     } catch (error) {
-      if (error instanceof Deno.errors.NotFound) {
+      if (isNotFoundError(error)) {
         return null;
       }
 
@@ -1194,7 +1386,7 @@ export class CodexOAuthProvider implements LLMProvider<CodexOAuthCallerConfig> {
    * Stores the latest auth record so later CLI runs can reuse the same login.
    */
   async saveAuth(record: CodexOAuthAuthRecord): Promise<void> {
-    await this.#mkdir(dirname(this.#storagePath), { recursive: true });
+    await this.#mkdir(dirnameFilePath(this.#storagePath), { recursive: true });
     await this.#writeTextFile(this.#storagePath, JSON.stringify(record, null, 2));
   }
 
@@ -1315,31 +1507,44 @@ export class CodexOAuthProvider implements LLMProvider<CodexOAuthCallerConfig> {
     if (auth.tokens.accountId === null || auth.tokens.accountId.length === 0) {
       throw new Error('Codex OAuth model listing requires an account ID.');
     }
-    const response = await this.#fetcher(
-      buildModelListUrl(auth.apiBaseUrl),
-      {
-        headers: {
-          Authorization: `Bearer ${auth.tokens.accessToken}`,
-          'chatgpt-account-id': auth.tokens.accountId,
-          originator: this.#originator,
-          'User-Agent': this.#userAgent,
+    for (let attempt = 0;; attempt += 1) {
+      const response = await this.#fetcher(
+        buildModelListUrl(auth.apiBaseUrl),
+        {
+          headers: {
+            Authorization: `Bearer ${auth.tokens.accessToken}`,
+            'chatgpt-account-id': auth.tokens.accountId,
+            originator: this.#originator,
+            'User-Agent': this.#userAgent,
+          },
+          method: 'GET',
         },
-        method: 'GET',
-      },
-    );
-    const payload = await response.json() as ModelListResponse & {
-      error?: unknown;
-    };
-    if (!response.ok) {
-      throw new Error(
-        extractStructuredErrorMessage(
-          payload,
-          `Model listing failed with status ${response.status}.`,
-        ),
       );
-    }
+      const rawText = await response.text();
+      const payload = parseModelListPayload(rawText);
 
-    return normalizeModelIds(payload);
+      if (!response.ok) {
+        const fallback = `Model listing failed with status ${response.status}.`;
+        const message = payload === null
+          ? `${fallback} raw=${rawText.trim() || '(empty)'}`
+          : extractStructuredErrorMessage(payload, fallback);
+        if (payload === null && attempt < MODEL_LIST_RETRY_COUNT) {
+          continue;
+        }
+
+        throw new Error(message);
+      }
+
+      if (payload === null) {
+        if (attempt < MODEL_LIST_RETRY_COUNT) {
+          continue;
+        }
+
+        throw new Error(formatInvalidModelListPayloadMessage(rawText));
+      }
+
+      return normalizeModelIds(payload);
+    }
   }
 
   /**
@@ -1357,7 +1562,10 @@ export class CodexOAuthProvider implements LLMProvider<CodexOAuthCallerConfig> {
           throw new Error('Codex OAuth calls require an account ID.');
         }
         if (modelsPromise === null) {
-          modelsPromise = this.listModels();
+          modelsPromise = this.listModels().catch((error) => {
+            modelsPromise = null;
+            throw error;
+          });
         }
         const caller = new CodexOAuthCaller({
           accessToken: auth.tokens.accessToken,
@@ -1397,8 +1605,10 @@ export const __codexOAuthProviderTestables = {
   normalizeCodexResponsePayload,
   normalizeAuthRecord,
   normalizeModelIds,
+  parseModelListPayload,
   normalizeStreamedCodexPayload,
   normalizeUsage,
+  formatInvalidModelListPayloadMessage,
   parseCodexResponseBody,
   parseServerSentEventPayload,
   resolveCodexModelId,

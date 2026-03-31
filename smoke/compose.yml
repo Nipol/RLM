@@ -1,0 +1,9 @@
+services:
+  node-smoke:
+    build:
+      context: ..
+      dockerfile: smoke/node/Dockerfile
+  browser-smoke:
+    build:
+      context: ..
+      dockerfile: smoke/browser/Dockerfile

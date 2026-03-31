@@ -578,7 +578,7 @@ Deno.test('llm_query helpers cover scalar selection extraction and delegated val
   );
 });
 
-Deno.test('rlm prompt helpers cover summaries, previews, and recovery guidance', () => {
+Deno.test('rlm prompt helpers cover summaries, previews, and current prompt formatting', () => {
   assert.equal(
     __rlmPromptTestables.summarizeString('context', ''),
     'context: string (0 chars, 0 words)',
@@ -591,7 +591,7 @@ Deno.test('rlm prompt helpers cover summaries, previews, and recovery guidance',
     __rlmPromptTestables.clipInlineText('  alpha    beta   gamma  ', 12),
     'alpha beta g...',
   );
-  assert.equal(__rlmPromptTestables.slicePreviewTokens('', 5), '(empty)');
+  assert.equal(__rlmPromptTestables.slicePreviewTokens('', 5), '(비어 있음)');
   assert.equal(
     __rlmPromptTestables.slicePreviewTokens('one two three four', 2, true),
     'three four',
@@ -600,18 +600,18 @@ Deno.test('rlm prompt helpers cover summaries, previews, and recovery guidance',
   assert.equal(__rlmPromptTestables.summarizeTopLevelValue('value', 42), 'value: number');
   assert.equal(
     __rlmPromptTestables.summarizeTopLevelValue('items', ['a', 'b']),
-    'items: array (2 items)',
+    'items: 배열 (2개 항목)',
   );
   assert.equal(
     __rlmPromptTestables.summarizeTopLevelValue('items', [{}, {}]),
-    'items: array (2 items; sample keys: (none))',
+    'items: 배열 (2개 항목; 예시 키: (없음))',
   );
   assert.match(
     __rlmPromptTestables.summarizeTopLevelValue('rows', [
       { active: false, code: 'A' },
       { active: true, code: 'B' },
     ]),
-    /varying boolean fields: active/u,
+    /값이 달라지는 불리언 필드: active/u,
   );
   assert.doesNotMatch(
     __rlmPromptTestables.summarizeTopLevelValue('rows', [
@@ -626,15 +626,15 @@ Deno.test('rlm prompt helpers cover summaries, previews, and recovery guidance',
       results: { code: 'A' },
       title: 'Book',
     }),
-    /sample value keys: chapter, code/u,
+    /예시 값 키: chapter, code/u,
   );
   assert.equal(
     __rlmPromptTestables.summarizeTopLevelValue('bag', {}),
-    'bag: object (0 keys: (none))',
+    'bag: 객체 (0개 키: (없음))',
   );
   assert.equal(
     __rlmPromptTestables.summarizeTopLevelValue('register', { alpha: {} }),
-    'register: object (1 keys: alpha; sample value keys: (none))',
+    'register: 객체 (1개 키: alpha; 예시 값 키: (없음))',
   );
   assert.doesNotMatch(
     __rlmPromptTestables.summarizeTopLevelValue('context', {
@@ -651,7 +651,7 @@ Deno.test('rlm prompt helpers cover summaries, previews, and recovery guidance',
     '- context: string (11 chars, 2 words)',
   );
   assert.equal(__rlmPromptTestables.buildContextSummary(true), '- context: boolean');
-  assert.equal(__rlmPromptTestables.buildContextSummary([1, 2, 3]), '- context: array (3 items)');
+  assert.equal(__rlmPromptTestables.buildContextSummary([1, 2, 3]), '- context: 배열 (3개 항목)');
   assert.match(
     __rlmPromptTestables.buildContextSummary({ title: 'Book' }),
     /- title: string/u,
@@ -660,7 +660,7 @@ Deno.test('rlm prompt helpers cover summaries, previews, and recovery guidance',
   assert.equal(__rlmPromptTestables.buildContextPreviews(42 as never), null);
   assert.match(
     __rlmPromptTestables.buildContextPreviews('token '.repeat(25_000)) ?? '',
-    /context head preview/u,
+    /context 앞부분 미리보기/u,
   );
   assert.match(
     __rlmPromptTestables.buildContextPreviews({
@@ -668,7 +668,7 @@ Deno.test('rlm prompt helpers cover summaries, previews, and recovery guidance',
       b: 'token '.repeat(25_000),
       c: 'token '.repeat(25_000),
     }) ?? '',
-    /a head preview/u,
+    /a 앞부분 미리보기/u,
   );
   assert.equal(__rlmPromptTestables.buildQuestionHints(null), null);
   assert.equal(
@@ -701,110 +701,6 @@ Deno.test('rlm prompt helpers cover summaries, previews, and recovery guidance',
     __rlmPromptTestables.isLargeContext({ document: 'token '.repeat(25_000) }),
     true,
   );
-  assert.equal(__rlmPromptTestables.requiresExecutionRecovery([]), false);
-  assert.equal(
-    __rlmPromptTestables.requiresExecutionRecovery([
-      {
-        assistantText: '```repl\n1\n```',
-        executions: [{
-          code: '1',
-          finalAnswer: 'undefined',
-          resultPreview: 'undefined',
-          status: 'success',
-          stderr: '',
-          stdout: '',
-        }],
-        step: 1,
-      },
-    ]),
-    true,
-  );
-  assert.equal(
-    __rlmPromptTestables.normalizeExecutionFailure({
-      code: '1',
-      finalAnswer: null,
-      resultPreview: '1',
-      status: 'success',
-      stderr: '',
-      stdout: '',
-    }),
-    null,
-  );
-  assert.equal(
-    __rlmPromptTestables.normalizeExecutionFailure({
-      code: '1',
-      finalAnswer: null,
-      resultPreview: '1',
-      status: 'timeout',
-      stderr: '',
-      stdout: '',
-    }),
-    'TimeoutError: Execution timed out',
-  );
-  assert.equal(
-    __rlmPromptTestables.normalizeExecutionFailure({
-      code: '1',
-      finalAnswer: null,
-      resultPreview: '1',
-      status: 'error',
-      stderr: '',
-      stdout: '',
-    }),
-    null,
-  );
-  assert.equal(__rlmPromptTestables.classifyFailureKind('oops'), 'other');
-  assert.equal(__rlmPromptTestables.classifyFailureKind('SyntaxError: bad'), 'syntax');
-  assert.equal(__rlmPromptTestables.classifyFailureKind('TypeError: bad'), 'type');
-  assert.equal(
-    __rlmPromptTestables.classifyFailureKind('RLMSubqueryContractError: bad'),
-    'contract',
-  );
-  assert.equal(__rlmPromptTestables.summarizeRepeatedFailure([]), null);
-  assert.deepEqual(
-    __rlmPromptTestables.summarizeRepeatedFailure([
-      {
-        assistantText: '```repl\n1\n```',
-        executions: [{
-          code: '1',
-          finalAnswer: null,
-          resultPreview: '1',
-          status: 'error',
-          stderr: 'TypeError: helper is not a function\nstack',
-          stdout: '',
-        }],
-        step: 1,
-      },
-    ]),
-    {
-      count: 1,
-      kind: 'type',
-      signature: 'TypeError: helper is not a function',
-    },
-  );
-  assert.match(
-    __rlmPromptTestables.buildStrategyShiftGuidance({
-      count: 1,
-      kind: 'contract',
-      signature: 'RLMSubqueryContractError: mismatch',
-    }),
-    /concrete expect contract/u,
-  );
-  assert.match(
-    __rlmPromptTestables.buildStrategyShiftGuidance({
-      count: 1,
-      kind: 'syntax',
-      signature: 'SyntaxError: unexpected token',
-    }),
-    /smaller valid block/u,
-  );
-  assert.match(
-    __rlmPromptTestables.buildStrategyShiftGuidance({
-      count: 1,
-      kind: 'other',
-      signature: 'OtherError: fail',
-    }),
-    /Change the execution shape/u,
-  );
   assert.match(
     buildRLMTurnInput({
       context: { excerpt: 'token '.repeat(25_000), task: 'Narrow child task' },
@@ -813,7 +709,7 @@ Deno.test('rlm prompt helpers cover summaries, previews, and recovery guidance',
       role: 'child',
       transcript: [],
     }),
-    /Stay on the delegated target or candidate subset/u,
+    /## 위임된 증거 안내/u,
   );
 });
 

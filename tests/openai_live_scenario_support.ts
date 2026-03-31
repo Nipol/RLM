@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { dirname, join } from 'node:path';
 
-import { loadRLMConfig } from '../src/env.ts';
-import { runOpenAIRLM } from '../src/rlm_runner.ts';
+import { loadProviderRequestTimeoutMs, loadRLMRuntimeConfig } from '../src/env.ts';
+import { CodexOAuthProvider } from '../src/providers/codex_oauth.ts';
+import { runRLM } from '../src/rlm_runner.ts';
 import type { JsonValue } from '../src/types.ts';
 
 export type OpenAILiveScenarioSuite = 'integration' | 'synthetic';
@@ -20,9 +21,27 @@ export interface OpenAILiveScenario {
     journal: string;
     journalDir: string;
     journalPath: string;
-    result: Awaited<ReturnType<typeof runOpenAIRLM>>;
+    result: Awaited<ReturnType<typeof runRLM>>;
   }) => Promise<void> | void;
 }
+
+export interface CodexLiveModels {
+  rootModel: string;
+  subModel: string;
+}
+
+export interface CodexLiveRunOptions {
+  cellTimeoutMs: number;
+  maxSteps: number;
+  maxSubcallDepth: number;
+  outputCharLimit: number;
+  requestTimeoutMs: number;
+  rootModel: string;
+  subModel: string;
+}
+
+let cachedCodexLiveProvider: CodexOAuthProvider | null = null;
+let cachedCodexIntegrationRunOptionsPromise: Promise<CodexLiveRunOptions> | null = null;
 
 export async function createOpenAILiveJournalPath(
   suite: OpenAILiveScenarioSuite,
@@ -32,20 +51,140 @@ export async function createOpenAILiveJournalPath(
   return join(root, testName, 'session.jsonl');
 }
 
-export function buildOpenAILiveConfig() {
-  const loaded = loadRLMConfig();
-  return {
-    openAI: {
-      ...loaded.openAI,
-      requestTimeoutMs: Math.max(loaded.openAI.requestTimeoutMs, 90_000),
-    },
-    runtime: {
-      ...loaded.runtime,
-      maxSteps: Math.min(loaded.runtime.maxSteps, 12),
-      maxSubcallDepth: Math.min(loaded.runtime.maxSubcallDepth, 1),
-      outputCharLimit: Math.min(loaded.runtime.outputCharLimit, 1_000),
-    },
+function pickPreferredModel(
+  availableModels: string[],
+  preferred: string[],
+): string | undefined {
+  for (const candidate of preferred) {
+    if (availableModels.includes(candidate)) {
+      return candidate;
+    }
+  }
+
+  return undefined;
+}
+
+export function resolveCodexLiveModels(
+  availableModels: string[],
+  overrides: {
+    rootModel?: string;
+    subModel?: string;
+  } = {},
+): CodexLiveModels {
+  const ensureExactModel = (requestedModel: string | undefined): string | undefined => {
+    if (requestedModel === undefined) {
+      return undefined;
+    }
+
+    if (availableModels.includes(requestedModel)) {
+      return requestedModel;
+    }
+
+    throw new Error(
+      [
+        `Requested Codex live-test model is unavailable: ${requestedModel}.`,
+        'Configure an exact model id from the current Codex catalog.',
+        `Available models: ${[...availableModels].sort().join(', ')}`,
+      ].join(' '),
+    );
   };
+
+  const rootModel = ensureExactModel(overrides.rootModel) ??
+    pickPreferredModel(
+      availableModels,
+      [
+        'gpt-5-mini',
+        'gpt-5.4-mini',
+        'gpt-5-4-t-mini',
+        'gpt-5',
+        'gpt-5.4',
+        'gpt-5-3',
+      ],
+    ) ??
+    availableModels[0];
+
+  if (rootModel === undefined) {
+    throw new Error('Codex live tests require at least one available model.');
+  }
+
+  const subModel = ensureExactModel(overrides.subModel) ??
+    pickPreferredModel(
+      availableModels,
+      [
+        'gpt-5.3-instant',
+        'gpt-5-3-instant',
+        'gpt-5-t-mini',
+        'gpt-5-mini',
+        rootModel,
+        'gpt-5.2-instant',
+        'gpt-5-2-instant',
+      ],
+    ) ??
+    rootModel;
+
+  return {
+    rootModel,
+    subModel,
+  };
+}
+
+export function buildCodexLiveRunOptions(
+  options: {
+    availableModels: string[];
+    maxStepsCap?: number;
+    maxSubcallDepthCap?: number;
+    minimumRequestTimeoutMs?: number;
+    modelOverrides?: {
+      rootModel?: string;
+      subModel?: string;
+    };
+    outputCharLimitCap?: number;
+    requestTimeoutMs?: number;
+    runtime?: ReturnType<typeof loadRLMRuntimeConfig>;
+  },
+): CodexLiveRunOptions {
+  const runtime = options.runtime ?? loadRLMRuntimeConfig();
+  const requestTimeoutMs = Math.max(
+    options.requestTimeoutMs ?? loadProviderRequestTimeoutMs(),
+    options.minimumRequestTimeoutMs ?? 90_000,
+  );
+  const models = resolveCodexLiveModels(options.availableModels, options.modelOverrides);
+
+  return {
+    cellTimeoutMs: requestTimeoutMs + runtime.cellTimeoutMs,
+    maxSteps: Math.min(runtime.maxSteps, options.maxStepsCap ?? runtime.maxSteps),
+    maxSubcallDepth: Math.min(
+      runtime.maxSubcallDepth,
+      options.maxSubcallDepthCap ?? runtime.maxSubcallDepth,
+    ),
+    outputCharLimit: Math.min(
+      runtime.outputCharLimit,
+      options.outputCharLimitCap ?? runtime.outputCharLimit,
+    ),
+    requestTimeoutMs,
+    rootModel: models.rootModel,
+    subModel: models.subModel,
+  };
+}
+
+async function loadCodexIntegrationRunOptions(): Promise<CodexLiveRunOptions> {
+  if (cachedCodexIntegrationRunOptionsPromise !== null) {
+    return await cachedCodexIntegrationRunOptionsPromise;
+  }
+
+  cachedCodexIntegrationRunOptionsPromise = (async () => {
+    cachedCodexLiveProvider ??= new CodexOAuthProvider();
+    const availableModels = await cachedCodexLiveProvider.listModels();
+    return buildCodexLiveRunOptions({
+      availableModels,
+      maxStepsCap: 12,
+      maxSubcallDepthCap: 1,
+      minimumRequestTimeoutMs: 90_000,
+      outputCharLimitCap: 1_000,
+    });
+  })();
+
+  return await cachedCodexIntegrationRunOptionsPromise;
 }
 
 export function createDeterministicRandom(seed: number): () => number {
@@ -108,16 +247,25 @@ export async function readSubqueryJournals(journalDir: string): Promise<string[]
 export async function runOpenAILiveScenario(
   scenario: OpenAILiveScenario,
 ): Promise<void> {
-  const config = buildOpenAILiveConfig();
+  cachedCodexLiveProvider ??= new CodexOAuthProvider();
+  const config = await loadCodexIntegrationRunOptions();
   const journalPath = await createOpenAILiveJournalPath(
     scenario.suite,
     scenario.journalPathName,
   );
-  const result = await runOpenAIRLM({
-    config,
+  const result = await runRLM({
+    cellTimeoutMs: config.cellTimeoutMs,
     context: scenario.context,
     journalPath,
+    llm: cachedCodexLiveProvider.createCaller({
+      requestTimeoutMs: config.requestTimeoutMs,
+    }),
+    maxSteps: config.maxSteps,
+    maxSubcallDepth: config.maxSubcallDepth,
+    outputCharLimit: config.outputCharLimit,
     prompt: scenario.prompt,
+    rootModel: config.rootModel,
+    subModel: config.subModel,
   });
 
   const normalizedAnswer = scenario.normalizeAnswer?.(result.answer) ?? result.answer;

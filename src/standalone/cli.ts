@@ -1,11 +1,15 @@
-import { createServer } from 'node:http';
-import { isAbsolute, join, resolve } from 'node:path';
-
 import { loadProviderRequestTimeoutMs, loadRLMConfig, loadRLMRuntimeConfig } from '../env.ts';
 import type { LLMCaller } from '../llm_adapter.ts';
 import { JsonlFileLogger } from '../logger.ts';
 import { OpenAIResponsesProvider } from '../openai_adapter.ts';
 import { estimateOpenAIRunCostUsd } from '../openai_pricing.ts';
+import {
+  importNodeBuiltin,
+  joinFilePath,
+  type ReadTextFile,
+  resolveCurrentWorkingDirectory,
+  resolveFilePath,
+} from '../platform.ts';
 import {
   type CodexOAuthAuthorizationCodeResult,
   type CodexOAuthAuthorizationReceiver,
@@ -13,8 +17,10 @@ import {
   CodexOAuthProvider,
   extractAuthorizationCodeFromCallbackUrl,
 } from '../providers/codex_oauth.ts';
-import { runOpenAIRLM, runRLM } from '../rlm_runner.ts';
-import type { RLMRunOptions, RunOpenAIRLMOptions } from '../rlm_runner.ts';
+import { createOpenAIRLM, runOpenAIRLM } from '../providers/openai.ts';
+import type { RunOpenAIRLMOptions } from '../providers/openai.ts';
+import { runRLM } from '../rlm_runner.ts';
+import type { RLMRunOptions } from '../rlm_runner.ts';
 import type {
   AssistantTurnEntry,
   CellEntry,
@@ -128,7 +134,7 @@ export interface StandaloneCLIDependencies {
   fetcher?: typeof fetch;
   llm?: Pick<LLMCaller, 'complete'>;
   readLoginLine?: (signal?: AbortSignal) => Promise<string | null>;
-  readTextFile?: typeof Deno.readTextFile;
+  readTextFile?: ReadTextFile;
   receiveLoopbackAuthorizationCode?: (
     session: CodexOAuthAuthorizationSession,
     signal?: AbortSignal,
@@ -164,8 +170,22 @@ export interface StandaloneFinalRenderInput {
 
 function resolveStandaloneReadTextFile(
   readTextFile: StandaloneCLIDependencies['readTextFile'],
-): typeof Deno.readTextFile {
-  return readTextFile ?? Deno.readTextFile;
+): ReadTextFile {
+  const defaultReadTextFile = (globalThis as typeof globalThis & {
+    Deno?: {
+      readTextFile?: ReadTextFile;
+    };
+  }).Deno?.readTextFile;
+
+  if (readTextFile !== undefined) {
+    return readTextFile;
+  }
+
+  if (defaultReadTextFile !== undefined) {
+    return defaultReadTextFile;
+  }
+
+  throw new Error('No default readTextFile implementation is available in this runtime.');
 }
 
 function resolveStandaloneReadLoginLine(
@@ -204,11 +224,45 @@ async function readStandaloneLoginLine(signal?: AbortSignal): Promise<string | n
   }
 }
 
+interface LoopbackSocketLike {
+  destroy(): void;
+  once(event: 'close', listener: () => void): void;
+}
+
+interface LoopbackRequestLike {
+  headers: {
+    host?: string;
+  };
+  url?: string;
+}
+
+interface LoopbackResponseLike {
+  end(text?: string, callback?: () => void): void;
+  writeHead(statusCode: number, headers: Record<string, string>): void;
+}
+
+interface LoopbackServerLike {
+  close(callback: () => void): void;
+  listen(port: number, hostname: string): void;
+  on(event: 'connection', listener: (socket: LoopbackSocketLike) => void): void;
+  on(event: 'error', listener: (error: Error) => void): void;
+}
+
+type LoopbackServerFactory = (
+  handler: (request: LoopbackRequestLike, response: LoopbackResponseLike) => void,
+) => LoopbackServerLike;
+
+async function loadNodeLoopbackServerFactory(): Promise<LoopbackServerFactory> {
+  const nodeHttp = await importNodeBuiltin<{ createServer: LoopbackServerFactory }>('http');
+  return nodeHttp.createServer as LoopbackServerFactory;
+}
+
 async function receiveStandaloneLoopbackAuthorizationCode(
   session: CodexOAuthAuthorizationSession,
   signal?: AbortSignal,
-  serverFactory: typeof createServer = createServer,
+  serverFactory?: LoopbackServerFactory,
 ): Promise<CodexOAuthAuthorizationCodeResult> {
+  const resolvedServerFactory = serverFactory ?? await loadNodeLoopbackServerFactory();
   return await new Promise<CodexOAuthAuthorizationCodeResult>((resolve, reject) => {
     let settled = false;
     const sockets = new Set<{
@@ -241,7 +295,7 @@ async function receiveStandaloneLoopbackAuthorizationCode(
       });
     };
 
-    const server = serverFactory((request, response) => {
+    const server = resolvedServerFactory((request, response) => {
       const fullUrl = new URL(
         request.url ?? '/',
         `http://${request.headers.host ?? `127.0.0.1:${session.callbackPort}`}`,
@@ -418,7 +472,7 @@ function formatStandaloneTimestamp(date: Date): string {
  * Converts a possibly-relative path into an absolute path anchored at the chosen cwd.
  */
 function resolveStandalonePath(path: string, cwd: string): string {
-  return isAbsolute(path) ? path : resolve(cwd, path);
+  return resolveFilePath(cwd, path);
 }
 
 function pickPreferredModel(
@@ -733,8 +787,8 @@ export function createStandaloneLogPath(
   } = {},
 ): string {
   const clock = options.clock ?? (() => new Date());
-  const cwd = options.cwd ?? Deno.cwd();
-  return join(cwd, 'logs', 'standalone', `${formatStandaloneTimestamp(clock())}.jsonl`);
+  const cwd = options.cwd ?? resolveCurrentWorkingDirectory();
+  return joinFilePath(cwd, 'logs', 'standalone', `${formatStandaloneTimestamp(clock())}.jsonl`);
 }
 
 /**
@@ -759,7 +813,7 @@ export function resolveStandaloneCLIOptions(
     cwd?: string;
   } = {},
 ): ResolvedStandaloneCLIOptions {
-  const cwd = options.cwd ?? Deno.cwd();
+  const cwd = options.cwd ?? resolveCurrentWorkingDirectory();
   return {
     cellTimeoutMs: args.cellTimeoutMs,
     inputPath: args.inputPath === undefined
@@ -989,8 +1043,8 @@ export async function runStandaloneCLI(
   args: string[],
   dependencies: StandaloneCLIDependencies = {},
 ): Promise<{ answer: string }> {
-  const cwd = dependencies.cwd ?? Deno.cwd();
-  const envPath = join(cwd, '.env');
+  const cwd = dependencies.cwd ?? resolveCurrentWorkingDirectory();
+  const envPath = joinFilePath(cwd, '.env');
   const parsed = parseStandaloneCLIArgs(args);
   const resolved = resolveStandaloneCLIOptions(parsed, {
     clock: dependencies.clock,

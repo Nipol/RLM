@@ -92,3 +92,14 @@ Deno.test('final signal extractor ignores casual prose that only resembles a fin
 
   assert.equal(signal, null);
 });
+
+Deno.test('final signal extractor ignores final markers when any code fence is present', () => {
+  assert.equal(
+    extractFinalSignal('```repl\nFINAL_VAR("done")'),
+    null,
+  );
+  assert.equal(
+    extractFinalSignal('Before\n```typescript\nconst x = 1;\n```\nFINAL("done")'),
+    null,
+  );
+});

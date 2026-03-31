@@ -85,6 +85,10 @@ export function extractReplCodeBlocks(text: string): ReplCodeBlock[] {
  * ```
  */
 export function extractFinalSignal(text: string): FinalSignal | null {
+  if (text.includes('```')) {
+    return null;
+  }
+
   const match = text.match(/\b(FINAL_VAR|FINAL)\(([\s\S]*?)\)/u);
   if (match === null) {
     return null;

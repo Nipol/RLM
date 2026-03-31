@@ -1,8 +1,13 @@
 {
   "name": "@yoonsung/rlm",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "license": "LGPL-3.0-only",
-  "exports": "./mod.ts",
+  "exports": {
+    ".": "./mod.ts",
+    "./core": "./core.ts",
+    "./providers/codex-oauth": "./codex-oauth.ts",
+    "./providers/openai": "./openai.ts"
+  },
   "compilerOptions": {
     "strict": true
   },
@@ -15,21 +20,33 @@
     "include": [
       "LICENSE",
       "README.md",
+      "codex-oauth.ts",
+      "core.ts",
       "mod.ts",
+      "openai.ts",
       "src/**/*.ts",
       ".env.example"
     ]
   },
   "tasks": {
-    "test": "deno test --allow-read --allow-write --unstable-worker-options",
-    "standalone": "deno run --allow-read --allow-write --allow-net=api.openai.com,auth.openai.com,chatgpt.com --unstable-worker-options src/standalone/main.ts",
-    "coverage": "deno test --allow-read --allow-write --unstable-worker-options --coverage=coverage/raw && deno coverage --lcov --output=coverage/lcov.info coverage/raw && deno coverage --html coverage/raw",
-    "coverage:raw": "deno test --allow-read --allow-write --unstable-worker-options --coverage=coverage/raw",
+    "test": "deno test --allow-read --allow-write",
+    "standalone": "deno run --allow-read --allow-write --allow-net=api.openai.com,auth.openai.com,chatgpt.com src/standalone/main.ts",
+    "coverage": "deno test --allow-read --allow-write --coverage=coverage/raw && deno coverage --lcov --output=coverage/lcov.info coverage/raw && deno coverage --html coverage/raw",
+    "coverage:raw": "deno test --allow-read --allow-write --coverage=coverage/raw",
     "coverage:report": "deno coverage --lcov --output=coverage/lcov.info coverage/raw && deno coverage --html coverage/raw",
-    "test:codex": "deno test --allow-read --allow-write --allow-net=auth.openai.com,chatgpt.com --unstable-worker-options tests/codex_oauth_ping_live.ts",
-    "test:openai": "deno test --allow-read --allow-write --allow-net=api.openai.com --unstable-worker-options tests/openai_live_test.ts",
-    "test:openai:integration": "deno test --allow-read --allow-write --allow-net=api.openai.com --unstable-worker-options --filter='^OpenAI integration' tests/openai_live_test.ts",
-    "test:openai:synthetic": "deno test --allow-read --allow-write --allow-net=api.openai.com --unstable-worker-options --filter='^Synthetic ' tests/openai_live_test.ts",
-    "test:openai:long-context": "deno test --allow-read --allow-write --allow-net=api.openai.com --unstable-worker-options tests/openai_long_context_benchmark.ts"
+    "test:codex": "deno test --allow-read --allow-write --allow-net=auth.openai.com,chatgpt.com tests/codex_oauth_ping_live.ts",
+    "test:codex:integration": "deno test --allow-read --allow-write --allow-net=auth.openai.com,chatgpt.com tests/openai_live_test.ts",
+    "test:codex:synthetic": "deno test --allow-read --allow-write --allow-net=auth.openai.com,chatgpt.com --filter='^Synthetic ' tests/openai_live_test.ts",
+    "test:codex:long-context": "deno test --allow-read --allow-write --allow-net=auth.openai.com,chatgpt.com tests/openai_long_context_benchmark.ts",
+    "test:codex:long-context:evaluator": "deno test --allow-read --allow-write --allow-net=auth.openai.com,chatgpt.com tests/openai_long_context_evaluator_benchmark.ts",
+    "test:openai": "deno task test:codex:integration",
+    "test:openai:integration": "deno task test:codex:integration",
+    "test:openai:synthetic": "deno task test:codex:synthetic",
+    "test:openai:long-context": "deno task test:codex:long-context",
+    "test:openai:long-context:evaluator": "deno task test:codex:long-context:evaluator",
+    "build:core": "deno run --allow-read --allow-write --allow-run scripts/build_core_bundle.ts",
+    "smoke:build": "deno task build:core && docker compose -f smoke/compose.yml build node-smoke browser-smoke",
+    "smoke:node": "deno task build:core && docker compose -f smoke/compose.yml run --rm node-smoke",
+    "smoke:browser": "deno task build:core && docker compose -f smoke/compose.yml run --rm browser-smoke"
   }
 }

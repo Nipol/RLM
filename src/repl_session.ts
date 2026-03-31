@@ -271,7 +271,9 @@ export class ReplSession {
    * Validates, executes, and journals one cell against the current reconstructed state.
    *
    * Successful cells become part of future interpreter state.
-   * Failed or timed out cells are recorded, but they are not replayed into later runs.
+   * Failed or timed out cells are recorded and excluded from replay if the
+   * interpreter is rebuilt, but a live session still keeps any mutations that
+   * happened before the throw, just like a normal REPL.
    *
    * @param code The JavaScript/TypeScript source to execute in the REPL.
    * @param options Optional per-call overrides such as timeout.

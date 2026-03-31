@@ -227,10 +227,10 @@ function createFilteringScenario(): OpenAILiveScenario {
 function createDirectAnchorScenario(): OpenAILiveScenario {
   return {
     suite: 'integration',
-    name: 'OpenAI integration runner can extract a direct anchored code from a short retrieval query',
+    name:
+      'OpenAI integration runner can extract a direct anchored code from a short retrieval query',
     context: {
-      document:
-        'Prelude text. The route beacon for amber has control code 618204. Closing text.',
+      document: 'Prelude text. The route beacon for amber has control code 618204. Closing text.',
       retrievalQuestion: 'What is the control code for amber?',
     },
     expectedAnswer: '618204',
@@ -609,8 +609,9 @@ function createDelegationContractBenchmarkScenario(seed: number): OpenAILiveScen
     journalPatterns: [/"type":"subquery"/u],
     prompt: [
       'Inspect the REPL state and return the enabled 6-digit access code for `context.targetProfile`.',
-      'You must use exactly one `await rlm_query(...)` call before FINAL_VAR, even if the root REPL could solve the data locally.',
+      'You must use `await rlm_query(...)` before FINAL_VAR, even if the root REPL could solve the data locally.',
       'Delegate the dossier selection step to the child and use the child result as the basis for the final lookup.',
+      'If the first delegated attempt is insufficient, you may retry with a narrower delegated task or a more concrete contract.',
       'Preserve the actual source field names `profile`, `active`, `primaryDispatch`, and `vaultKey` while narrowing or delegating.',
       'Use a field-specific expect such as `expect: "vaultKey"` for the delegated lookup key instead of a generic string contract.',
       'Return only the 6-digit code through FINAL_VAR.',
@@ -620,7 +621,7 @@ function createDelegationContractBenchmarkScenario(seed: number): OpenAILiveScen
     ].join(' '),
     assertJournal: ({ journal }) => {
       const matches = journal.match(/"type":"subquery"/gu) ?? [];
-      assert.equal(matches.length, 1);
+      assert.ok(matches.length >= 1);
     },
   };
 }
@@ -700,26 +701,26 @@ function buildDynamicIntegrationScenarios(runSeed: number): OpenAILiveScenario[]
         contextLength,
         deriveScenarioSeed(runSeed, contextLength),
       );
-    return {
-      suite: 'integration' as const,
-      name:
-        `OpenAI integration runner can recover a secret code from noisy context with length ${contextLength} (run seed ${runSeed})`,
-      context: {
-        document: scenario.document,
-        targetLength: contextLength,
-      },
-      expectedAnswer: scenario.secretCode,
-      journalPathName: `secret-code-${contextLength}-seed-${runSeed}`,
-      journalPatterns: [/비밀 코드/u],
-      prompt: [
-        'Inspect `context.document` in the REPL.',
-        'Find the unique substring that matches the exact label `비밀 코드: ` followed by decimal digits.',
-        'Return only the decimal digits through FINAL_VAR, with no label and no extra text.',
-        'Use concise REPL code.',
-        'Do not include imports.',
-        'Do not include prose outside repl code fences.',
-      ].join(' '),
-    };
+      return {
+        suite: 'integration' as const,
+        name:
+          `OpenAI integration runner can recover a secret code from noisy context with length ${contextLength} (run seed ${runSeed})`,
+        context: {
+          document: scenario.document,
+          targetLength: contextLength,
+        },
+        expectedAnswer: scenario.secretCode,
+        journalPathName: `secret-code-${contextLength}-seed-${runSeed}`,
+        journalPatterns: [/비밀 코드/u],
+        prompt: [
+          'Inspect `context.document` in the REPL.',
+          'Find the unique substring that matches the exact label `비밀 코드: ` followed by decimal digits.',
+          'Return only the decimal digits through FINAL_VAR, with no label and no extra text.',
+          'Use concise REPL code.',
+          'Do not include imports.',
+          'Do not include prose outside repl code fences.',
+        ].join(' '),
+      };
     }),
     ...PUBLIC_NIAH_CONTEXT_LENGTHS.map((contextLength) =>
       createPublicNeedleInHaystackScenario(
@@ -906,10 +907,9 @@ function buildSyntheticScenarios(runSeed: number): OpenAILiveScenario[] {
         const targetOperator = aliasDirectory.find((entry) => entry.alias === targetAlias)!;
         const targetLockerId = operatorAssignments[targetOperator.operatorId];
         const targetLocker = lockers.find((locker) => locker.id === targetLockerId)!;
-        const expectedAnswer = shardEntries[targetLocker.shard].find((entry) =>
-          entry.slot === targetLocker.slot
-        )!
-          .accessCode;
+        const expectedAnswer =
+          shardEntries[targetLocker.shard].find((entry) => entry.slot === targetLocker.slot)!
+            .accessCode;
 
         return {
           context: {

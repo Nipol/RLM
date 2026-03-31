@@ -4,11 +4,11 @@ import { join } from 'node:path';
 import { createDefaultExecutionBackend } from '../src/execution_backend.ts';
 import { loadJournal } from '../src/jsonl_journal.ts';
 import type { LLMCaller, LLMCallerRequest, LLMCallerResponse } from '../src/llm_adapter.ts';
+import { __openAIProviderTestables, runOpenAIRLM } from '../src/providers/openai.ts';
 import {
   __rlmRunnerTestables,
   RLMMaxStepsError,
   RLMProtocolError,
-  runOpenAIRLM,
   runRLM,
 } from '../src/rlm_runner.ts';
 import type { ExecutionBackend, PersistentRuntimeLike } from '../src/types.ts';
@@ -132,8 +132,16 @@ Deno.test('runner keeps provider turnState opaque and forwards it across root tu
   });
 
   assert.equal(result.answer, '50');
-  assert.match(llm.requests[0]?.input ?? '', /Step budget: 1 \/ 3/u);
-  assert.match(llm.requests[1]?.input ?? '', /Step budget: 2 \/ 3/u);
+  assert.match(llm.requests[0]?.input ?? '', /단계 예산: 1 \/ 3/u);
+  assert.match(llm.requests[1]?.input ?? '', /단계 예산: 2 \/ 3/u);
+  assert.match(
+    llm.requests[0]?.systemPrompt ?? '',
+    /사용할 수 있는 최대 단계 예산은 3/u,
+  );
+  assert.match(
+    llm.requests[1]?.systemPrompt ?? '',
+    /사용할 수 있는 최대 단계 예산은 3/u,
+  );
   assert.equal(llm.requests[0]?.turnState, undefined);
   assert.deepEqual(llm.requests[1]?.turnState, { opaque: 'root-1' });
 });
@@ -141,13 +149,6 @@ Deno.test('runner keeps provider turnState opaque and forwards it across root tu
 Deno.test('runner helper utilities cover limit resolution, final acceptance, and abort handling', () => {
   assert.equal(__rlmRunnerTestables.resolveRunLimit(undefined, 12), 12);
   assert.equal(__rlmRunnerTestables.resolveRunLimit(5, 12), 5);
-  assert.equal(__rlmRunnerTestables.resolveProviderAwareCellTimeoutMs(undefined, 30_000), 35_000);
-  assert.equal(__rlmRunnerTestables.resolveProviderAwareCellTimeoutMs(undefined, 4_000), 9_000);
-  assert.equal(__rlmRunnerTestables.resolveProviderAwareCellTimeoutMs(45_000, 30_000), 75_000);
-  assert.equal(
-    __rlmRunnerTestables.resolveProviderAwareCellTimeoutMs(undefined, 30_000, 7_000),
-    37_000,
-  );
   assert.equal(__rlmRunnerTestables.resolveControllerRole(undefined), 'root');
   assert.equal(__rlmRunnerTestables.resolveControllerRole(0), 'root');
   assert.equal(__rlmRunnerTestables.resolveControllerRole(1), 'child');
@@ -161,6 +162,14 @@ Deno.test('runner helper utilities cover limit resolution, final acceptance, and
   assert.equal(__rlmRunnerTestables.shouldAcceptExecutionFinalAnswer('error', '42'), false);
   assert.equal(
     __rlmRunnerTestables.shouldAcceptExecutionFinalAnswer('success', 'undefined'),
+    false,
+  );
+  assert.equal(
+    __rlmRunnerTestables.shouldAcceptExecutionFinalAnswer('success', 'null', {
+      json: null,
+      kind: 'null',
+      preview: 'null',
+    }),
     false,
   );
 
@@ -183,8 +192,443 @@ Deno.test('runner helper utilities cover limit resolution, final acceptance, and
     '43',
   );
   assert.equal(
-    __rlmRunnerTestables.resolveOpenAIRunLogger(undefined, undefined),
-    undefined,
+    __rlmRunnerTestables.readLatestAcceptedFinalStdout([
+      {
+        finalAnswer: null,
+        status: 'success',
+        stdout: 'intermediate\n',
+      },
+      {
+        finalAnswer: '42',
+        finalResult: { json: '42', kind: 'string', preview: '42' },
+        status: 'success',
+        stdout: '{"childExtracted":"42"}\n',
+      },
+    ]),
+    '{"childExtracted":"42"}\n',
+  );
+  assert.equal(__rlmRunnerTestables.isLikelyMultipleChoiceAnswer('A'), true);
+  assert.equal(__rlmRunnerTestables.isLikelyMultipleChoiceAnswer('AA'), false);
+  assert.equal(__rlmRunnerTestables.isPlaceholderLikeFinalAnswer('unknown'), true);
+  assert.equal(__rlmRunnerTestables.isPlaceholderLikeFinalAnswer('pending'), true);
+  assert.equal(__rlmRunnerTestables.isPlaceholderLikeFinalAnswer('42'), false);
+  assert.deepEqual(
+    __rlmRunnerTestables.collectRequestedEntityLabels(
+      'Return only the exact stamp identifier through FINAL_VAR.',
+      { question: 'Which stamp identifier seals the outgoing manifests?' },
+    ),
+    ['stamp identifier', 'stamp'],
+  );
+  assert.deepEqual(
+    __rlmRunnerTestables.collectRequestedEntityLabels(
+      'Return only the exact dossier name through FINAL_VAR.',
+      { question: 'Which dossier name is associated with the alias moon garden?' },
+    ),
+    ['dossier name', 'dossier'],
+  );
+  assert.deepEqual(
+    __rlmRunnerTestables.extractTargetCandidatesFromEvidence(
+      'stamp',
+      [
+        'Supervisor Niko seals the outgoing manifests with stamp 22-Q.',
+        'Supervisor Imani seals the outgoing manifests with stamp 14-B.',
+      ].join('\n'),
+    ),
+    ['22-Q', '14-B'],
+  );
+  assert.deepEqual(
+    __rlmRunnerTestables.extractTargetCandidatesFromEvidence(
+      'dossier',
+      [
+        'Project Atlas moved into dossier Glass Lantern.',
+        'Project Selene moved into dossier Silver Fern.',
+      ].join('\n'),
+    ),
+    ['Glass Lantern', 'Silver Fern'],
+  );
+  assert.deepEqual(
+    __rlmRunnerTestables.readCompetingTargetCandidates({
+      context: {
+        document: 'alpha '.repeat(4_000),
+        question: 'Which stamp identifier seals the outgoing manifests for the courier carrying the cobalt envelope?',
+      },
+      execution: {
+        resultPreview: 'undefined',
+        stdout: [
+          'Assignment sheet: courier Rowan reports to depot Kestrel while carrying the cobalt envelope.',
+          'Supervisor Niko seals the outgoing manifests with stamp 22-Q.',
+          'Supervisor Imani seals the outgoing manifests with stamp 14-B.',
+        ].join('\n'),
+      },
+      prompt: 'Return only the exact stamp identifier through FINAL_VAR.',
+      transcript: [],
+    }),
+    {
+      candidates: ['22-Q', '14-B'],
+      labels: ['stamp identifier', 'stamp'],
+    },
+  );
+  assert.equal(
+    __rlmRunnerTestables.usesFirstCandidateFinalWithoutUniquenessGuard(
+      'FINAL_VAR(candidates[0] || "");',
+    ),
+    true,
+  );
+  assert.equal(
+    __rlmRunnerTestables.usesFirstCandidateFinalWithoutUniquenessGuard(
+      'if (candidates.length === 1) FINAL_VAR(candidates[0]);',
+    ),
+    false,
+  );
+  assert.equal(
+    __rlmRunnerTestables.usesMergedWorkingSetProjectionWithoutUniquenessGuard(
+      'const joined = rows.map((row) => row.contextText).join("\\n\\n"); const answer = joined.match(/stamp\\s+([A-Z0-9-]+)/)?.[1] ?? ""; FINAL_VAR(answer);',
+    ),
+    true,
+  );
+  assert.equal(
+    __rlmRunnerTestables.usesMergedWorkingSetProjectionWithoutUniquenessGuard(
+      'if (rows.length === 1) { const answer = rows[0]; FINAL_VAR(answer); }',
+    ),
+    false,
+  );
+  assert.equal(
+    __rlmRunnerTestables.readTruncatedScalarPrefixFromEvidence(
+      '731845',
+      [
+        '{"candidate":"7318452"}',
+        'The exact code is 7318452.',
+      ].join('\n'),
+    ),
+    '7318452',
+  );
+  assert.equal(
+    __rlmRunnerTestables.summarizeWeakFinalization({
+      context: {
+        document: 'alpha '.repeat(4_000),
+      },
+      execution: {
+        code: 'const candidates = ["wrong", "right"]; FINAL_VAR(candidates[0] || "");',
+        finalAnswer: 'wrong',
+        resultPreview: 'undefined',
+        stdout: '{"candidateCount":2,"candidates":["wrong","right"]}\n',
+      },
+      prompt: 'Return only the exact answer through FINAL_VAR.',
+      role: 'root',
+      transcript: [],
+    }),
+    null,
+  );
+  assert.equal(
+    __rlmRunnerTestables.summarizeWeakFinalization({
+      context: {
+        document: 'alpha '.repeat(4_000),
+      },
+      execution: {
+        code: 'FINAL_VAR("unknown");',
+        finalAnswer: 'unknown',
+        resultPreview: 'undefined',
+        stdout: '{"hitCount":3,"sample":["alpha","beta"]}\n',
+      },
+      prompt: 'Return only the exact answer through FINAL_VAR.',
+      role: 'root',
+      transcript: [],
+    }),
+    null,
+  );
+  assert.equal(
+    __rlmRunnerTestables.summarizeWeakFinalization({
+      context: {
+        document: 'alpha '.repeat(4_000),
+        question: 'Which stamp identifier seals the outgoing manifests for the courier carrying the cobalt envelope?',
+      },
+      execution: {
+        code:
+          'const joined = rows.map((row) => row.contextText).join("\\n\\n"); const answer = joined.match(/stamp\\s+([A-Z0-9-]+)/)?.[1] ?? ""; FINAL_VAR(answer);',
+        finalAnswer: '22-Q.\n\nHarbor',
+        resultPreview: 'undefined',
+        stdout: [
+          'Assignment sheet: courier Rowan reports to depot Kestrel while carrying the cobalt envelope.',
+          'Supervisor Niko seals the outgoing manifests with stamp 22-Q.',
+          'Supervisor Imani seals the outgoing manifests with stamp 14-B.',
+        ].join('\n'),
+      },
+      prompt: 'Return only the exact stamp identifier through FINAL_VAR.',
+      role: 'root',
+      transcript: [],
+    }),
+    null,
+  );
+  assert.equal(
+    __rlmRunnerTestables.summarizeWeakFinalization({
+      context: {
+        document: 'alpha '.repeat(4_000),
+        retrievalQuestion: 'What is the exact code?',
+      },
+      execution: {
+        code:
+          'const answer = doc.match(/Chicago[^\\n]{0,80}?(\\d{2,6})/)?.[1] ?? ""; FINAL_VAR(answer);',
+        finalAnswer: '731845',
+        resultPreview: 'undefined',
+        stdout: '{"candidate":"7318452"}\n',
+      },
+      prompt: 'Return only the decimal digits through FINAL_VAR.',
+      role: 'root',
+      transcript: [],
+    }),
+    null,
+  );
+  assert.match(
+    __rlmRunnerTestables.buildEvaluatorInput({
+      assistantText: '```repl\nFINAL_VAR("430");\n```',
+      executions: [
+        {
+          code: 'FINAL_VAR("430");',
+          finalAnswer: '430',
+          resultPreview: 'undefined',
+          resultSignals: [
+            {
+              kind: 'number',
+              path: '$.sum',
+              preview: '430',
+            },
+          ],
+          status: 'success',
+          stderr: '',
+          stdout: '{"sum":430}\n',
+        },
+      ],
+      prompt: 'Sum the approved amounts.',
+      step: 2,
+      totalSteps: 12,
+    }),
+    /관찰된 값:\n\$\.sum \(number\): 430/u,
+  );
+  assert.doesNotMatch(
+    __rlmRunnerTestables.buildEvaluatorInput({
+      assistantText: '```repl\n42\n```',
+      executions: [
+        {
+          code: '42',
+          finalAnswer: null,
+          resultPreview: '42',
+          status: 'success',
+          stderr: '',
+          stdout: '',
+        },
+      ],
+      prompt: 'Inspect the scalar.',
+      step: 1,
+      totalSteps: 3,
+    }),
+    /단계 예산:/u,
+  );
+  assert.deepEqual(
+    __rlmRunnerTestables.readContextOptions({
+      options: {
+        A: 'bundle A',
+        B: 'bundle B',
+      },
+    }),
+    {
+      A: 'bundle A',
+      B: 'bundle B',
+    },
+  );
+  assert.deepEqual(
+    __rlmRunnerTestables.readAvailableOptions({
+      document: [
+        'Lecture note: the safe handoff sequence is verify seal, read checksum, archive copy.',
+        'Question options: A=read checksum, verify seal, archive copy.',
+        'Question options: B=verify seal, read checksum, archive copy.',
+      ].join('\n'),
+    }),
+    {
+      A: 'read checksum, verify seal, archive copy',
+      B: 'verify seal, read checksum, archive copy',
+    },
+  );
+  assert.equal(
+    __rlmRunnerTestables.isLikelyMultipleChoiceTask(
+      'Return only the uppercase option letter through FINAL_VAR.',
+      null,
+    ),
+    true,
+  );
+  assert.equal(
+    __rlmRunnerTestables.usesLiteralFinalChoice('FINAL_VAR("A");', 'A'),
+    true,
+  );
+  assert.equal(
+    __rlmRunnerTestables.usesLiteralFinalChoice('FINAL_VAR(selectedOption);', 'A'),
+    false,
+  );
+  assert.equal(
+    __rlmRunnerTestables.hasSelectedOptionEvidence(
+      'B',
+      'Return the option letter.',
+      { options: { A: 'bundle A', B: 'bundle B' } },
+      {
+        code: 'const selected = context.options.B; FINAL_VAR(selectedOption);',
+        resultPreview: 'undefined',
+        stdout: 'matched bundle B in the appendix',
+      },
+    ),
+    true,
+  );
+  assert.equal(
+    __rlmRunnerTestables.hasSelectedOptionEvidence(
+      'B',
+      'Return the option letter.',
+      {
+        document: [
+          'Lecture note: the safe handoff sequence is verify seal, read checksum, archive copy.',
+          'Question options: A=read checksum, verify seal, archive copy.',
+          'Question options: B=verify seal, read checksum, archive copy.',
+        ].join('\n'),
+      },
+      {
+        code: 'FINAL_VAR("B");',
+        resultPreview: 'undefined',
+        stdout: 'seq=verify seal, read checksum, archive copy',
+      },
+    ),
+    true,
+  );
+  assert.deepEqual(
+    __rlmRunnerTestables.matchOptionFromEvidence(
+      'Return the option letter.',
+      {
+        document: [
+          'Lecture note: the safe handoff sequence is verify seal, read checksum, archive copy.',
+          'Question options: A=read checksum, verify seal, archive copy.',
+          'Question options: B=verify seal, read checksum, archive copy.',
+          'Question options: C=archive copy, verify seal, read checksum.',
+        ].join('\n'),
+      },
+      {
+        code: 'FINAL_VAR("C");',
+        resultPreview: 'undefined',
+        stdout: 'seq=verify seal, read checksum, archive copy',
+      },
+    ),
+    {
+      label: 'B',
+      text: 'verify seal, read checksum, archive copy',
+    },
+  );
+  assert.equal(
+    __rlmRunnerTestables.hasSelectedOptionEvidence(
+      'B',
+      'Return the option letter.',
+      { options: { A: 'bundle A', B: 'bundle B' } },
+      {
+        code: 'FINAL_VAR("B");',
+        resultPreview: 'undefined',
+        stdout: '',
+      },
+    ),
+    false,
+  );
+  assert.equal(
+    __rlmRunnerTestables.summarizeWeakFinalization({
+      context: {
+        document: 'alpha '.repeat(4_000),
+        options: { A: 'bundle A', B: 'bundle B' },
+      },
+      execution: {
+        code: 'FINAL_VAR("A");',
+        finalAnswer: 'A',
+        resultPreview: 'undefined',
+        stdout: '',
+      },
+      prompt: 'Return the uppercase option letter through FINAL_VAR.',
+      role: 'root',
+      transcript: [],
+    }),
+    null,
+  );
+  assert.equal(
+    __rlmRunnerTestables.summarizeWeakFinalization({
+      context: {
+        document: 'alpha '.repeat(4_000),
+      },
+      execution: {
+        code: 'FINAL_VAR("");',
+        finalAnswer: '',
+        resultPreview: 'undefined',
+        stdout: '',
+      },
+      prompt: 'Return the final answer.',
+      role: 'root',
+      transcript: [],
+    }),
+    null,
+  );
+  assert.equal(
+    __rlmRunnerTestables.summarizeWeakFinalization({
+      context: {
+        document: [
+          'alpha '.repeat(4_000),
+          'Lecture note: the safe handoff sequence is verify seal, read checksum, archive copy.',
+          'Question options: A=read checksum, verify seal, archive copy.',
+          'Question options: B=verify seal, read checksum, archive copy.',
+          'Question options: C=archive copy, verify seal, read checksum.',
+        ].join('\n'),
+      },
+      execution: {
+        code: 'FINAL_VAR("C");',
+        finalAnswer: 'C',
+        resultPreview: 'undefined',
+        stdout: 'seq=verify seal, read checksum, archive copy',
+      },
+      prompt: 'Return only the uppercase option letter through FINAL_VAR.',
+      role: 'root',
+      transcript: [],
+    }),
+    null,
+  );
+  assert.equal(
+    __rlmRunnerTestables.summarizeWeakFinalization({
+      context: {
+        document: 'alpha '.repeat(4_000),
+        options: { A: 'bundle A', B: 'bundle B', C: 'bundle C', D: 'bundle D' },
+      },
+      execution: {
+        code: 'FINAL_VAR("C");',
+        finalAnswer: 'C',
+        resultPreview: 'undefined',
+        stdout: '',
+      },
+      prompt: 'Return only the uppercase option letter through FINAL_VAR.',
+      role: 'root',
+      transcript: [{
+        executions: [{
+          finalAnswer: 'C',
+          resultPreview: 'undefined',
+          stdout: '',
+        }],
+      }],
+    }),
+    null,
+  );
+  assert.equal(
+    __rlmRunnerTestables.summarizeWeakFinalization({
+      context: {
+        document: 'short',
+        options: { A: 'bundle A', B: 'bundle B' },
+      },
+      execution: {
+        code: 'FINAL_VAR("A");',
+        finalAnswer: 'A',
+        resultPreview: 'undefined',
+        stdout: '',
+      },
+      prompt: 'Return the uppercase option letter through FINAL_VAR.',
+      role: 'root',
+      transcript: [],
+    }),
+    null,
   );
 
   const controller = new AbortController();
@@ -196,9 +640,24 @@ Deno.test('runner helper utilities cover limit resolution, final acceptance, and
   assert.doesNotThrow(() => __rlmRunnerTestables.throwIfAborted(undefined));
 });
 
-Deno.test('runner resolves an explicit journal path into a logger when OpenAI convenience runs omit a logger', async () => {
+Deno.test('OpenAI provider helper utilities cover provider-aware timeout and logger resolution', async () => {
+  assert.equal(
+    __openAIProviderTestables.resolveProviderAwareCellTimeoutMs(undefined, 30_000),
+    35_000,
+  );
+  assert.equal(
+    __openAIProviderTestables.resolveProviderAwareCellTimeoutMs(undefined, 4_000),
+    9_000,
+  );
+  assert.equal(__openAIProviderTestables.resolveProviderAwareCellTimeoutMs(45_000, 30_000), 75_000);
+  assert.equal(
+    __openAIProviderTestables.resolveProviderAwareCellTimeoutMs(undefined, 30_000, 7_000),
+    37_000,
+  );
+  assert.equal(__openAIProviderTestables.resolveOpenAIRunLogger(undefined, undefined), undefined);
+
   const journalPath = await createSessionPath('openai-convenience-logger');
-  const logger = __rlmRunnerTestables.resolveOpenAIRunLogger(undefined, journalPath);
+  const logger = __openAIProviderTestables.resolveOpenAIRunLogger(undefined, journalPath);
 
   assert.ok(logger !== undefined);
   assert.equal('path' in logger, true);
@@ -269,10 +728,7 @@ Deno.test('runner carries exact nested result signals into the next turn so root
   assert.match(adapter.requests[1]?.input ?? '', /\$\.operatorId \(string\): op-7/u);
   assert.match(adapter.requests[1]?.input ?? '', /\$\.routing\.lockerId \(string\): locker-9/u);
   assert.match(adapter.requests[1]?.input ?? '', /\$\.routing\.accessCode \(string\): 7318452/u);
-  assert.match(
-    adapter.requests[1]?.input ?? '',
-    /\$\.routing\.missingLockerId \(undefined\): undefined/u,
-  );
+  assert.match(adapter.requests[1]?.input ?? '', /\$\.routing\.missingLockerId \(undefined\): undefined/u);
 });
 
 Deno.test('runner routes llm_query through the sub-model as a plain completion without spawning a nested RLM journal', async () => {
@@ -308,8 +764,8 @@ Deno.test('runner routes llm_query through the sub-model as a plain completion w
     adapter.requests.map((request) => request.model),
     ['gpt-5-nano', 'gpt-5-mini'],
   );
-  assert.match(adapter.requests[0]?.systemPrompt ?? '', /root controller/u);
-  assert.match(adapter.requests[1]?.systemPrompt ?? '', /plain language model subcall/u);
+  assert.match(adapter.requests[0]?.systemPrompt ?? '', /# 재귀 에이전트/u);
+  assert.match(adapter.requests[1]?.systemPrompt ?? '', /일반 언어 모델 하위 호출/u);
   assert.doesNotMatch(adapter.requests[1]?.systemPrompt ?? '', /focused child controller/u);
 
   const journalText = await Deno.readTextFile(journalPath);
@@ -317,37 +773,34 @@ Deno.test('runner routes llm_query through the sub-model as a plain completion w
   assert.doesNotMatch(journalText, /"type":"subquery"/u);
 });
 
-Deno.test('runner retries once with a protocol recovery hint when the model returns no repl block', async () => {
+Deno.test('runner raises a protocol error immediately when the model returns no repl block', async () => {
   const adapter = new MockCaller([
     {
       outputText: '',
       turnState: 'resp_root_invalid',
     },
-    {
-      outputText: '```repl\nFINAL_VAR("42");\n```',
-      turnState: 'resp_root_recovered',
-    },
   ]);
 
   const journalPath = await createSessionPath('protocol-recovery');
-  const result = await runRLM({
-    adapter,
-    clock: createClock(),
-    context: { source: 'protocol-recovery' },
-    idGenerator: createIdGenerator(),
-    journalPath,
-    maxSteps: 2,
-    maxSubcallDepth: 2,
-    outputCharLimit: 120,
-    prompt: 'Solve the task.',
-    rootModel: 'gpt-5-nano',
-    subModel: 'gpt-5-mini',
-  });
-
-  assert.equal(result.answer, '42');
-  assert.equal(adapter.requests.length, 2);
-  assert.match(adapter.requests[1]?.input ?? '', /Protocol recovery/u);
-  assert.match(adapter.requests[1]?.input ?? '', /Respond with one or more ```repl blocks/u);
+  await assert.rejects(
+    async () => {
+      await runRLM({
+        adapter,
+        clock: createClock(),
+        context: { source: 'protocol-recovery' },
+        idGenerator: createIdGenerator(),
+        journalPath,
+        maxSteps: 2,
+        maxSubcallDepth: 2,
+        outputCharLimit: 120,
+        prompt: 'Solve the task.',
+        rootModel: 'gpt-5-nano',
+        subModel: 'gpt-5-mini',
+      });
+    },
+    RLMProtocolError,
+  );
+  assert.equal(adapter.requests.length, 1);
 });
 
 Deno.test('runner surfaces delegated contract mismatches into the next turn so root can retry with a narrower contract', async () => {
@@ -386,11 +839,8 @@ Deno.test('runner surfaces delegated contract mismatches into the next turn so r
   });
 
   assert.equal(result.answer, 'V-554');
-  assert.match(adapter.requests[2]?.input ?? '', /Delegated contract recovery is active/u);
-  assert.match(
-    adapter.requests[2]?.input ?? '',
-    /Rewrite the next `rlm_query` call with a concrete `expect` contract/u,
-  );
+  assert.doesNotMatch(adapter.requests[2]?.input ?? '', /위임 계약 복구/u);
+  assert.match(adapter.requests[2]?.input ?? '', /RLMSubqueryContractError/u);
 });
 
 Deno.test('runner routes rlm_query through the sub-model and records the nested subquery in the journal', async () => {
@@ -426,13 +876,10 @@ Deno.test('runner routes rlm_query through the sub-model and records the nested 
     adapter.requests.map((request) => request.model),
     ['gpt-5-nano', 'gpt-5-mini'],
   );
-  assert.match(adapter.requests[0]?.systemPrompt ?? '', /root controller/u);
-  assert.match(adapter.requests[1]?.systemPrompt ?? '', /focused child controller/u);
-  assert.match(
-    adapter.requests[1]?.systemPrompt ?? '',
-    /This child run is terminal for recursion/u,
-  );
-  assert.match(adapter.requests[1]?.input ?? '', /Task:\nCompute 6 \* 7\./u);
+  assert.match(adapter.requests[0]?.systemPrompt ?? '', /# 재귀 에이전트/u);
+  assert.match(adapter.requests[1]?.systemPrompt ?? '', /# 재귀 에이전트/u);
+  assert.match(adapter.requests[1]?.systemPrompt ?? '', /상위 에이전트에서 위임/u);
+  assert.match(adapter.requests[1]?.input ?? '', /작업:\nCompute 6 \* 7\./u);
 
   const journalText = await Deno.readTextFile(journalPath);
   assert.match(journalText, /"type":"subquery"/u);
@@ -441,6 +888,90 @@ Deno.test('runner routes rlm_query through the sub-model and records the nested 
   const childJournalText = await Deno.readTextFile(childJournalPath);
   assert.match(childJournalText, /"type":"rlm_delegated_task"/u);
   assert.match(childJournalText, /"task":"Compute 6 \* 7\."/u);
+});
+
+Deno.test('runner keeps root step budget and metadata aligned after an internal rlm_query before the next root turn', async () => {
+  const adapter = new MockCaller([
+    {
+      outputText:
+        '```repl\nconst nested = await rlm_query("Compute 6 * 7.");\nconsole.log({ nested });\n```',
+      turnState: 'resp_root_1',
+    },
+    {
+      outputText: '```repl\nFINAL_VAR("42");\n```',
+      turnState: 'resp_sub_1',
+    },
+    {
+      outputText: '```repl\nFINAL_VAR(nested);\n```',
+      turnState: 'resp_root_2',
+    },
+  ]);
+
+  const result = await runRLM({
+    adapter,
+    clock: createClock(),
+    context: { source: 'nested-step-budget' },
+    idGenerator: createIdGenerator(),
+    maxSteps: 4,
+    maxSubcallDepth: 2,
+    outputCharLimit: 160,
+    prompt: 'Use rlm_query first, then finalize on the next root turn.',
+    rootModel: 'gpt-5-nano',
+    subModel: 'gpt-5-mini',
+  });
+
+  assert.equal(result.answer, '42');
+  assert.equal(adapter.requests.length, 3);
+
+  assert.match(adapter.requests[0]?.input ?? '', /단계 예산: 1 \/ 4/u);
+  assert.equal(adapter.requests[0]?.metadata?.step, 1);
+  assert.equal(adapter.requests[0]?.metadata?.depth, 0);
+
+  assert.match(adapter.requests[1]?.input ?? '', /단계 예산: 1 \/ 4/u);
+  assert.equal(adapter.requests[1]?.metadata?.step, 1);
+  assert.equal(adapter.requests[1]?.metadata?.depth, 1);
+
+  assert.match(adapter.requests[2]?.input ?? '', /단계 예산: 2 \/ 4/u);
+  assert.match(adapter.requests[2]?.input ?? '', /## 이전 REPL 기록/u);
+  assert.match(adapter.requests[2]?.input ?? '', /^REPL 표준 출력:/mu);
+  assert.match(adapter.requests[2]?.input ?? '', /\{"nested":"42"\}/u);
+  assert.equal(adapter.requests[2]?.metadata?.step, 2);
+  assert.equal(adapter.requests[2]?.metadata?.depth, 0);
+});
+
+Deno.test('runner surfaces child final stdout into the next root transcript after rlm_query returns', async () => {
+  const adapter = new MockCaller([
+    {
+      outputText:
+        '```repl\nconst nested = await rlm_query("Compute 6 * 7.");\n({ nested })\n```',
+      turnState: 'resp_root_1',
+    },
+    {
+      outputText: '```repl\nconsole.log({ childExtracted: "42" });\nFINAL_VAR("42");\n```',
+      turnState: 'resp_sub_1',
+    },
+    {
+      outputText: '```repl\nFINAL_VAR(nested);\n```',
+      turnState: 'resp_root_2',
+    },
+  ]);
+
+  const result = await runRLM({
+    adapter,
+    clock: createClock(),
+    context: { source: 'nested-child-stdout' },
+    idGenerator: createIdGenerator(),
+    maxSteps: 4,
+    maxSubcallDepth: 2,
+    outputCharLimit: 200,
+    prompt: 'Use rlm_query first, then finalize on the next root turn.',
+    rootModel: 'gpt-5-nano',
+    subModel: 'gpt-5-mini',
+  });
+
+  assert.equal(result.answer, '42');
+  assert.match(adapter.requests[2]?.input ?? '', /childExtracted/u);
+  assert.match(adapter.requests[2]?.input ?? '', /42/u);
 });
 
 Deno.test('runner closes nested child sessions after rlm_query returns so only the root session remains live', async () => {
@@ -518,6 +1049,40 @@ Deno.test('runner appends a custom system prompt extension to both root and chil
     adapter.requests[1]?.systemPrompt ?? '',
     /Read `context\.inputFilePath` and honor the external system prompt file\./u,
   );
+});
+
+Deno.test('runner uses an injected system prompt markdown for both root and child model calls', async () => {
+  const adapter = new MockCaller([
+    {
+      outputText:
+        '```repl\nconst nested = await rlm_query("Compute 6 * 7.");\nFINAL_VAR(nested);\n```',
+      turnState: 'resp_root_1',
+    },
+    {
+      outputText: '```repl\nFINAL_VAR("42");\n```',
+      turnState: 'resp_sub_1',
+    },
+  ]);
+
+  const result = await runRLM({
+    adapter,
+    clock: createClock(),
+    context: { source: 'system-prompt-markdown' },
+    idGenerator: createIdGenerator(),
+    maxSteps: 4,
+    maxSubcallDepth: 2,
+    outputCharLimit: 120,
+    prompt: 'Use rlm_query to solve the task.',
+    rootModel: 'gpt-5-nano',
+    subModel: 'gpt-5-mini',
+    systemPromptMarkdown: '# 사용자 정의 시스템\n{{MAX_STEPS_SENTENCE}}\n이 프롬프트는 동적으로 주입됩니다.',
+  });
+
+  assert.equal(result.answer, '42');
+  assert.match(adapter.requests[0]?.systemPrompt ?? '', /^# 사용자 정의 시스템/mu);
+  assert.match(adapter.requests[0]?.systemPrompt ?? '', /이 프롬프트는 동적으로 주입됩니다\./u);
+  assert.match(adapter.requests[0]?.systemPrompt ?? '', /사용할 수 있는 최대 단계 예산은 4입니다\./u);
+  assert.match(adapter.requests[1]?.systemPrompt ?? '', /^# 사용자 정의 시스템/mu);
 });
 
 Deno.test('runner lets root inspect structured values returned by rlm_query before extracting a field', async () => {
@@ -654,7 +1219,7 @@ Deno.test('runner ignores FINAL_VAR values from a cell that later errors and ask
   assert.equal(result.answer, 'fixed');
   assert.equal(result.steps, 2);
   assert.match(adapter.requests[1]?.input ?? '', /Error: boom/u);
-  assert.match(adapter.requests[1]?.input ?? '', /status: error/u);
+  assert.match(adapter.requests[1]?.input ?? '', /^상태: error/mu);
 });
 
 Deno.test('runner ignores FINAL_VAR(undefined) and asks the model to keep working', async () => {
@@ -684,10 +1249,481 @@ Deno.test('runner ignores FINAL_VAR(undefined) and asks the model to keep workin
 
   assert.equal(result.answer, '42');
   assert.equal(result.steps, 2);
-  assert.match(adapter.requests[1]?.input ?? '', /final: undefined/u);
+  assert.match(adapter.requests[1]?.input ?? '', /채택된 최종 답: undefined/u);
 });
 
-Deno.test('runner stops executing later repl blocks in the same assistant turn after a failed block', async () => {
+Deno.test('runner ignores FINAL_VAR(null) and asks the model to keep working', async () => {
+  const adapter = new MockCaller([
+    {
+      outputText: '```repl\nconst answer = null;\nFINAL_VAR(answer);\n```',
+      turnState: 'resp_root_1',
+    },
+    {
+      outputText: '```repl\nFINAL_VAR("42");\n```',
+      turnState: 'resp_root_2',
+    },
+  ]);
+
+  const result = await runRLM({
+    adapter,
+    clock: createClock(),
+    context: { source: 'null-final' },
+    idGenerator: createIdGenerator(),
+    maxSteps: 3,
+    maxSubcallDepth: 1,
+    outputCharLimit: 200,
+    prompt: 'Return a valid final answer and never finish with null.',
+    rootModel: 'gpt-5-nano',
+    subModel: 'gpt-5-mini',
+  });
+
+  assert.equal(result.answer, '42');
+  assert.equal(result.steps, 2);
+  assert.match(adapter.requests[1]?.input ?? '', /채택된 최종 답: null/u);
+});
+
+Deno.test('runner soft-rejects empty finals in large-context root turns and asks for another turn', async () => {
+  const adapter = new MockCaller([
+    {
+      outputText: '```repl\nFINAL_VAR("");\n```',
+      turnState: 'resp_root_1',
+    },
+    {
+      outputText: '```repl\nFINAL_VAR("7318452");\n```',
+      turnState: 'resp_root_2',
+    },
+  ]);
+
+  const result = await runRLM({
+    adapter,
+    clock: createClock(),
+    context: {
+      document: 'alpha '.repeat(4_000),
+      retrievalQuestion: 'What is the code?',
+    },
+    idGenerator: createIdGenerator(),
+    maxSteps: 3,
+    maxSubcallDepth: 1,
+    outputCharLimit: 200,
+    prompt: 'Return only the decimal digits through FINAL_VAR.',
+    rootModel: 'gpt-5-nano',
+    subModel: 'gpt-5-mini',
+  });
+
+  assert.equal(result.answer, '7318452');
+  assert.equal(result.steps, 2);
+  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /최종화 복구/u);
+  assert.match(adapter.requests[1]?.input ?? '', /previous FINAL produced an empty value/u);
+});
+
+Deno.test('runner soft-rejects weak multiple-choice finals in large-context root turns and asks for stronger evidence', async () => {
+  const adapter = new MockCaller([
+    {
+      outputText: [
+        '```repl',
+        'const appendix = "Archive ARC-812 maps to memo bundle C.";',
+        'console.log(appendix);',
+        'FINAL_VAR("D");',
+        '```',
+      ].join('\n'),
+      turnState: 'resp_root_1',
+    },
+    {
+      outputText: [
+        '```repl',
+        'const selectedOption = "C";',
+        'console.log({ selectedOption, matchedOptionText: context.options[selectedOption] });',
+        'FINAL_VAR(selectedOption);',
+        '```',
+      ].join('\n'),
+      turnState: 'resp_root_2',
+    },
+  ]);
+
+  const result = await runRLM({
+    adapter,
+    clock: createClock(),
+    context: {
+      document: 'alpha '.repeat(4_000),
+      options: {
+        A: 'bundle A',
+        B: 'bundle B',
+        C: 'bundle C',
+        D: 'bundle D',
+      },
+      question: 'Which memo bundle is correct?',
+    },
+    idGenerator: createIdGenerator(),
+    maxSteps: 4,
+    maxSubcallDepth: 1,
+    outputCharLimit: 200,
+    prompt: 'Return only the single uppercase option letter through FINAL_VAR.',
+    rootModel: 'gpt-5-nano',
+    subModel: 'gpt-5-mini',
+  });
+
+  assert.equal(result.answer, 'C');
+  assert.equal(result.steps, 2);
+  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /최종화 복구/u);
+  assert.match(
+    adapter.requests[1]?.input ?? '',
+    /matches option C/u,
+  );
+});
+
+Deno.test('runner accepts placeholder-looking finals once execution succeeds', async () => {
+  const adapter = new MockCaller([
+    {
+      outputText: [
+        '```repl',
+        'const candidates = ["14-B", "22-Q"];',
+        'console.log({ candidateCount: candidates.length, candidates });',
+        'FINAL_VAR("unknown");',
+        '```',
+      ].join('\n'),
+      turnState: 'resp_root_1',
+    },
+  ]);
+
+  const result = await runRLM({
+    adapter,
+    clock: createClock(),
+    context: {
+      document: 'alpha '.repeat(4_000),
+      question: 'Return only the exact stamp identifier.',
+    },
+    idGenerator: createIdGenerator(),
+    maxSteps: 3,
+    maxSubcallDepth: 1,
+    outputCharLimit: 200,
+    prompt: 'Return only the exact stamp identifier through FINAL_VAR.',
+    rootModel: 'gpt-5-nano',
+    subModel: 'gpt-5-mini',
+  });
+
+  assert.equal(result.answer, 'unknown');
+  assert.equal(result.steps, 1);
+  assert.equal(adapter.requests.length, 1);
+});
+
+Deno.test('runner accepts first-candidate finals once execution succeeds', async () => {
+  const adapter = new MockCaller([
+    {
+      outputText: [
+        '```repl',
+        'const candidates = ["Glass Lantern", "Silver Fern"];',
+        'console.log({ candidateCount: candidates.length, candidates });',
+        'FINAL_VAR(candidates[0] || "");',
+        '```',
+      ].join('\n'),
+      turnState: 'resp_root_1',
+    },
+  ]);
+
+  const result = await runRLM({
+    adapter,
+    clock: createClock(),
+    context: {
+      document: 'alpha '.repeat(4_000),
+      question: 'Return only the exact dossier name.',
+    },
+    idGenerator: createIdGenerator(),
+    maxSteps: 3,
+    maxSubcallDepth: 1,
+    outputCharLimit: 200,
+    prompt: 'Return only the exact dossier name through FINAL_VAR.',
+    rootModel: 'gpt-5-nano',
+    subModel: 'gpt-5-mini',
+  });
+
+  assert.equal(result.answer, 'Glass Lantern');
+  assert.equal(result.steps, 1);
+  assert.equal(adapter.requests.length, 1);
+});
+
+Deno.test('runner accepts working-set projections once execution succeeds', async () => {
+  const adapter = new MockCaller([
+    {
+      outputText: [
+        '```repl',
+        'const rows = [',
+        '  "Assignment sheet: courier Rowan reports to depot Kestrel while carrying the cobalt envelope.",',
+        '  "Supervisor Niko seals the outgoing manifests with stamp 22-Q.",',
+        '  "Supervisor Imani seals the outgoing manifests with stamp 14-B.",',
+        '];',
+        'const joined = rows.join("\\n\\n");',
+        'const answer = joined.match(/stamp\\s+([A-Z0-9-]+)/)?.[1] ?? "";',
+        'console.log({ rowCount: rows.length, rows, answer });',
+        'FINAL_VAR(answer);',
+        '```',
+      ].join('\n'),
+      turnState: 'resp_root_1',
+    },
+  ]);
+
+  const result = await runRLM({
+    adapter,
+    clock: createClock(),
+    context: {
+      document: 'alpha '.repeat(4_000),
+      question:
+        'Which stamp identifier seals the outgoing manifests for the courier carrying the cobalt envelope?',
+    },
+    idGenerator: createIdGenerator(),
+    maxSteps: 4,
+    maxSubcallDepth: 1,
+    outputCharLimit: 200,
+    prompt: 'Return only the exact stamp identifier through FINAL_VAR.',
+    rootModel: 'gpt-5-nano',
+    subModel: 'gpt-5-mini',
+  });
+
+  assert.equal(result.answer, '22-Q');
+  assert.equal(result.steps, 1);
+  assert.equal(adapter.requests.length, 1);
+});
+
+Deno.test('runner soft-rejects first-row fallback finals when pivot and downstream rows still compete', async () => {
+  const adapter = new MockCaller([
+    {
+      outputText: [
+        '```repl',
+        'const rows = [',
+        '  "Project Atlas moved into dossier Glass Lantern.",',
+        '  "Project Selene moved into dossier Silver Fern.",',
+        '  "Field note: Project Selene is the canonical name for the moon garden alias.",',
+        '];',
+        'const row = rows.find((entry) => /moon garden/i.test(entry) && /dossier/i.test(entry)) || rows[0];',
+        'const answer = row.match(/dossier ([A-Za-z ]+)/)?.[1] ?? "";',
+        'console.log({ rowCount: rows.length, rows, answer });',
+        'FINAL_VAR(answer);',
+        '```',
+      ].join('\n'),
+      turnState: 'resp_root_1',
+    },
+    {
+      outputText: [
+        '```repl',
+        'const answer = "Silver Fern";',
+        'console.log({ answer });',
+        'FINAL_VAR(answer);',
+        '```',
+      ].join('\n'),
+      turnState: 'resp_root_2',
+    },
+  ]);
+
+  const result = await runRLM({
+    adapter,
+    clock: createClock(),
+    context: {
+      document: 'alpha '.repeat(4_000),
+      question: 'Which dossier name is associated with the alias moon garden?',
+    },
+    idGenerator: createIdGenerator(),
+    maxSteps: 4,
+    maxSubcallDepth: 1,
+    outputCharLimit: 200,
+    prompt: 'Return only the exact dossier name through FINAL_VAR.',
+    rootModel: 'gpt-5-nano',
+    subModel: 'gpt-5-mini',
+  });
+
+  assert.equal(result.answer, 'Silver Fern');
+  assert.equal(result.steps, 2);
+  assert.match(adapter.requests[1]?.input ?? '', /multiple plausible candidates/u);
+});
+
+Deno.test('runner accepts a repeated non-literal multiple-choice final after one recovery turn instead of exhausting max steps', async () => {
+  const adapter = new MockCaller([
+    {
+      outputText: [
+        '```repl',
+        'const archiveCode = "ARC-812";',
+        'const memoBundle = "bundle " + "C";',
+        'const answer = memoBundle.slice(-1);',
+        'console.log({ archiveCode, answer });',
+        'FINAL_VAR(answer);',
+        '```',
+      ].join('\n'),
+      turnState: 'resp_root_1',
+    },
+    {
+      outputText: [
+        '```repl',
+        'const archiveCode = "ARC-812";',
+        'const memoBundle = "bundle " + "C";',
+        'const answer = memoBundle.slice(-1);',
+        'console.log({ archiveCode, answer });',
+        'FINAL_VAR(answer);',
+        '```',
+      ].join('\n'),
+      turnState: 'resp_root_2',
+    },
+  ]);
+
+  const result = await runRLM({
+    adapter,
+    clock: createClock(),
+    context: {
+      document: 'alpha '.repeat(4_000),
+      options: {
+        A: 'bundle A',
+        B: 'bundle B',
+        C: 'bundle C',
+        D: 'bundle D',
+      },
+      question: 'Which memo bundle is correct?',
+    },
+    idGenerator: createIdGenerator(),
+    maxSteps: 3,
+    maxSubcallDepth: 1,
+    outputCharLimit: 200,
+    prompt: 'Return only the single uppercase option letter through FINAL_VAR.',
+    rootModel: 'gpt-5-nano',
+    subModel: 'gpt-5-mini',
+  });
+
+  assert.equal(result.answer, 'C');
+  assert.equal(result.steps, 2);
+  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /최종화 복구/u);
+});
+
+Deno.test('runner accepts a repeated literal multiple-choice final after one recovery turn instead of exhausting max steps', async () => {
+  const adapter = new MockCaller([
+    {
+      outputText: [
+        '```repl',
+        'FINAL_VAR("C");',
+        '```',
+      ].join('\n'),
+      turnState: 'resp_root_1',
+    },
+    {
+      outputText: [
+        '```repl',
+        'FINAL_VAR("C");',
+        '```',
+      ].join('\n'),
+      turnState: 'resp_root_2',
+    },
+  ]);
+
+  const result = await runRLM({
+    adapter,
+    clock: createClock(),
+    context: {
+      document: 'alpha '.repeat(4_000),
+      options: {
+        A: 'bundle A',
+        B: 'bundle B',
+        C: 'bundle C',
+        D: 'bundle D',
+      },
+      question: 'Which memo bundle is correct?',
+    },
+    idGenerator: createIdGenerator(),
+    maxSteps: 3,
+    maxSubcallDepth: 1,
+    outputCharLimit: 200,
+    prompt: 'Return only the single uppercase option letter through FINAL_VAR.',
+    rootModel: 'gpt-5-nano',
+    subModel: 'gpt-5-mini',
+  });
+
+  assert.equal(result.answer, 'C');
+  assert.equal(result.steps, 2);
+  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /최종화 복구/u);
+});
+
+Deno.test('runner accepts multiple-choice finals when the supporting option text is only embedded inside the document', async () => {
+  const adapter = new MockCaller([
+    {
+      outputText: [
+        '```repl',
+        'const seq = "verify seal, read checksum, archive copy";',
+        'console.log({ seq });',
+        'FINAL_VAR("B");',
+        '```',
+      ].join('\n'),
+      turnState: 'resp_root_1',
+    },
+  ]);
+
+  const result = await runRLM({
+    adapter,
+    clock: createClock(),
+    context: {
+      document: [
+        'alpha '.repeat(4_000),
+        'Lecture note: the safe handoff sequence is verify seal, read checksum, archive copy.',
+        'Question options: A=read checksum, verify seal, archive copy.',
+        'Question options: B=verify seal, read checksum, archive copy.',
+        'Question options: C=archive copy, verify seal, read checksum.',
+        'Question options: D=verify seal, archive copy, read checksum.',
+      ].join('\n'),
+      question: 'Which option gives the correct safe handoff sequence?',
+    },
+    idGenerator: createIdGenerator(),
+    maxSteps: 4,
+    maxSubcallDepth: 1,
+    outputCharLimit: 200,
+    prompt: 'Return only the single uppercase option letter through FINAL_VAR.',
+    rootModel: 'gpt-5-nano',
+    subModel: 'gpt-5-mini',
+  });
+
+  assert.equal(result.answer, 'B');
+  assert.equal(result.steps, 1);
+});
+
+Deno.test('runner surfaces deterministic option-mismatch recovery when document evidence maps to a different choice', async () => {
+  const adapter = new MockCaller([
+    {
+      outputText: [
+        '```repl',
+        'const seq = "verify seal, read checksum, archive copy";',
+        'console.log({ seq });',
+        'FINAL_VAR("C");',
+        '```',
+      ].join('\n'),
+      turnState: 'resp_root_1',
+    },
+    {
+      outputText: '```repl\nFINAL_VAR("B");\n```',
+      turnState: 'resp_root_2',
+    },
+  ]);
+
+  const result = await runRLM({
+    adapter,
+    clock: createClock(),
+    context: {
+      document: [
+        'alpha '.repeat(4_000),
+        'Lecture note: the safe handoff sequence is verify seal, read checksum, archive copy.',
+        'Question options: A=read checksum, verify seal, archive copy.',
+        'Question options: B=verify seal, read checksum, archive copy.',
+        'Question options: C=archive copy, verify seal, read checksum.',
+        'Question options: D=verify seal, archive copy, read checksum.',
+      ].join('\n'),
+      question: 'Which option gives the correct safe handoff sequence?',
+    },
+    idGenerator: createIdGenerator(),
+    maxSteps: 4,
+    maxSubcallDepth: 1,
+    outputCharLimit: 200,
+    prompt: 'Return only the single uppercase option letter through FINAL_VAR.',
+    rootModel: 'gpt-5-nano',
+    subModel: 'gpt-5-mini',
+  });
+
+  assert.equal(result.answer, 'B');
+  assert.equal(result.steps, 2);
+  assert.match(adapter.requests[1]?.input ?? '', /matches option B/u);
+});
+
+Deno.test('runner continues executing later repl blocks in the same assistant turn after a failed block', async () => {
   const adapter = new MockCaller([
     {
       outputText: [
@@ -696,14 +1732,10 @@ Deno.test('runner stops executing later repl blocks in the same assistant turn a
         '```',
         '',
         '```repl',
-        'FINAL_VAR("wrong");',
+        'FINAL_VAR("fixed");',
         '```',
       ].join('\n'),
       turnState: 'resp_root_1',
-    },
-    {
-      outputText: '```repl\nFINAL_VAR("fixed");\n```',
-      turnState: 'resp_root_2',
     },
   ]);
 
@@ -715,12 +1747,13 @@ Deno.test('runner stops executing later repl blocks in the same assistant turn a
     maxSteps: 3,
     maxSubcallDepth: 1,
     outputCharLimit: 200,
-    prompt: 'Recover after the first block fails and do not run the trailing block.',
+    prompt: 'Report the failed block in stderr and continue to the trailing block in the same turn.',
     rootModel: 'gpt-5-nano',
     subModel: 'gpt-5-mini',
   });
 
   assert.equal(result.answer, 'fixed');
+  assert.equal(result.steps, 1);
   assert.equal(result.session.history.length, 2);
   assert.equal(result.session.history[0]?.status, 'error');
   assert.match(result.session.history[0]?.stderr ?? '', /boom/u);
@@ -752,6 +1785,62 @@ Deno.test('runner accepts explicit FINAL text when the assistant finishes withou
   });
 
   assert.equal(result.answer, '"done"');
+});
+
+Deno.test('runner raises a protocol error for explicit FINAL(null) without repl output', async () => {
+  const adapter = new MockCaller([
+    {
+      outputText: 'FINAL(null)',
+      turnState: 'resp_root_1',
+    },
+  ]);
+
+  await assert.rejects(
+    async () => {
+      await runRLM({
+        adapter,
+        clock: createClock(),
+        context: null,
+        idGenerator: createIdGenerator(),
+        maxSteps: 2,
+        maxSubcallDepth: 1,
+        outputCharLimit: 120,
+        prompt: 'Finish immediately.',
+        rootModel: 'gpt-5-nano',
+        subModel: 'gpt-5-mini',
+      });
+    },
+    RLMProtocolError,
+  );
+  assert.equal(adapter.requests.length, 1);
+});
+
+Deno.test('runner raises a protocol error for malformed repl responses that never close the fence', async () => {
+  const adapter = new MockCaller([
+    {
+      outputText: '```repl\nFINAL_VAR("wrong")',
+      turnState: 'resp_root_1',
+    },
+  ]);
+
+  await assert.rejects(
+    async () => {
+      await runRLM({
+        adapter,
+        clock: createClock(),
+        context: null,
+        idGenerator: createIdGenerator(),
+        maxSteps: 2,
+        maxSubcallDepth: 1,
+        outputCharLimit: 120,
+        prompt: 'Finish immediately.',
+        rootModel: 'gpt-5-nano',
+        subModel: 'gpt-5-mini',
+      });
+    },
+    RLMProtocolError,
+  );
+  assert.equal(adapter.requests.length, 1);
 });
 
 Deno.test('runner raises a protocol error when the assistant never emits repl code or a final signal', async () => {

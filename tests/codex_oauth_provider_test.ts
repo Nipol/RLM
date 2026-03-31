@@ -2038,6 +2038,118 @@ Deno.test('Codex OAuth provider surfaces structured model-list failures instead 
   );
 });
 
+Deno.test('Codex OAuth provider retries a transient HTML model-list response before completing a request', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'rlm-codex-oauth-model-html-retry-' });
+  const storagePath = join(root, '.rlm/codex-oauth.json');
+  await Deno.mkdir(join(root, '.rlm'));
+  await Deno.writeTextFile(storagePath, JSON.stringify(createStoredAuth(), null, 2));
+
+  let modelListCalls = 0;
+  const provider = new CodexOAuthProvider({
+    clock: createClock(),
+    fetcher: async (input) => {
+      const url = String(input);
+      if (url.includes('/codex/models')) {
+        modelListCalls += 1;
+        if (modelListCalls === 1) {
+          return new Response('<html>temporary edge error</html>', {
+            headers: { 'Content-Type': 'text/html' },
+            status: 502,
+          });
+        }
+
+        return jsonResponse({
+          models: [{ slug: 'gpt-5-4-t-mini' }],
+        });
+      }
+
+      if (url.endsWith('/codex/responses')) {
+        return jsonResponse({
+          id: 'resp_codex_1',
+          output_text: '```repl\nFINAL_VAR("done")\n```',
+        });
+      }
+
+      throw new Error(`Unexpected request: ${url}`);
+    },
+    storagePath,
+  });
+
+  const completion = await provider.createCaller().complete({
+    input: 'Return done.',
+    kind: 'root_turn',
+    metadata: { depth: 0, step: 1 },
+    model: 'gpt-5-4-t-mini',
+    systemPrompt: 'Use the REPL.',
+  });
+
+  assert.equal(completion.outputText, '```repl\nFINAL_VAR("done")\n```');
+  assert.equal(modelListCalls, 2);
+});
+
+Deno.test('Codex OAuth provider clears a rejected cached model-list promise and surfaces stable errors for invalid HTML payloads', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'rlm-codex-oauth-model-html-reset-' });
+  const storagePath = join(root, '.rlm/codex-oauth.json');
+  await Deno.mkdir(join(root, '.rlm'));
+  await Deno.writeTextFile(storagePath, JSON.stringify(createStoredAuth(), null, 2));
+
+  let modelListCalls = 0;
+  const provider = new CodexOAuthProvider({
+    clock: createClock(),
+    fetcher: async (input) => {
+      const url = String(input);
+      if (url.includes('/codex/models')) {
+        modelListCalls += 1;
+        if (modelListCalls <= 2) {
+          return new Response('<html>gateway error</html>', {
+            headers: { 'Content-Type': 'text/html' },
+            status: 502,
+          });
+        }
+
+        return jsonResponse({
+          models: [{ slug: 'gpt-5-4-t-mini' }],
+        });
+      }
+
+      if (url.endsWith('/codex/responses')) {
+        return jsonResponse({
+          id: 'resp_codex_2',
+          output_text: '```repl\nFINAL_VAR("done")\n```',
+        });
+      }
+
+      throw new Error(`Unexpected request: ${url}`);
+    },
+    storagePath,
+  });
+
+  const llm = provider.createCaller();
+
+  await assert.rejects(
+    async () =>
+      await llm.complete({
+        input: 'Return done.',
+        kind: 'root_turn',
+        metadata: { depth: 0, step: 1 },
+        model: 'gpt-5-4-t-mini',
+        systemPrompt: 'Use the REPL.',
+      }),
+    /Model listing failed with status 502|invalid response payload/u,
+  );
+
+  const completion = await llm.complete({
+    input: 'Return done.',
+    kind: 'root_turn',
+    metadata: { depth: 0, step: 2 },
+    model: 'gpt-5-4-t-mini',
+    systemPrompt: 'Use the REPL.',
+  });
+
+  assert.equal(completion.outputText, '```repl\nFINAL_VAR("done")\n```');
+  assert.equal(modelListCalls, 3);
+});
+
 Deno.test('Codex OAuth provider rejects non-catalog model aliases before calling the Codex responses endpoint', async () => {
   const root = await Deno.makeTempDir({ prefix: 'rlm-codex-oauth-model-validate-' });
   const storagePath = join(root, '.rlm/codex-oauth.json');

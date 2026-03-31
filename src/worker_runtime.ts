@@ -37,7 +37,7 @@ interface WorkerLike {
 type WorkerFactory = (
   url: string,
   options: WorkerOptions,
-) => WorkerLike;
+) => WorkerLike | Promise<WorkerLike>;
 
 interface PersistentRuntimeOptions {
   context: JsonValue | null;
@@ -63,7 +63,7 @@ interface PersistentWorkerLike {
 type PersistentWorkerFactory = (
   url: string,
   options: WorkerOptions,
-) => PersistentWorkerLike;
+) => PersistentWorkerLike | Promise<PersistentWorkerLike>;
 
 interface PersistentWorkerExecuteMessage {
   captureFinals: boolean;
@@ -97,6 +97,7 @@ interface PersistentWorkerRecursiveQueryRequestMessage {
 
 interface PersistentWorkerQueryResponseMessage {
   queryId: number;
+  stdout?: string;
   type: 'llm_query_response';
   value: JsonValue;
 }
@@ -128,6 +129,12 @@ interface PendingExecution {
 interface PendingQueryController {
   controller: AbortController;
   worker: PersistentWorkerLike;
+}
+
+interface InternalRLMQueryResultEnvelope {
+  __rlmQueryResultEnvelope: true;
+  stdout?: string;
+  value: JsonValue;
 }
 
 /**
@@ -165,6 +172,15 @@ function abortPendingQueryControllers(
     pending.controller.abort();
     pendingControllers.delete(queryId);
   }
+}
+
+function isInternalRLMQueryResultEnvelope(value: unknown): value is InternalRLMQueryResultEnvelope {
+  return typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value) &&
+    '__rlmQueryResultEnvelope' in value &&
+    value.__rlmQueryResultEnvelope === true &&
+    'value' in value;
 }
 
 type WorkerFailureOutput = SandboxExecutionOutput & {
@@ -321,145 +337,81 @@ try {
 }
 
 /**
- * Generates a shared worker-side helper that normalizes question-derived lookup targets.
+ * Generates a shared worker-side helper that collects repeated line-oriented matches.
  */
-function buildNormalizeTargetSource(): string {
+function buildGrepSource(): string {
   return `
-const normalizeTarget = (value) => {
-  if (value === undefined || value === null) {
+const grep = (text, pattern, options = {}) => {
+  if (text === undefined || text === null || pattern === undefined || pattern === null) {
     return null;
   }
 
-  const valueType = typeof value;
-  if (valueType !== 'boolean' && valueType !== 'number' && valueType !== 'string') {
-    return '';
+  if (typeof text !== 'string') {
+    return [];
   }
 
-  let text = String(value).trim();
-  if (text.length === 0) {
-    return '';
+  const safeOptions = options && typeof options === 'object' && !Array.isArray(options)
+    ? options
+    : {};
+  const before = Number.isInteger(safeOptions.before) && safeOptions.before > 0 ? safeOptions.before : 0;
+  const after = Number.isInteger(safeOptions.after) && safeOptions.after > 0 ? safeOptions.after : 0;
+  const limit = Number.isInteger(safeOptions.limit) && safeOptions.limit > 0 ? safeOptions.limit : 20;
+  const mode = safeOptions.mode === 'regex' ? 'regex' : 'plain';
+  const caseSensitive = safeOptions.caseSensitive === true;
+
+  let matcher;
+  if (pattern instanceof RegExp) {
+    const flags = pattern.flags.replace(/[gy]/gu, '');
+    matcher = (line) => new RegExp(pattern.source, flags).test(line);
+  } else if (typeof pattern === 'string') {
+    if (pattern.length === 0) {
+      return [];
+    }
+
+    if (mode === 'regex') {
+      let regex;
+      try {
+        regex = new RegExp(pattern, caseSensitive ? '' : 'i');
+      } catch (_) {
+        return [];
+      }
+      matcher = (line) => regex.test(line);
+    } else {
+      const needle = caseSensitive ? pattern : pattern.toLowerCase();
+      matcher = (line) => {
+        const haystack = caseSensitive ? line : line.toLowerCase();
+        return haystack.includes(needle);
+      };
+    }
+  } else {
+    return [];
   }
 
-  const pairedQuotes = new Map([
-    ['"', '"'],
-    ["'", "'"],
-    ['\`', '\`'],
-    ['“', '”'],
-    ['‘', '’'],
-    ['(', ')'],
-    ['[', ']'],
-    ['{', '}'],
-  ]);
+  const lines = text.split(/\\r?\\n/u);
+  const matches = [];
 
-  while (text.length >= 2) {
-    const opener = text[0];
-    const closer = text[text.length - 1];
-    if (pairedQuotes.get(opener) !== closer) {
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (!matcher(line)) {
+      continue;
+    }
+
+    const start = Math.max(0, index - before);
+    const end = Math.min(lines.length, index + after + 1);
+    matches.push({
+      contextText: lines.slice(start, end).join('\\n'),
+      endLine: end,
+      line,
+      lineNumber: index + 1,
+      startLine: start + 1,
+    });
+
+    if (matches.length >= limit) {
       break;
     }
-
-    text = text.slice(1, -1).trim();
   }
 
-  const sourceText = text;
-  text = text
-    .replace(/^[\\s"'“”‘’\`([{]+/u, '')
-    .replace(/[\\s"'“”‘’\`)\\]}!?.,:;]+$/u, '')
-    .trim();
-
-  if (text.length === 0) {
-    return '';
-  }
-
-  const looksLikeQuery = /^(?:what|which|who|where|when|why|how|return|find|identify|extract|give|show|locate)\\b/iu
-    .test(text);
-
-  if (looksLikeQuery) {
-    const targetPatterns = [
-      /\\bfor\\s+(.+?)(?:\\s*[?!.]|$)/iu,
-      /\\bnamed\\s+(.+?)(?:\\s*[?!.]|$)/iu,
-      /\\bcalled\\s+(.+?)(?:\\s*[?!.]|$)/iu,
-      /\\bbelongs\\s+to\\s+(?:profile\\s+)?(.+?)(?:\\s*[?!.]|$)/iu,
-    ];
-
-    for (const pattern of targetPatterns) {
-      const match = sourceText.match(pattern) ?? text.match(pattern);
-      if (!match || typeof match[1] !== 'string') {
-        continue;
-      }
-
-      const candidate = normalizeTarget(match[1]);
-      if (candidate !== null && candidate.length > 0 && candidate !== text) {
-        return candidate;
-      }
-    }
-
-    return '';
-  }
-
-  const descriptorSuffixes = new Set([
-    'code',
-    'id',
-    'identifier',
-    'key',
-    'label',
-    'number',
-    'token',
-  ]);
-  const words = text.split(/\\s+/u).filter((part) => part.length > 0);
-  if (words.length >= 1) {
-    const trailingWord = words[words.length - 1].toLowerCase();
-    if (descriptorSuffixes.has(trailingWord)) {
-      if (words.length === 1) {
-        return '';
-      }
-
-      return words.slice(0, -1).join(' ');
-    }
-  }
-
-  return text;
-};
-`;
-}
-
-/**
- * Generates a shared worker-side helper that extracts the substring between exact anchors.
- */
-function buildAnchoredValueSource(): string {
-  return `
-const findAnchoredValue = (text, prefix, suffix) => {
-  if (text === undefined || text === null || prefix === undefined || prefix === null || suffix === undefined || suffix === null) {
-    return null;
-  }
-
-  if (typeof text !== 'string' || typeof prefix !== 'string' || typeof suffix !== 'string') {
-    return '';
-  }
-
-  if (prefix.length === 0) {
-    return '';
-  }
-
-  const start = text.indexOf(prefix);
-  if (start < 0) {
-    return '';
-  }
-
-  const valueStart = start + prefix.length;
-  const end = suffix.length === 0 ? -1 : text.indexOf(suffix, valueStart);
-  if (end >= 0) {
-    const exact = text.slice(valueStart, end).trim();
-    return exact.length === 0 ? '' : exact;
-  }
-
-  const trailing = text.slice(valueStart).trimStart();
-  if (trailing.length === 0) {
-    return '';
-  }
-
-  const token = trailing.split(/\\s+/u, 1)[0];
-  return normalizeTarget(token);
+  return matches;
 };
 `;
 }
@@ -501,7 +453,7 @@ const __stableStringify = (value, depth = 0) => {
     return null;
   }
 
-  if (depth > 2) {
+  if (depth > 3) {
     return '[MaxDepth]';
   }
 
@@ -697,8 +649,7 @@ for (const __globalName of [
 }
 
 ${buildSandboxGuardSource()}
-${buildNormalizeTargetSource()}
-${buildAnchoredValueSource()}
+${buildGrepSource()}
 
 const __deepFreeze = (value) => {
   if (value && typeof value === 'object' && !Object.isFrozen(value)) {
@@ -794,7 +745,7 @@ function createErrorSnapshot(error: unknown, fallbackName = 'Error'): ExecutionE
  * Encodes generated worker source as a self-contained TypeScript data URL.
  */
 function buildWorkerUrl(source: string): string {
-  return `data:application/typescript;charset=utf-8,${encodeURIComponent(source)}`;
+  return `data:text/javascript;charset=utf-8,${encodeURIComponent(source)}`;
 }
 
 /**
@@ -803,6 +754,10 @@ function buildWorkerUrl(source: string): string {
 export async function executeCellInSandbox(
   input: SandboxExecutionInput,
 ): Promise<SandboxExecutionOutput> {
+  if (typeof Worker !== 'function') {
+    throw new Error('No global Worker constructor is available in this runtime.');
+  }
+
   return await executeCellInSandboxWithFactory(input, (url, options) => new Worker(url, options));
 }
 
@@ -813,8 +768,7 @@ export async function executeCellInSandboxWithFactory(
   input: SandboxExecutionInput,
   workerFactory: WorkerFactory,
 ): Promise<SandboxExecutionOutput> {
-  const worker = workerFactory(buildWorkerUrl(buildWorkerSource(input)), {
-    deno: { permissions: 'none' },
+  const worker = await workerFactory(buildWorkerUrl(buildWorkerSource(input)), {
     type: 'module',
   });
 
@@ -909,14 +863,56 @@ function createScannerState() {
     brackets: 0,
     canStartStatement: true,
     parens: 0,
+    regexCharClass: false,
     state: 'code' as
       | 'block-comment'
       | 'code'
       | 'double'
       | 'line-comment'
+      | 'regex'
       | 'single'
       | 'template',
   };
+}
+
+/**
+ * Finds the previous non-whitespace character index before one scanner position.
+ */
+function findPreviousSignificantIndex(source: string, start: number): number {
+  let index = start - 1;
+  while (index >= 0 && /\s/u.test(source[index])) {
+    index -= 1;
+  }
+
+  return index;
+}
+
+/**
+ * Heuristically decides whether one slash starts a regex literal instead of division.
+ */
+function startsRegexLiteral(source: string, index: number): boolean {
+  const next = source[index + 1];
+  if (next === '/' || next === '*') {
+    return false;
+  }
+
+  const previousIndex = findPreviousSignificantIndex(source, index);
+  if (previousIndex < 0) {
+    return true;
+  }
+
+  const previousChar = source[previousIndex];
+  if ('([{:,;=!?&|+-*%^~<>'.includes(previousChar)) {
+    return true;
+  }
+
+  if (previousChar === ')' || previousChar === ']' || previousChar === '}' || previousChar === '.') {
+    return false;
+  }
+
+  const prefix = source.slice(Math.max(0, previousIndex - 16), previousIndex + 1);
+  return /\b(?:return|case|throw|typeof|instanceof|in|of|delete|void|new|await|yield)$/
+    .test(prefix);
 }
 
 /**
@@ -948,6 +944,13 @@ function advanceScanner(
     if (char === '/' && next === '*') {
       scanner.state = 'block-comment';
       return { nextIndex: index + 2, scanner };
+    }
+
+    if (char === '/' && startsRegexLiteral(source, index)) {
+      scanner.state = 'regex';
+      scanner.regexCharClass = false;
+      scanner.canStartStatement = false;
+      return { nextIndex: index + 1, scanner };
     }
 
     if (char === '{') {
@@ -995,6 +998,37 @@ function advanceScanner(
       if (!/\s/u.test(char)) {
         scanner.canStartStatement = false;
       }
+    }
+
+    return { nextIndex: index + 1, scanner };
+  }
+
+  if (scanner.state === 'regex') {
+    if (char === '\\') {
+      return {
+        nextIndex: Math.min(source.length, index + 2),
+        scanner,
+      };
+    }
+
+    if (char === '[') {
+      scanner.regexCharClass = true;
+      return { nextIndex: index + 1, scanner };
+    }
+
+    if (char === ']' && scanner.regexCharClass) {
+      scanner.regexCharClass = false;
+      return { nextIndex: index + 1, scanner };
+    }
+
+    if (char === '/' && !scanner.regexCharClass) {
+      scanner.state = 'code';
+      let nextIndex = index + 1;
+      while (/[A-Za-z]/u.test(source[nextIndex] ?? '')) {
+        nextIndex += 1;
+      }
+
+      return { nextIndex, scanner };
     }
 
     return { nextIndex: index + 1, scanner };
@@ -1424,7 +1458,18 @@ const __stdoutParts = [];
 const __stderrParts = [];
 const __stateStore = Object.create(null);
 const __pendingQueries = new Map();
-const __reservedBindings = new Set(['FINAL', 'FINAL_VAR', 'context', 'findAnchoredValue', 'history', 'llm_query', 'normalizeTarget', 'rlm_query']);
+const __reservedBindings = new Set([
+  'FINAL',
+  'FINAL_VAR',
+  'SHOW_VARS',
+  'context',
+  'grep',
+  'history',
+  'llm_query',
+  'llm_query_batched',
+  'rlm_query',
+  'rlm_query_batched',
+]);
 const __excludedBindings = new Set(['__scope', '__setResult']);
 
 let __context = null;
@@ -1459,7 +1504,7 @@ const __stableStringify = (value, depth = 0) => {
     return null;
   }
 
-  if (depth > 2) {
+  if (depth > 3) {
     return '[MaxDepth]';
   }
 
@@ -1686,8 +1731,7 @@ for (const __globalName of [
 }
 
 ${buildSandboxGuardSource()}
-${buildNormalizeTargetSource()}
-${buildAnchoredValueSource()}
+${buildGrepSource()}
 
 const FINAL = (value) => {
   if (__captureFinals) {
@@ -1699,6 +1743,10 @@ const FINAL = (value) => {
 };
 
 const FINAL_VAR = (value) => FINAL(value);
+
+const SHOW_VARS = () => Object.keys(__stateStore)
+  .filter((key) => !__reservedBindings.has(key) && !__excludedBindings.has(key))
+  .sort();
 
 const llm_query = (prompt) => new Promise((resolve, reject) => {
   if (prompt === undefined || prompt === null) {
@@ -1720,6 +1768,28 @@ const llm_query = (prompt) => new Promise((resolve, reject) => {
     type: 'llm_query_request',
   });
 });
+
+const llm_query_batched = (prompts) => {
+  if (!Array.isArray(prompts) || prompts.length === 0) {
+    return Promise.reject(new Error('llm_query_batched requires a non-empty prompt array.'));
+  }
+
+  const normalized = [];
+  for (const prompt of prompts) {
+    if (prompt === undefined || prompt === null) {
+      return Promise.reject(new Error('llm_query_batched requires each prompt to be concrete and non-empty.'));
+    }
+
+    const promptText = String(prompt);
+    if (promptText.trim().length === 0) {
+      return Promise.reject(new Error('llm_query_batched requires each prompt to be concrete and non-empty.'));
+    }
+
+    normalized.push(promptText);
+  }
+
+  return Promise.all(normalized.map((prompt) => llm_query(prompt)));
+};
 
 const rlm_query = (prompt) => new Promise((resolve, reject) => {
   if (prompt === undefined || prompt === null) {
@@ -1760,6 +1830,41 @@ const rlm_query = (prompt) => new Promise((resolve, reject) => {
   });
 });
 
+const rlm_query_batched = (prompts) => {
+  if (!Array.isArray(prompts) || prompts.length === 0) {
+    return Promise.reject(new Error('rlm_query_batched requires a non-empty prompt array.'));
+  }
+
+  const normalized = [];
+  for (const prompt of prompts) {
+    if (typeof prompt === 'string') {
+      if (prompt.trim().length === 0) {
+        return Promise.reject(
+          new Error('rlm_query_batched expects each entry to be either a non-empty task string or an object with a non-empty task field.'),
+        );
+      }
+      normalized.push(prompt);
+      continue;
+    }
+
+    if (typeof prompt === 'object' && prompt !== null && !Array.isArray(prompt)) {
+      if (typeof prompt.task !== 'string' || prompt.task.trim().length === 0) {
+        return Promise.reject(
+          new Error('rlm_query_batched expects each entry to be either a non-empty task string or an object with a non-empty task field.'),
+        );
+      }
+      normalized.push(prompt);
+      continue;
+    }
+
+    return Promise.reject(
+      new Error('rlm_query_batched expects each entry to be either a non-empty task string or an object with a non-empty task field.'),
+    );
+  }
+
+  return Promise.all(normalized.map((prompt) => rlm_query(prompt)));
+};
+
 const __scope = new Proxy(__stateStore, {
   deleteProperty(target, key) {
     if (typeof key === 'string' && __reservedBindings.has(key)) {
@@ -1789,20 +1894,28 @@ const __scope = new Proxy(__stateStore, {
       return FINAL_VAR;
     }
 
+    if (key === 'SHOW_VARS') {
+      return SHOW_VARS;
+    }
+
     if (key === 'llm_query') {
       return llm_query;
     }
 
-    if (key === 'findAnchoredValue') {
-      return findAnchoredValue;
+    if (key === 'llm_query_batched') {
+      return llm_query_batched;
     }
 
-    if (key === 'normalizeTarget') {
-      return normalizeTarget;
+    if (key === 'grep') {
+      return grep;
     }
 
     if (key === 'rlm_query') {
       return rlm_query;
+    }
+
+    if (key === 'rlm_query_batched') {
+      return rlm_query_batched;
     }
 
     if (Reflect.has(target, key)) {
@@ -1889,6 +2002,11 @@ const __handleMessage = async (message) => {
     const pending = __pendingQueries.get(message.queryId);
     if (pending) {
       __pendingQueries.delete(message.queryId);
+      if (typeof message.stdout === 'string' && message.stdout.length > 0) {
+        __stdoutParts.push(
+          message.stdout.endsWith('\\n') ? message.stdout : message.stdout + '\\n',
+        );
+      }
       pending.resolve(message.value);
     }
 
@@ -1973,10 +2091,6 @@ export class PersistentSandboxRuntime {
         });
         this.#syncedHistoryLength = input.history.length;
       }
-
-      if (output.status !== 'success') {
-        this.#destroyWorker();
-      }
     } catch (error) {
       if (error instanceof PersistentWorkerStartupError) {
         output = error.output;
@@ -2010,8 +2124,7 @@ export class PersistentSandboxRuntime {
 
     this.#syncedHistoryLength = 0;
     this.#startupFailure = null;
-    const worker = this.#workerFactory(buildWorkerUrl(buildPersistentWorkerSource()), {
-      deno: { permissions: 'none' },
+    const worker = await this.#workerFactory(buildWorkerUrl(buildPersistentWorkerSource()), {
       type: 'module',
     });
     this.#worker = worker;
@@ -2200,10 +2313,15 @@ export class PersistentSandboxRuntime {
           return;
         }
 
+        const envelope = isInternalRLMQueryResultEnvelope(value)
+          ? value
+          : null;
+
         worker.postMessage({
           queryId: message.queryId,
+          stdout: envelope?.stdout,
           type: 'llm_query_response',
-          value: structuredClone(value),
+          value: structuredClone(envelope?.value ?? value),
         });
       } catch (error) {
         if (isStalePersistentWorker(this.#worker, worker)) {

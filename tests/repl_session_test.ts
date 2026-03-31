@@ -12,7 +12,12 @@ import {
   PersistentSandboxRuntime,
   SandboxTimeoutError,
 } from '../src/worker_runtime.ts';
-import type { CellEntry, ExecutionBackend, PersistentRuntimeLike, SessionEntry } from '../src/types.ts';
+import type {
+  CellEntry,
+  ExecutionBackend,
+  PersistentRuntimeLike,
+  SessionEntry,
+} from '../src/types.ts';
 
 function createClock(start = Date.parse('2026-03-22T00:00:00.000Z')): () => Date {
   let current = start;
@@ -373,7 +378,7 @@ Deno.test('console warning and errors are captured in stderr', async () => {
   assert.equal(result.stderr, 'careful\nboom\n');
 });
 
-Deno.test('runtime failures are recorded and not replayed into future state', async () => {
+Deno.test('runtime failures are recorded while keeping live REPL state available to later cells', async () => {
   const journalPath = await createSessionPath('runtime-error');
   const session = await ReplSession.open({
     clock: createClock(),
@@ -387,7 +392,7 @@ Deno.test('runtime failures are recorded and not replayed into future state', as
 
   assert.equal(failed.status, 'error');
   assert.match(failed.stderr, /Error: explode/u);
-  assert.equal(afterFailure.result.preview, '1');
+  assert.equal(afterFailure.result.preview, '2');
   assert.equal(afterFailure.replayedCellIds.length, 1);
 });
 
@@ -419,92 +424,8 @@ Deno.test('reserved REPL identifiers cannot be reassigned', async () => {
   assert.match(result.stderr, /Reserved REPL identifiers/u);
 });
 
-Deno.test('normalizeTarget trims question punctuation and returns empty strings for unresolved non-null inputs', async () => {
-  const journalPath = await createSessionPath('normalize-target');
-  const session = await ReplSession.open({
-    clock: createClock(),
-    idGenerator: createIdGenerator(),
-    journalPath,
-  });
-
-  const cleaned = await session.execute(`({
-  plain: normalizeTarget(' linen? '),
-  quoted: normalizeTarget('"linen?"'),
-  empty: normalizeTarget(' ? '),
-  object: normalizeTarget({ value: 'linen' }),
-  nullish: normalizeTarget(null),
-})`);
-
-  assert.equal(cleaned.status, 'success');
-  assert.deepEqual(cleaned.result.json, {
-    plain: 'linen',
-    quoted: 'linen',
-    empty: '',
-    object: '',
-    nullish: null,
-  });
-});
-
-Deno.test('normalizeTarget extracts clear trailing targets from query-like strings and returns empty strings when the target is ambiguous', async () => {
-  const journalPath = await createSessionPath('normalize-target-queries');
-  const session = await ReplSession.open({
-    clock: createClock(),
-    idGenerator: createIdGenerator(),
-    journalPath,
-  });
-
-  const cleaned = await session.execute(`({
-  questionFor: normalizeTarget('What is the control code for linen?'),
-  imperativeFor: normalizeTarget('Return the control code for "linen".'),
-  namedTarget: normalizeTarget('Find the route beacon named cedar.'),
-  calledTarget: normalizeTarget('Identify the active dossier called onyx!'),
-  belongsToTarget: normalizeTarget('Which vault key belongs to profile amber?'),
-  ambiguousQuestion: normalizeTarget('Which control code should we inspect?'),
-  plainLabelQuestion: normalizeTarget('linen?'),
-})`);
-
-  assert.equal(cleaned.status, 'success');
-  assert.deepEqual(cleaned.result.json, {
-    questionFor: 'linen',
-    imperativeFor: 'linen',
-    namedTarget: 'cedar',
-    calledTarget: 'onyx',
-    belongsToTarget: 'amber',
-    ambiguousQuestion: '',
-    plainLabelQuestion: 'linen',
-  });
-});
-
-Deno.test('normalizeTarget strips trailing descriptor nouns from partial question remnants seen in live retrieval prompts', async () => {
-  const journalPath = await createSessionPath('normalize-target-remnants');
-  const session = await ReplSession.open({
-    clock: createClock(),
-    idGenerator: createIdGenerator(),
-    journalPath,
-  });
-
-  const cleaned = await session.execute(`({
-  exactLiveFailure: normalizeTarget('Sydney number?'),
-  lowercaseCode: normalizeTarget('linen code.'),
-  uppercaseId: normalizeTarget('AMBER id'),
-  extraSpaces: normalizeTarget('   Barcelona token   '),
-  descriptorOnly: normalizeTarget('number?'),
-  stablePlain: normalizeTarget('release-current'),
-})`);
-
-  assert.equal(cleaned.status, 'success');
-  assert.deepEqual(cleaned.result.json, {
-    exactLiveFailure: 'Sydney',
-    lowercaseCode: 'linen',
-    uppercaseId: 'AMBER',
-    extraSpaces: 'Barcelona',
-    descriptorOnly: '',
-    stablePlain: 'release-current',
-  });
-});
-
-Deno.test('findAnchoredValue extracts substrings between exact anchors and returns empty strings when matching fails', async () => {
-  const journalPath = await createSessionPath('find-anchored-value');
+Deno.test('normalizeTarget and findAnchoredValue are not exposed on the REPL surface', async () => {
+  const journalPath = await createSessionPath('removed-lookup-helpers');
   const session = await ReplSession.open({
     clock: createClock(),
     idGenerator: createIdGenerator(),
@@ -512,43 +433,58 @@ Deno.test('findAnchoredValue extracts substrings between exact anchors and retur
   });
 
   const extracted = await session.execute(`({
-  hit: findAnchoredValue(
-    'The special magic Barcelona number is: 6985442. filler',
-    'The special magic Barcelona number is: ',
-    '.',
-  ),
-  fallback: findAnchoredValue(
-    '비밀 코드: 528612 filler',
-    '비밀 코드: ',
-    '\\n',
-  ),
-  emptySuffix: findAnchoredValue(
-    'What is the control code for linen?',
-    'What is the control code for ',
-    '',
-  ),
-  miss: findAnchoredValue(
-    'The special magic Toronto number is: 7451057. filler',
-    'The special magic Barcelona number is: ',
-    '.',
-  ),
-  badInput: findAnchoredValue({ text: 'nope' }, 'prefix', '.'),
-  nullish: findAnchoredValue(null, 'prefix', '.'),
+  normalizeTargetType: typeof normalizeTarget,
+  findAnchoredValueType: typeof findAnchoredValue,
 })`);
 
   assert.equal(extracted.status, 'success');
   assert.deepEqual(extracted.result.json, {
-    hit: '6985442',
-    fallback: '528612',
-    emptySuffix: 'linen',
-    miss: '',
-    badInput: '',
-    nullish: null,
+    findAnchoredValueType: 'undefined',
+    normalizeTargetType: 'undefined',
   });
 });
 
-Deno.test('findAnchoredValue prefers the exact anchored span and normalizes token fallback punctuation', async () => {
-  const journalPath = await createSessionPath('find-anchored-value-repeated');
+Deno.test('grep collects matching lines as structured records with optional surrounding context', async () => {
+  const journalPath = await createSessionPath('grep-lines');
+  const session = await ReplSession.open({
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    journalPath,
+  });
+
+  const extracted = await session.execute(`grep(
+  [
+    'header',
+    'Program Orion entry: status=approved amount=120 reviewer=west.',
+    'skip',
+    'program orion entry: status=approved amount=140 reviewer=south.',
+    'Program Nova entry: status=approved amount=900 reviewer=east.',
+  ].join('\\n'),
+  'program orion',
+  { before: 1, after: 0, limit: 2 },
+)`);
+
+  assert.equal(extracted.status, 'success');
+  assert.deepEqual(extracted.result.json, [
+    {
+      contextText: 'header\nProgram Orion entry: status=approved amount=120 reviewer=west.',
+      endLine: 2,
+      line: 'Program Orion entry: status=approved amount=120 reviewer=west.',
+      lineNumber: 2,
+      startLine: 1,
+    },
+    {
+      contextText: 'skip\nprogram orion entry: status=approved amount=140 reviewer=south.',
+      endLine: 4,
+      line: 'program orion entry: status=approved amount=140 reviewer=south.',
+      lineNumber: 4,
+      startLine: 3,
+    },
+  ]);
+});
+
+Deno.test('grep supports regex mode and handles defensive nullish or invalid inputs', async () => {
+  const journalPath = await createSessionPath('grep-lines-regex');
   const session = await ReplSession.open({
     clock: createClock(),
     idGenerator: createIdGenerator(),
@@ -556,28 +492,143 @@ Deno.test('findAnchoredValue prefers the exact anchored span and normalizes toke
   });
 
   const extracted = await session.execute(`({
-  firstExact: findAnchoredValue(
-    'The route beacon for amber has control code 721228. The route beacon for linen has control code 848562.',
-    'The route beacon for linen has control code ',
-    '.',
+  regexString: grep(
+    'A=1\\nB=22\\nC=333',
+    '\\\\d{2,}',
+    { mode: 'regex' },
   ),
-  tokenFallbackQuestionMark: findAnchoredValue(
-    'Control code for linen? 848562',
-    'Control code for ',
-    '::missing::',
+  regexLiteral: grep(
+    'stamp 14-B\\nstamp 22-Q',
+    /stamp\\s+\\d{2}-[A-Z]/,
+    { limit: 1 },
   ),
-  emptyValue: findAnchoredValue(
-    'The route beacon for linen has control code .',
-    'The route beacon for linen has control code ',
-    '.',
-  ),
+  emptyPattern: grep('alpha', '', {}),
+  badInput: grep({ text: 'alpha' }, 'alpha'),
+  nullish: grep(null, 'alpha'),
 })`);
 
   assert.equal(extracted.status, 'success');
   assert.deepEqual(extracted.result.json, {
-    firstExact: '848562',
-    tokenFallbackQuestionMark: 'linen',
-    emptyValue: '',
+    regexString: [
+      { contextText: 'B=22', endLine: 2, line: 'B=22', lineNumber: 2, startLine: 2 },
+      { contextText: 'C=333', endLine: 3, line: 'C=333', lineNumber: 3, startLine: 3 },
+    ],
+    regexLiteral: [
+      { contextText: 'stamp 14-B', endLine: 1, line: 'stamp 14-B', lineNumber: 1, startLine: 1 },
+    ],
+    emptyPattern: [],
+    badInput: [],
+    nullish: null,
+  });
+});
+
+Deno.test('SHOW_VARS returns current user-defined bindings without reserved helper names', async () => {
+  const journalPath = await createSessionPath('show-vars');
+  const session = await ReplSession.open({
+    clock: createClock(),
+    context: { project: 'orion' },
+    idGenerator: createIdGenerator(),
+    journalPath,
+  });
+
+  await session.execute(`const dossier = 'Silver Fern';
+const parsedAmounts = [120, 140, 170];
+function chooseStamp(value) {
+  return value;
+}`);
+
+  const result = await session.execute('SHOW_VARS()');
+
+  assert.equal(result.status, 'success');
+  assert.deepEqual(result.result.json, [
+    'chooseStamp',
+    'dossier',
+    'parsedAmounts',
+  ]);
+});
+
+Deno.test('llm_query_batched resolves plain subcalls in input order', async () => {
+  const journalPath = await createSessionPath('llm-query-batched');
+  const seenPrompts: string[] = [];
+  const session = await ReplSession.open({
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    journalPath,
+    llmQueryHandler: async (prompt) => {
+      seenPrompts.push(prompt);
+      return `echo:${prompt}`;
+    },
+  });
+
+  const result = await session.execute(
+    'await llm_query_batched(["alpha", "beta", "gamma"])',
+  );
+
+  assert.equal(result.status, 'success');
+  assert.deepEqual(result.result.json, [
+    'echo:alpha',
+    'echo:beta',
+    'echo:gamma',
+  ]);
+  assert.deepEqual(seenPrompts, ['alpha', 'beta', 'gamma']);
+});
+
+Deno.test('rlm_query_batched resolves delegated subcalls in input order', async () => {
+  const journalPath = await createSessionPath('rlm-query-batched');
+  const seenPrompts: Array<string | { task: string }> = [];
+  const session = await ReplSession.open({
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    journalPath,
+    rlmQueryHandler: async (prompt) => {
+      seenPrompts.push(typeof prompt === 'string' ? prompt : { task: prompt.task });
+      return typeof prompt === 'string'
+        ? `delegated:${prompt}`
+        : { task: prompt.task, ok: true };
+    },
+  });
+
+  const result = await session.execute(`await rlm_query_batched([
+  "pick dossier",
+  { task: "pick stamp", expect: "string" },
+])`);
+
+  assert.equal(result.status, 'success');
+  assert.deepEqual(result.result.json, [
+    'delegated:pick dossier',
+    { ok: true, task: 'pick stamp' },
+  ]);
+  assert.deepEqual(seenPrompts, [
+    'pick dossier',
+    { task: 'pick stamp' },
+  ]);
+});
+
+Deno.test('batched query helpers reject invalid prompt collections defensively', async () => {
+  const journalPath = await createSessionPath('batched-query-invalid');
+  const session = await ReplSession.open({
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    journalPath,
+    llmQueryHandler: async (prompt) => prompt,
+    rlmQueryHandler: async (prompt) => typeof prompt === 'string' ? prompt : prompt.task,
+  });
+
+  const result = await session.execute(`({
+  badLlmType: await llm_query_batched('alpha').catch((error) => error.message),
+  emptyLlm: await llm_query_batched([]).catch((error) => error.message),
+  badRlmEntry: await rlm_query_batched([null]).catch((error) => error.message),
+  emptyRlmTask: await rlm_query_batched([{ task: '   ' }]).catch((error) => error.message),
+})`);
+
+  assert.equal(result.status, 'success');
+  assert.deepEqual(result.result.json, {
+    badLlmType: 'llm_query_batched requires a non-empty prompt array.',
+    emptyLlm: 'llm_query_batched requires a non-empty prompt array.',
+    badRlmEntry:
+      'rlm_query_batched expects each entry to be either a non-empty task string or an object with a non-empty task field.',
+    emptyRlmTask:
+      'rlm_query_batched expects each entry to be either a non-empty task string or an object with a non-empty task field.',
   });
 });
 
@@ -984,9 +1035,14 @@ Deno.test('code guard allows reserved bindings to be compared or read without tr
     assertCodeIsRunnable('const raw = typeof context === "string" ? context : "";\nraw')
   );
   assert.doesNotThrow(() => assertCodeIsRunnable('const same = context == null;\nsame'));
-  assert.doesNotThrow(() => assertCodeIsRunnable('const target = normalizeTarget("linen?");\ntarget'));
+});
+
+Deno.test('code guard allows normalizeTarget and findAnchoredValue to be reused as ordinary user variable names', () => {
   assert.doesNotThrow(() =>
-    assertCodeIsRunnable('const code = findAnchoredValue("A: 1.", "A: ", ".");\ncode')
+    assertCodeIsRunnable('const normalizeTarget = "linen";\nconst value = normalizeTarget;\nvalue')
+  );
+  assert.doesNotThrow(() =>
+    assertCodeIsRunnable('const findAnchoredValue = "A: 1.";\nconst value = findAnchoredValue;\nvalue')
   );
 });
 
@@ -1224,6 +1280,39 @@ function broken() {
   assert.equal(__workerRuntimeTestables.rewriteTopLevelBindings('const ;'), '');
 });
 
+Deno.test('worker runtime persistent transform preserves top-level grep calls with regex and options objects', () => {
+  const transformed = __workerRuntimeTestables.buildPersistentCellCode(`
+const optionRows = grep(context.document, /Question options:|Option [A-Z]|^[A-E][).:-]/i, { before: 0, after: 1, limit: 20 }) || [];
+const evidenceRows = grep(context.document, /handoff|checksum|archive copy|verify seal/i, { before: 1, after: 1, limit: 20 }) || [];
+({ optionRows: optionRows.map((row) => row.contextText), evidenceRows: evidenceRows.map((row) => row.contextText) });
+`);
+
+  assert.match(
+    transformed,
+    /optionRows = grep\(context\.document, \/Question options:\|Option \[A-Z\]\|\^\[A-E\]\[\)\.:-\]\/i, \{ before: 0, after: 1, limit: 20 \}\) \|\| \[\];/u,
+  );
+  assert.match(
+    transformed,
+    /evidenceRows = grep\(context\.document, \/handoff\|checksum\|archive copy\|verify seal\/i, \{ before: 1, after: 1, limit: 20 \}\) \|\| \[\];/u,
+  );
+  assert.doesNotMatch(transformed, /\|\| \[\] = undefined/u);
+  assert.doesNotThrow(() => new Function(transformed));
+});
+
+Deno.test('worker runtime persistent transform preserves top-level grep calls with inline regex character classes', () => {
+  const transformed = __workerRuntimeTestables.buildPersistentCellCode(`
+const hits = grep(doc, /safe handoff|handoff sequence|option [A-E]|^[A-E][).:-]/i, { before: 2, after: 2, limit: 50 }) || [];
+console.log({ hitCount: hits.length });
+hits.slice(0, 10).map((hit) => hit.contextText).join("\\n---\\n");
+`);
+
+  assert.match(
+    transformed,
+    /hits = grep\(doc, \/safe handoff\|handoff sequence\|option \[A-E\]\|\^\[A-E\]\[\)\.:-\]\/i, \{ before: 2, after: 2, limit: 50 \}\) \|\| \[\];/u,
+  );
+  assert.doesNotThrow(() => new Function(transformed));
+});
+
 Deno.test('direct sandbox helper executes a cell in the default worker runtime', async () => {
   const result = await executeCellInSandbox({
     context: null,
@@ -1299,6 +1388,104 @@ Deno.test('persistent runtime rejects concurrent executions and supports explici
   const result = await first;
   assert.equal(result.status, 'success');
   runtime.close();
+});
+
+Deno.test('persistent runtime can bootstrap from an async worker factory before the first execution', async () => {
+  let created = 0;
+  let pendingRequestId: number | null = null;
+  const worker = createPersistentWorker((message, fakeWorker) => {
+    if (message.type === 'execute' && pendingRequestId === null) {
+      pendingRequestId = message.requestId ?? null;
+      queueMicrotask(() => {
+        fakeWorker.onmessage?.(
+          new MessageEvent('message', {
+            data: createSandboxOutput(message.requestId!),
+          }),
+        );
+      });
+    }
+  });
+
+  const runtime = new PersistentSandboxRuntime(
+    { context: null },
+    async () => {
+      created += 1;
+      return worker as unknown as Worker;
+    },
+  );
+
+  const result = await runtime.execute({ code: '1 + 1', history: [], timeoutMs: 100 });
+
+  assert.equal(created, 1);
+  assert.equal(result.status, 'success');
+  assert.equal(pendingRequestId !== null, true);
+});
+
+Deno.test('persistent runtime keeps the active worker alive after one cell returns an execution error', async () => {
+  let created = 0;
+  let executeCount = 0;
+  const worker = createPersistentWorker((message, fakeWorker) => {
+    if (message.type !== 'execute' || typeof message.requestId !== 'number') {
+      return;
+    }
+
+    executeCount += 1;
+    queueMicrotask(() => {
+      fakeWorker.onmessage?.(
+        new MessageEvent('message', {
+          data: executeCount === 1
+            ? createSandboxOutput(message.requestId!, {
+              error: { message: 'missing ) after argument list', name: 'SyntaxError' },
+              status: 'error',
+              stderr: 'SyntaxError: missing ) after argument list',
+            })
+            : createSandboxOutput(message.requestId!, {
+              finalAnswer: 'fixed',
+              result: { kind: 'string', json: 'fixed', preview: '"fixed"' },
+            }),
+        }),
+      );
+    });
+  });
+
+  const runtime = new PersistentSandboxRuntime(
+    { context: null },
+    async () => {
+      created += 1;
+      return worker as unknown as Worker;
+    },
+  );
+
+  const first = await runtime.execute({
+    code: 'const broken = (',
+    history: [],
+    timeoutMs: 100,
+  });
+  const second = await runtime.execute({
+    code: 'FINAL_VAR("fixed")',
+    history: [
+      createCellEntry({
+        cellId: 'cell-error',
+        code: 'const broken = (',
+        error: { message: 'missing ) after argument list', name: 'SyntaxError' },
+        status: 'error',
+        stderr: 'SyntaxError: missing ) after argument list',
+      }),
+    ],
+    timeoutMs: 100,
+  });
+
+  assert.equal(first.status, 'error');
+  assert.equal(first.error?.name, 'SyntaxError');
+  assert.match(first.stderr, /missing \) after argument list/u);
+  assert.equal(second.status, 'success');
+  assert.equal(second.finalAnswer, 'fixed');
+  assert.equal(created, 1);
+  assert.equal(executeCount, 2);
+  assert.equal(worker.terminated, false);
+
+  runtime.close();
+  assert.equal(worker.terminated, true);
 });
 
 Deno.test('persistent runtime synchronizes history incrementally instead of resending full history on every execute', async () => {
@@ -1753,9 +1940,9 @@ Deno.test('worker runtime helper resolves worker error and messageerror paths', 
         terminate() {},
       };
 
-      queueMicrotask(() => {
+      setTimeout(() => {
         fakeWorker.onerror?.(new ErrorEvent('error', { message: 'worker failed' }));
-      });
+      }, 0);
 
       return fakeWorker;
     },
@@ -1776,9 +1963,9 @@ Deno.test('worker runtime helper resolves worker error and messageerror paths', 
         terminate() {},
       };
 
-      queueMicrotask(() => {
+      setTimeout(() => {
         fakeWorker.onmessageerror?.(new MessageEvent('messageerror'));
-      });
+      }, 0);
 
       return fakeWorker;
     },
@@ -1788,6 +1975,52 @@ Deno.test('worker runtime helper resolves worker error and messageerror paths', 
   assert.equal(workerError.error?.name, 'WorkerError');
   assert.equal(messageError.status, 'error');
   assert.equal(messageError.error?.name, 'MessageError');
+});
+
+Deno.test('worker runtime helper accepts async worker factories before it starts the timeout window', async () => {
+  const output = await __workerRuntimeTestables.executeCellInSandboxWithFactory(
+    {
+      context: null,
+      currentCode: '1 + 1',
+      history: [],
+      replayCells: [],
+      timeoutMs: 50,
+    },
+    async () => {
+      const fakeWorker: {
+        onerror: ((event: ErrorEvent) => void) | null;
+        onmessage: ((event: MessageEvent<unknown>) => void) | null;
+        onmessageerror: ((event: MessageEvent<unknown>) => void) | null;
+        terminate(): void;
+      } = {
+        onerror: null,
+        onmessage: null,
+        onmessageerror: null,
+        terminate() {},
+      };
+
+      setTimeout(() => {
+        fakeWorker.onmessage?.(
+          new MessageEvent('message', {
+            data: {
+              error: null,
+              finalAnswer: '2',
+              finalResult: null,
+              result: { kind: 'number', preview: '2' },
+              status: 'success',
+              stderr: '',
+              stdout: '',
+            },
+          }),
+        );
+      }, 0);
+
+      return fakeWorker;
+    },
+  );
+
+  assert.equal(output.status, 'success');
+  assert.equal(output.finalAnswer, '2');
 });
 
 Deno.test('worker runtime helper rejects when the worker never replies', async () => {

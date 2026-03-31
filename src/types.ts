@@ -137,6 +137,14 @@ export interface AssistantTurnEntry {
   type: 'assistant_turn';
 }
 
+export interface EvaluatorFeedbackEntry {
+  createdAt: string;
+  feedback: string;
+  model: string;
+  step: number;
+  type: 'evaluator_feedback';
+}
+
 export interface SubqueryEntry {
   answer: JsonValue | null;
   createdAt: string;
@@ -158,6 +166,7 @@ export interface StandaloneErrorEntry {
 export type JournalEntry =
   | AssistantTurnEntry
   | CellEntry
+  | EvaluatorFeedbackEntry
   | SessionEntry
   | StandaloneErrorEntry
   | SubqueryEntry;

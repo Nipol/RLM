@@ -24,13 +24,13 @@ export {
   RLMSubqueryDepthError,
   RLMSubqueryResultError,
 } from './llm_query.ts';
-export {
-  OpenAIResponsesAdapter,
-  OpenAIResponsesError,
-  OpenAIResponsesProvider,
-} from './openai_adapter.ts';
 export { CodexOAuthProvider } from './providers/codex_oauth.ts';
 export { extractFinalSignal, extractReplCodeBlocks } from './repl_protocol.ts';
+export {
+  buildRLMSystemPrompt,
+  buildRLMTurnInput,
+  loadDefaultRLMSystemPromptMarkdown,
+} from './rlm_prompt.ts';
 export {
   createStandaloneLogPath,
   createStandaloneProgressLogger,
@@ -39,14 +39,7 @@ export {
   resolveStandaloneCLIOptions,
   runStandaloneCLI,
 } from './standalone/cli.ts';
-export {
-  createOpenAIRLM,
-  createRLM,
-  RLMMaxStepsError,
-  RLMProtocolError,
-  runOpenAIRLM,
-  runRLM,
-} from './rlm_runner.ts';
+export { createRLM, RLMMaxStepsError, RLMProtocolError, runRLM } from './rlm_runner.ts';
 export {
   estimateOpenAIRunCostUsd,
   estimateOpenAIUsageCostUsd,
@@ -54,10 +47,10 @@ export {
 } from './openai_pricing.ts';
 export type { OpenAIProviderConfig, RLMConfig, RLMRuntimeConfig } from './env.ts';
 export type {
-  OpenAIRLMClientOptions,
   RLMClient,
   RLMClientOptions,
   RLMDefaults,
+  RLMEvaluatorOptions,
   RLMModels,
   RLMRunInput,
 } from './library_entrypoint.ts';
@@ -87,10 +80,6 @@ export type {
   OpenAIUsageCostEstimate,
 } from './openai_pricing.ts';
 export type {
-  OpenAIResponsesAdapterOptions,
-  OpenAIResponsesProviderOptions,
-} from './openai_adapter.ts';
-export type {
   CodexOAuthAuthorizationCodeResult,
   CodexOAuthAuthorizationReceiver,
   CodexOAuthAuthorizationSession,
@@ -101,7 +90,7 @@ export type {
   CodexOAuthTokenBundle,
 } from './providers/codex_oauth.ts';
 export type { FinalSignal, ReplCodeBlock } from './repl_protocol.ts';
-export type { RLMRunOptions, RLMRunResult, RunOpenAIRLMOptions } from './rlm_runner.ts';
+export type { RLMRunOptions, RLMRunResult } from './rlm_runner.ts';
 export type {
   ParsedStandaloneCLIArgs,
   ResolvedStandaloneCLIOptions,

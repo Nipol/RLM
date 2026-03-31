@@ -13,3 +13,4 @@ tmp/
 logs/
 .rlm/
 docs/
+dist/

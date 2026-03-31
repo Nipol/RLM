@@ -1,4 +1,4 @@
-import { extname } from 'node:path';
+import { extnameFilePath } from './platform.ts';
 
 /**
  * Builds a deterministic child journal path for one nested subquery invocation.
@@ -8,7 +8,7 @@ export function createSubqueryJournalPath(
   depth: number,
   queryIndex: number,
 ): string {
-  const extension = extname(parentJournalPath);
+  const extension = extnameFilePath(parentJournalPath);
   const suffix = `.subquery.d${depth}.q${queryIndex}`;
 
   if (extension.length === 0) {

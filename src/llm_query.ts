@@ -64,8 +64,26 @@ export interface NestedRLMRunRequest {
 export interface NestedRLMRunResult {
   answer: string | null;
   steps: number;
+  stdout?: string;
   usage: RLMUsageSummary;
   value: JsonValue | null;
+}
+
+interface InternalRLMQueryResultEnvelope {
+  __rlmQueryResultEnvelope: true;
+  stdout?: string;
+  value: JsonValue;
+}
+
+function createInternalRLMQueryResultEnvelope(
+  value: JsonValue,
+  stdout: string | undefined,
+): InternalRLMQueryResultEnvelope {
+  return {
+    __rlmQueryResultEnvelope: true,
+    stdout,
+    value,
+  };
 }
 
 /**
@@ -778,10 +796,10 @@ export function buildDelegatedChildContext(prompt: RLMQueryInput): DelegatedChil
  */
 export function buildLLMQuerySystemPrompt(): string {
   return [
-    'You are handling a plain language model subcall.',
-    'Return the best direct answer to the user prompt.',
-    'Do not emit repl fences, tool calls, or code unless the user prompt explicitly asks for code.',
-    'Keep the answer concise and focused on the requested result.',
+    '당신은 일반 언어 모델 하위 호출을 처리하고 있습니다.',
+    '사용자 프롬프트에 가장 직접적인 답을 반환하십시오.',
+    '사용자 프롬프트가 명시적으로 코드를 요구하지 않으면 repl fence, 도구 호출, 코드를 출력하지 마십시오.',
+    '답변은 간결하게 유지하고 요청된 결과에만 집중하십시오.',
   ].join('\n');
 }
 
@@ -880,13 +898,16 @@ export function createRLMQueryHandler(options: RLMQueryBridgeOptions): RLMQueryH
         throw new RLMSubqueryResultError(delegatedContext.task);
       }
 
-      return normalizeDelegatedValue(
-        delegatedContext.task,
-        delegatedContext.payload,
-        delegatedContext.selectionHints,
-        delegatedContext.expect,
-        result.value,
-      );
+      return createInternalRLMQueryResultEnvelope(
+        normalizeDelegatedValue(
+          delegatedContext.task,
+          delegatedContext.payload,
+          delegatedContext.selectionHints,
+          delegatedContext.expect,
+          result.value,
+        ),
+        result.stdout,
+      ) as unknown as JsonValue;
     };
 
     const previousRun = pendingRun;
@@ -897,6 +918,7 @@ export function createRLMQueryHandler(options: RLMQueryBridgeOptions): RLMQueryH
 }
 
 export const __llmQueryTestables = {
+  createInternalRLMQueryResultEnvelope,
   buildDelegatedChildContext,
   buildDelegatedChildPayload,
   createAbortError,

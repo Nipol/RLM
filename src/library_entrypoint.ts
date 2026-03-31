@@ -1,4 +1,3 @@
-import type { OpenAIProviderConfig } from './env.ts';
 import type { LLMAdapter, LLMCaller } from './llm_adapter.ts';
 import type { ExecutionBackend, RLMLogger } from './types.ts';
 import type { JsonValue } from './types.ts';
@@ -47,6 +46,27 @@ export interface RLMDefaults {
 }
 
 /**
+ * Configures an optional read-only evaluator that critiques each completed step.
+ *
+ * The evaluator uses the same injected caller as the main RLM run, but with its own model.
+ * Its feedback is attached to the next turn input instead of executing code directly.
+ *
+ * @example
+ * ```ts
+ * const evaluator: RLMEvaluatorOptions = {
+ *   enabled: true,
+ *   model: 'gpt-5-mini',
+ *   maxFeedbackChars: 240,
+ * };
+ * ```
+ */
+export interface RLMEvaluatorOptions {
+  enabled?: boolean;
+  maxFeedbackChars?: number;
+  model: string;
+}
+
+/**
  * Describes the shared dependencies configured once at client construction time.
  *
  * This interface is the main dependency injection point for library consumers.
@@ -67,11 +87,13 @@ export interface RLMClientOptions {
   adapter?: LLMAdapter;
   clock?: () => Date;
   defaults?: RLMDefaults;
+  evaluator?: RLMEvaluatorOptions;
   executionBackend?: ExecutionBackend;
   idGenerator?: () => string;
   llm?: LLMCaller;
   logger?: RLMLogger;
   models: RLMModels;
+  systemPromptMarkdown?: string;
 }
 
 /**
@@ -95,6 +117,7 @@ export interface RLMRunInput {
   maxSubcallDepth?: number;
   outputCharLimit?: number;
   prompt: string;
+  systemPromptMarkdown?: string;
   systemPromptExtension?: string;
 }
 
@@ -122,33 +145,4 @@ export interface RLMClient {
    * ```
    */
   run(input: RLMRunInput): Promise<RLMRunResult>;
-}
-
-/**
- * Describes the provider-specific inputs needed to build an OpenAI-backed RLM client.
- *
- * This is the provider-specific convenience variant of `RLMClientOptions`.
- * It exists so callers do not need to manually assemble an OpenAI-backed caller just to use OpenAI.
- *
- * @example
- * ```ts
- * const options: OpenAIRLMClientOptions = {
- *   openAI: {
- *     apiKey: 'sk-test',
- *     baseUrl: 'https://api.openai.com/v1',
- *     requestTimeoutMs: 30_000,
- *     rootModel: 'gpt-5-nano',
- *     subModel: 'gpt-5-mini',
- *   },
- * };
- * ```
- */
-export interface OpenAIRLMClientOptions {
-  clock?: () => Date;
-  defaults?: RLMDefaults;
-  executionBackend?: ExecutionBackend;
-  fetcher?: typeof fetch;
-  idGenerator?: () => string;
-  logger?: RLMLogger;
-  openAI: OpenAIProviderConfig;
 }
