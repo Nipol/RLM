@@ -64,6 +64,7 @@ Deno.test('deno.json contains the metadata needed for JSR publishing', async () 
     'core.ts',
     'mod.ts',
     'openai.ts',
+    'prompts/rlm_system.ts',
     'src/**/*.ts',
     '.env.example',
   ]);
