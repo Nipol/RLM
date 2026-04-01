@@ -1,16 +1,27 @@
+/**
+ * OpenAI convenience entrypoints that adapt the provider-neutral core into packaged clients.
+ *
+ * @module
+ *
+ * @example
+ * ```ts
+ * import { createOpenAIRLM } from './openai.ts';
+ * ```
+ */
 import type { RLMClient, RLMDefaults, RLMRunInput } from '../library_entrypoint.ts';
-import { loadRLMConfig } from '../env.ts';
-import type { OpenAIProviderConfig, RLMConfig } from '../env.ts';
 import { resolveRLMLogger } from '../logger.ts';
-import { OpenAIResponsesProvider } from '../openai_adapter.ts';
-import { createRLM, runRLM } from '../rlm_runner.ts';
-import type { RLMRunOptions, RLMRunResult } from '../rlm_runner.ts';
+import { createRLM } from '../rlm_runner.ts';
+import type { RLMRunResult } from '../rlm_runner.ts';
 import type { ExecutionBackend, RLMLogger } from '../types.ts';
+import { OpenAIResponsesProvider } from './openai_adapter.ts';
+import type { OpenAIProviderConfig, OpenAIReasoningEffort } from './openai_config.ts';
+import {
+  estimateOpenAIRunCostUsd,
+  estimateOpenAIUsageCostUsd,
+  resolveOpenAITextModelPricing,
+} from './openai_pricing.ts';
 
 const DEFAULT_CELL_TIMEOUT_MS = 5_000;
-const DEFAULT_MAX_STEPS = 12;
-const DEFAULT_MAX_SUBCALL_DEPTH = 3;
-const DEFAULT_OUTPUT_CHAR_LIMIT = 4_000;
 
 /**
  * Describes the provider-specific inputs needed to build an OpenAI-backed RLM client.
@@ -39,6 +50,7 @@ export interface OpenAIRLMClientOptions {
   idGenerator?: () => string;
   logger?: RLMLogger;
   openAI: OpenAIProviderConfig;
+  systemPromptExtension?: string;
 }
 
 /**
@@ -66,13 +78,13 @@ export interface OpenAIRLMClientOptions {
  */
 export interface RunOpenAIRLMOptions extends RLMRunInput {
   clock?: () => Date;
-  config?: RLMConfig;
+  defaults?: RLMDefaults;
   executionBackend?: ExecutionBackend;
   fetcher?: typeof fetch;
   idGenerator?: () => string;
   journalPath?: string;
   logger?: RLMLogger;
-  openAI?: OpenAIProviderConfig;
+  openAI: OpenAIProviderConfig;
 }
 
 function resolveProviderAwareCellTimeoutMs(
@@ -125,6 +137,7 @@ export function createOpenAIRLM(options: OpenAIRLMClientOptions): RLMClient {
       root: options.openAI.rootModel,
       sub: options.openAI.subModel,
     },
+    systemPromptExtension: options.systemPromptExtension,
   });
 
   return {
@@ -143,37 +156,24 @@ export function createOpenAIRLM(options: OpenAIRLMClientOptions): RLMClient {
 }
 
 /**
- * Runs one OpenAI-backed RLM loop while keeping explicit provider args library-safe.
+ * Runs one OpenAI-backed RLM loop while keeping provider config explicit.
  *
- * When `openAI` is supplied, this function behaves as a pure library helper.
- * When `config` is supplied, it uses the already-loaded repository config.
- * When neither is supplied, it falls back to `.env` loading for standalone usage.
+ * Standalone `.env` loading belongs to the standalone layer and should pass
+ * `openAI` and `defaults` into this helper after loading them.
  */
 export async function runOpenAIRLM(options: RunOpenAIRLMOptions): Promise<RLMRunResult> {
-  const loaded = options.config ??
-    (options.openAI === undefined ? loadRLMConfig() : {
-      openAI: options.openAI,
-      runtime: {
-        cellTimeoutMs: DEFAULT_CELL_TIMEOUT_MS,
-        maxSteps: DEFAULT_MAX_STEPS,
-        maxSubcallDepth: DEFAULT_MAX_SUBCALL_DEPTH,
-        outputCharLimit: DEFAULT_OUTPUT_CHAR_LIMIT,
-      },
-    });
+  if ((options as Partial<RunOpenAIRLMOptions>).openAI === undefined) {
+    throw new Error('runOpenAIRLM requires options.openAI.');
+  }
 
   const client = createOpenAIRLM({
     clock: options.clock,
-    defaults: {
-      cellTimeoutMs: loaded.runtime.cellTimeoutMs,
-      maxSteps: options.maxSteps ?? loaded.runtime.maxSteps,
-      maxSubcallDepth: options.maxSubcallDepth ?? loaded.runtime.maxSubcallDepth,
-      outputCharLimit: options.outputCharLimit ?? loaded.runtime.outputCharLimit,
-    },
+    defaults: options.defaults,
     executionBackend: options.executionBackend,
     fetcher: options.fetcher,
     idGenerator: options.idGenerator,
     logger: resolveOpenAIRunLogger(options.logger, options.journalPath),
-    openAI: loaded.openAI,
+    openAI: options.openAI,
   });
 
   return await client.run({
@@ -202,8 +202,19 @@ export {
   OpenAIResponsesAdapter,
   OpenAIResponsesError,
   OpenAIResponsesProvider,
-} from '../openai_adapter.ts';
+} from './openai_adapter.ts';
+export {
+  estimateOpenAIRunCostUsd,
+  estimateOpenAIUsageCostUsd,
+  resolveOpenAITextModelPricing,
+} from './openai_pricing.ts';
+export type { OpenAIProviderConfig, OpenAIReasoningEffort } from './openai_config.ts';
 export type {
   OpenAIResponsesAdapterOptions,
   OpenAIResponsesProviderOptions,
-} from '../openai_adapter.ts';
+} from './openai_adapter.ts';
+export type {
+  OpenAIRunCostEstimate,
+  OpenAITextModelPricing,
+  OpenAIUsageCostEstimate,
+} from './openai_pricing.ts';

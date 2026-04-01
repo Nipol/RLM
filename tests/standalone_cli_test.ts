@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { join } from 'node:path';
 
 import { InMemoryRLMLogger } from '../src/logger.ts';
+import { estimateOpenAIRunCostUsd } from '../src/providers/openai.ts';
 import type { AssistantTurnEntry, CellEntry, SessionEntry } from '../src/types.ts';
 import {
   __standaloneCLITestables,
@@ -639,7 +640,7 @@ Deno.test('renderStandaloneFinalAnswer serializes omitted final values as null a
   assert.match(requests[0]?.input ?? '', /Structured final value:\nnull/u);
 });
 
-Deno.test('standalone helpers can build usage lines for runs with missing pricing and use the default render resolver', async () => {
+Deno.test('standalone helpers can leave cost fields blank without provider pricing and report missing model pricing when an estimator exists', async () => {
   assert.deepEqual(
     __standaloneCLITestables.buildStandaloneUsageLines({
       byModel: [
@@ -662,7 +663,33 @@ Deno.test('standalone helpers can build usage lines for runs with missing pricin
     }),
     [
       '[usage] input_tokens=12 output_tokens=3 total_tokens=15',
-      '[cost] input_usd=n/a output_usd=n/a total_usd=n/a missing_pricing_models=unknown-model',
+      '[cost] input_usd= output_usd= total_usd=',
+    ],
+  );
+
+  assert.deepEqual(
+    __standaloneCLITestables.buildStandaloneUsageLines({
+      byModel: [
+        {
+          cachedInputTokens: 0,
+          inputTokens: 12,
+          model: 'unknown-model',
+          outputTokens: 3,
+          reportedRequests: 1,
+          requests: 1,
+          totalTokens: 15,
+        },
+      ],
+      cachedInputTokens: 0,
+      inputTokens: 12,
+      outputTokens: 3,
+      reportedRequests: 1,
+      requests: 1,
+      totalTokens: 15,
+    }, estimateOpenAIRunCostUsd),
+    [
+      '[usage] input_tokens=12 output_tokens=3 total_tokens=15',
+      '[cost] input_usd= output_usd= total_usd= missing_pricing_models=unknown-model',
     ],
   );
 
@@ -791,7 +818,7 @@ Deno.test('runStandaloneCLI loads the input and system prompt files, writes prog
             ? (options.logger as { path?: string }).path
             : undefined,
           prompt: options.prompt,
-          requestTimeoutMs: options.config?.openAI.requestTimeoutMs,
+          requestTimeoutMs: options.openAI.requestTimeoutMs,
         });
 
         await options.logger?.append({
@@ -904,6 +931,14 @@ Deno.test('runStandaloneCLI closes the returned session so standalone runs can e
   const systemPromptPath = join(root, 'ebook-system.txt');
   await Deno.writeTextFile(inputPath, 'Chapter 1\nThe answer is 42.\n');
   await Deno.writeTextFile(systemPromptPath, 'Always answer in concise Korean.');
+  await Deno.writeTextFile(
+    join(root, '.env'),
+    [
+      'OPENAI_API_KEY=sk-test',
+      'RLM_OPENAI_ROOT_MODEL=gpt-5.4-mini',
+      'RLM_OPENAI_SUB_MODEL=gpt-5.4-nano',
+    ].join('\n'),
+  );
 
   let closed = false;
 
@@ -1666,7 +1701,7 @@ Deno.test('runStandaloneCLI can execute a Codex OAuth-backed run through the gen
   ]);
   assert.ok(lines.some((line) => line.includes('[standalone] provider: codex-oauth')));
   assert.ok(lines.includes('[usage] input_tokens=60 output_tokens=20 total_tokens=80'));
-  assert.ok(lines.includes('[cost] input_usd=$0.000045 output_usd=$0.000090 total_usd=$0.000135'));
+  assert.ok(lines.includes('[cost] input_usd= output_usd= total_usd='));
 });
 
 Deno.test('runStandaloneCLI can use the default Codex provider and default final renderer in run mode', async () => {
@@ -2108,7 +2143,7 @@ Deno.test('runStandaloneCLI keeps the provider request timeout from config when 
         ),
       run: async (options) => {
         calls.push({
-          requestTimeoutMs: options.config?.openAI.requestTimeoutMs,
+          requestTimeoutMs: options.openAI.requestTimeoutMs,
         });
         return {
           answer: '42',

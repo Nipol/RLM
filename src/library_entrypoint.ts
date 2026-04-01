@@ -1,3 +1,13 @@
+/**
+ * Public client-facing interfaces shared by the packaged RLM entrypoints.
+ *
+ * @module
+ *
+ * @example
+ * ```ts
+ * import type { RLMClientOptions } from './library_entrypoint.ts';
+ * ```
+ */
 import type { LLMAdapter, LLMCaller } from './llm_adapter.ts';
 import type { ExecutionBackend, RLMLogger } from './types.ts';
 import type { JsonValue } from './types.ts';
@@ -93,6 +103,7 @@ export interface RLMClientOptions {
   llm?: LLMCaller;
   logger?: RLMLogger;
   models: RLMModels;
+  systemPromptExtension?: string;
   systemPromptMarkdown?: string;
 }
 

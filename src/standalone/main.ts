@@ -1,3 +1,13 @@
+/**
+ * Standalone CLI executable entrypoint.
+ *
+ * @module
+ *
+ * @example
+ * ```ts
+ * import './main.ts';
+ * ```
+ */
 import { runStandaloneCLI } from './cli.ts';
 
 try {

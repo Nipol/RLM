@@ -14,3 +14,8 @@ logs/
 .rlm/
 docs/
 dist/
+output/
+DESIGN.md
+APP.md
+smoke/node_modules/
+smoke/package-lock.json

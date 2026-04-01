@@ -1,18 +1,49 @@
+/**
+ * Cross-runtime platform helpers for paths, files, dynamic imports, and base64url encoding.
+ *
+ * @module
+ *
+ * @example
+ * ```ts
+ * import { normalizeFilePath } from './platform.ts';
+ * ```
+ */
+/**
+ * Describes the directory-creation options used by portable filesystem helpers.
+ */
 export interface DirectoryCreateOptions {
   recursive?: boolean;
 }
 
+/**
+ * Describes write options for portable text-file helpers.
+ */
 export interface WriteTextFileOptions {
   append?: boolean;
 }
 
+/**
+ * Describes an async text-file reader used by portable helpers.
+ */
 export type ReadTextFile = (path: string) => Promise<string>;
+
+/**
+ * Describes a sync text-file reader used by dotenv loading helpers.
+ */
 export type ReadTextFileSync = (path: string) => string;
+
+/**
+ * Describes an async text-file writer used by portable helpers.
+ */
 export type WriteTextFile = (
   path: string,
   data: string,
   options?: WriteTextFileOptions,
 ) => Promise<void>;
+
+/**
+ * Describes an async directory-creation helper used by portable helpers.
+ */
 export type MakeDirectory = (
   path: string,
   options?: DirectoryCreateOptions,
@@ -57,10 +88,16 @@ function splitDrivePrefix(path: string): { path: string; prefix: string } {
   };
 }
 
+/**
+ * Returns whether a path is already absolute on POSIX, Windows drive, or UNC forms.
+ */
 export function isAbsolutePath(path: string): boolean {
   return /^(?:[A-Za-z]:[\\/]|\\\\|\/)/u.test(path);
 }
 
+/**
+ * Normalizes a potentially relative or platform-specific file path.
+ */
 export function normalizeFilePath(path: string): string {
   if (path.length === 0) {
     return '.';
@@ -106,6 +143,9 @@ export function normalizeFilePath(path: string): string {
   return joined.length > 0 ? joined : '.';
 }
 
+/**
+ * Joins path parts using the leading path style and normalizes the result.
+ */
 export function joinFilePath(...parts: string[]): string {
   const filtered = parts.filter((part) => part.length > 0);
   if (filtered.length === 0) {
@@ -116,6 +156,9 @@ export function joinFilePath(...parts: string[]): string {
   return normalizeFilePath(filtered.join(separator));
 }
 
+/**
+ * Returns the parent directory portion of a normalized file path.
+ */
 export function dirnameFilePath(path: string): string {
   const normalized = normalizeFilePath(path);
   const separator = resolvePathSeparator(normalized);
@@ -142,6 +185,9 @@ export function dirnameFilePath(path: string): string {
   return trimmed.slice(0, index);
 }
 
+/**
+ * Returns the file extension portion of a normalized file path.
+ */
 export function extnameFilePath(path: string): string {
   const normalized = normalizeFilePath(path);
   const separator = resolvePathSeparator(normalized);
@@ -156,10 +202,16 @@ export function extnameFilePath(path: string): string {
   return basename.slice(lastDot);
 }
 
+/**
+ * Resolves a possibly relative file path against a working directory.
+ */
 export function resolveFilePath(cwd: string, path: string): string {
   return isAbsolutePath(path) ? normalizeFilePath(path) : joinFilePath(cwd, path);
 }
 
+/**
+ * Resolves the current working directory across Deno, Node, and fallback runtimes.
+ */
 export function resolveCurrentWorkingDirectory(
   scope: typeof globalThis = globalThis,
 ): string {
@@ -184,6 +236,9 @@ export function resolveCurrentWorkingDirectory(
   return '.';
 }
 
+/**
+ * Detects common not-found filesystem errors across Deno and Node runtimes.
+ */
 export function isNotFoundError(error: unknown): boolean {
   if (!(error instanceof Error)) {
     return false;
@@ -218,6 +273,9 @@ function decodeBase64(base64: string): Uint8Array {
   throw new Error('No base64 decoder is available in this runtime.');
 }
 
+/**
+ * Encodes raw bytes using URL-safe base64 without padding.
+ */
 export function encodeBase64Url(input: Uint8Array): string {
   return encodeBase64(input)
     .replace(/\+/gu, '-')
@@ -225,6 +283,9 @@ export function encodeBase64Url(input: Uint8Array): string {
     .replace(/=+$/gu, '');
 }
 
+/**
+ * Decodes a URL-safe base64 string into text.
+ */
 export function decodeBase64Url(input: string): string {
   const padded = input
     .replace(/-/gu, '+')
@@ -233,14 +294,23 @@ export function decodeBase64Url(input: string): string {
   return new TextDecoder().decode(decodeBase64(padded));
 }
 
+/**
+ * Performs a runtime dynamic import without triggering static bundler resolution.
+ */
 export function importModule<Module = unknown>(specifier: string): Promise<Module> {
   return dynamicImport<Module>(specifier);
 }
 
+/**
+ * Dynamically imports a Node builtin module by name.
+ */
 export function importNodeBuiltin<Module = unknown>(name: string): Promise<Module> {
   return dynamicImport<Module>(`node:${name}`);
 }
 
+/**
+ * Exposes internal platform helpers for focused tests.
+ */
 export const __platformTestables = {
   dirnameFilePath,
   importModule,

@@ -1,3 +1,13 @@
+/**
+ * Journal-path helpers for naming nested subquery logs deterministically.
+ *
+ * @module
+ *
+ * @example
+ * ```ts
+ * import { createSubqueryJournalPath } from './subquery_path.ts';
+ * ```
+ */
 import { extnameFilePath } from './platform.ts';
 
 /**

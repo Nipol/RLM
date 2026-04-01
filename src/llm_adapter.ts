@@ -1,4 +1,14 @@
 /**
+ * Provider-neutral caller contracts consumed by the RLM runtime.
+ *
+ * @module
+ *
+ * @example
+ * ```ts
+ * import type { LLMCaller } from './llm_adapter.ts';
+ * ```
+ */
+/**
  * Describes the provider-neutral usage payload consumed by the orchestration layer.
  */
 export interface LLMUsage {

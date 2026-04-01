@@ -154,6 +154,67 @@ Deno.test('createRLM lets callers override the base system prompt markdown per r
   assert.match(llm.requests[0]?.systemPrompt ?? '', /실행별 프롬프트입니다\./u);
 });
 
+Deno.test('createRLM appends a client-level system prompt extension when runs do not override it', async () => {
+  const llm = new MockCaller([
+    {
+      outputText: '```repl\nFINAL_VAR("ok");\n```',
+      turnState: { opaque: 'root-1' },
+    },
+  ]);
+
+  const client = createRLM({
+    llm,
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    models: {
+      root: 'gpt-5-nano',
+      sub: 'gpt-5-mini',
+    },
+    systemPromptExtension: 'Always prefer `context.document` when it is present.',
+  });
+
+  const result = await client.run({
+    context: { document: 'Prompt extension test.' },
+    prompt: 'Return ok.',
+  });
+
+  assert.equal(result.answer, 'ok');
+  assert.match(
+    llm.requests[0]?.systemPrompt ?? '',
+    /Always prefer `context\.document` when it is present\./u,
+  );
+});
+
+Deno.test('createRLM lets runs override the client-level system prompt extension', async () => {
+  const llm = new MockCaller([
+    {
+      outputText: '```repl\nFINAL_VAR("ok");\n```',
+      turnState: { opaque: 'root-1' },
+    },
+  ]);
+
+  const client = createRLM({
+    llm,
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    models: {
+      root: 'gpt-5-nano',
+      sub: 'gpt-5-mini',
+    },
+    systemPromptExtension: 'Use the client default extension.',
+  });
+
+  const result = await client.run({
+    context: null,
+    prompt: 'Return ok.',
+    systemPromptExtension: 'Use the per-run extension instead.',
+  });
+
+  assert.equal(result.answer, 'ok');
+  assert.match(llm.requests[0]?.systemPrompt ?? '', /Use the per-run extension instead\./u);
+  assert.doesNotMatch(llm.requests[0]?.systemPrompt ?? '', /Use the client default extension\./u);
+});
+
 Deno.test('createRLM can request optional evaluator feedback through the same injected caller', async () => {
   const llm = new MockCaller([
     {
@@ -204,8 +265,9 @@ Deno.test('createRLM can request optional evaluator feedback through the same in
   assert.equal(llm.requests[1]?.model, 'gpt-5-evaluator');
   assert.equal(llm.requests[1]?.metadata?.step, 1);
   assert.equal(llm.requests[2]?.kind, 'root_turn');
-  assert.match(llm.requests[2]?.input ?? '', /Evaluator feedback:/u);
-  assert.match(llm.requests[2]?.input ?? '', /You surfaced a sample row/u);
+  assert.match(llm.requests[2]?.input ?? '', /단계 예산: 2 \/ 3/u);
+  assert.doesNotMatch(llm.requests[2]?.input ?? '', /Evaluator feedback:/u);
+  assert.doesNotMatch(llm.requests[2]?.input ?? '', /You surfaced a sample row/u);
   const evaluatorEntry = logger.entries.find(
     (entry): entry is {
       createdAt: string;
@@ -391,6 +453,53 @@ Deno.test('createOpenAIRLM builds the OpenAI adapter from explicit arguments ins
   const payload = JSON.parse(String(capturedInit?.body)) as Record<string, unknown>;
   assert.equal(payload.model, 'gpt-5-nano');
   assert.equal(result.answer, 'ok');
+});
+
+Deno.test('createOpenAIRLM forwards a client-level system prompt extension into the provider instructions', async () => {
+  let capturedInit: RequestInit | undefined;
+  const client = createOpenAIRLM({
+    clock: createClock(),
+    defaults: {
+      maxSteps: 1,
+      maxSubcallDepth: 1,
+      outputCharLimit: 120,
+    },
+    fetcher: async (_input, init) => {
+      capturedInit = init;
+
+      return new Response(
+        JSON.stringify({
+          id: 'resp_openai_extension_1',
+          output_text: '```repl\nFINAL_VAR("ok")\n```',
+        }),
+        {
+          headers: { 'Content-Type': 'application/json' },
+          status: 200,
+        },
+      );
+    },
+    idGenerator: createIdGenerator(),
+    openAI: {
+      apiKey: 'sk-test',
+      baseUrl: 'https://api.openai.com/v1',
+      requestTimeoutMs: 30_000,
+      rootModel: 'gpt-5-nano',
+      subModel: 'gpt-5-mini',
+    },
+    systemPromptExtension: 'Honor browser-specific conversation memory hints.',
+  });
+
+  const result = await client.run({
+    context: { conversation: [] },
+    prompt: 'Finish immediately.',
+  });
+
+  const payload = JSON.parse(String(capturedInit?.body)) as Record<string, unknown>;
+  assert.equal(result.answer, 'ok');
+  assert.match(
+    String(payload.instructions ?? ''),
+    /Honor browser-specific conversation memory hints\./u,
+  );
 });
 
 Deno.test('createOpenAIRLM treats cellTimeoutMs overrides as additional time beyond the provider timeout', async () => {

@@ -4,7 +4,7 @@ import {
   estimateOpenAIRunCostUsd,
   estimateOpenAIUsageCostUsd,
   resolveOpenAITextModelPricing,
-} from '../src/openai_pricing.ts';
+} from '../src/providers/openai_pricing.ts';
 
 Deno.test('OpenAI pricing exposes the current GPT-5 nano context and token rates', () => {
   const pricing = resolveOpenAITextModelPricing('gpt-5-nano');

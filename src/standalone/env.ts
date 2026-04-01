@@ -1,4 +1,15 @@
-import { isNotFoundError, type ReadTextFileSync } from './platform.ts';
+/**
+ * Standalone environment loading helpers for provider credentials and runtime limits.
+ *
+ * @module
+ *
+ * @example
+ * ```ts
+ * import { loadRLMConfig } from './env.ts';
+ * ```
+ */
+import type { OpenAIProviderConfig, OpenAIReasoningEffort } from '../providers/openai_config.ts';
+import { isNotFoundError, type ReadTextFileSync } from '../platform.ts';
 
 /**
  * Describes the local `.env` file reader used by the configuration loader.
@@ -14,28 +25,6 @@ import { isNotFoundError, type ReadTextFileSync } from './platform.ts';
 export interface DotEnvFileOptions {
   path?: string;
   readTextFileSync?: ReadTextFileSync;
-}
-
-/**
- * Describes the typed OpenAI provider configuration consumed by the runner layer.
- *
- * @example
- * ```ts
- * const openAI: OpenAIProviderConfig = {
- *   apiKey: 'sk-test',
- *   baseUrl: 'https://api.openai.com/v1',
- *   requestTimeoutMs: 30_000,
- *   rootModel: 'gpt-5-nano',
- *   subModel: 'gpt-5-mini',
- * };
- * ```
- */
-export interface OpenAIProviderConfig {
-  apiKey: string;
-  baseUrl: string;
-  requestTimeoutMs: number;
-  rootModel: string;
-  subModel: string;
 }
 
 /**
@@ -194,6 +183,33 @@ function readPositiveIntegerEnv(
   }
 
   return parsed;
+}
+
+function isOpenAIReasoningEffort(value: string): value is OpenAIReasoningEffort {
+  return value === 'none' ||
+    value === 'minimal' ||
+    value === 'low' ||
+    value === 'medium' ||
+    value === 'high' ||
+    value === 'xhigh';
+}
+
+function readOptionalOpenAIReasoningEffortEnv(
+  values: Record<string, string | undefined>,
+  key: string,
+): OpenAIReasoningEffort | undefined {
+  const raw = values[key]?.trim();
+  if (raw === undefined || raw.length === 0) {
+    return undefined;
+  }
+
+  if (!isOpenAIReasoningEffort(raw)) {
+    throw new Error(
+      `Environment variable ${key} must be one of none, minimal, low, medium, high, xhigh.`,
+    );
+  }
+
+  return raw;
 }
 
 function readRuntimeConfig(
@@ -400,7 +416,15 @@ export function loadRLMConfig(options: LoadRLMConfigOptions = {}): RLMConfig {
       DEFAULT_REQUEST_TIMEOUT_MS,
     ),
     rootModel: readRequiredEnv(values, 'RLM_OPENAI_ROOT_MODEL'),
+    rootReasoningEffort: readOptionalOpenAIReasoningEffortEnv(
+      values,
+      'RLM_OPENAI_ROOT_REASONING_EFFORT',
+    ),
     subModel: readRequiredEnv(values, 'RLM_OPENAI_SUB_MODEL'),
+    subReasoningEffort: readOptionalOpenAIReasoningEffortEnv(
+      values,
+      'RLM_OPENAI_SUB_REASONING_EFFORT',
+    ),
   };
 
   const runtime = readRuntimeConfig(values);

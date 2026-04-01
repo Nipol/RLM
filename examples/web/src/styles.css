@@ -1,0 +1,313 @@
+@import url("https://fonts.googleapis.com/css2?family=Anonymous+Pro:wght@400;700&display=swap");
+@import "tailwindcss";
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --radius-sm: calc(var(--radius) - 8px);
+  --radius-md: calc(var(--radius) - 6px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 8px);
+  --font-sans: "Pretendard Variable", "Anonymous Pro", "Apple SD Gothic Neo", sans-serif;
+  --font-serif: "Anonymous Pro", ui-monospace, monospace;
+  --font-mono: "Anonymous Pro", ui-monospace, monospace;
+}
+
+:root {
+  --canvas-gray: #e5e5e5;
+  --snow-powder: #fefafa;
+  --dark-chocolate: #302f2d;
+  --ledger-gray: #4b4642;
+  --muted-ledger: #8a8480;
+  --faded-metadata: #b3b2b2;
+  --quiet-border: #cac7c6;
+  --soft-border: #e3ddda;
+  --chocolate-pink: #ffb6c1;
+  --milk-chocolate: #dbd7ba;
+  --straw-chocolate: #d2ad9b;
+  --sugar-red: #da3434;
+  --dont-touch-green: #39f95c;
+  --orange-yellow: #daac37;
+  --background: var(--canvas-gray);
+  --foreground: var(--dark-chocolate);
+  --card: var(--snow-powder);
+  --card-foreground: var(--dark-chocolate);
+  --primary: var(--chocolate-pink);
+  --primary-foreground: var(--dark-chocolate);
+  --primary-soft: rgb(255 182 193 / 0.16);
+  --secondary: var(--milk-chocolate);
+  --secondary-foreground: var(--dark-chocolate);
+  --muted: var(--snow-powder);
+  --muted-foreground: var(--muted-ledger);
+  --active-accent: var(--milk-chocolate);
+  --active-accent-foreground: var(--dark-chocolate);
+  --active-accent-soft: rgb(219 215 186 / 0.22);
+  --accent: var(--active-accent);
+  --accent-foreground: var(--active-accent-foreground);
+  --border: var(--quiet-border);
+  --input: var(--snow-powder);
+  --ring: rgb(48 47 45 / 0.18);
+  --destructive: var(--sugar-red);
+  --destructive-foreground: var(--snow-powder);
+  --success: var(--dont-touch-green);
+  --warning: var(--orange-yellow);
+  --metadata: var(--faded-metadata);
+  --ledger: var(--ledger-gray);
+  --neutral-hover: #f1ece8;
+  --outline-hover: #f7f3f1;
+  --active-accent-hover: #cec9ae;
+  --danger-hover: #b83e34;
+  --success-hover: #9ed83f;
+  --warning-hover: #dfae32;
+  --field-hover-border: #b8b1ae;
+  --soft-surface: #f7f3f1;
+  --panel-muted: #f1ece8;
+  --brand-surface: var(--active-accent-soft);
+  --user-surface: #f1ece8;
+  --error-surface: rgb(218 52 52 / 0.07);
+  --success-surface: rgb(57 249 92 / 0.12);
+  --radius: 24px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --dark-chocolate-surface: #302f2d;
+    --warm-charcoal: #383633;
+    --soft-charcoal: #45423f;
+    --white-chocolate: #e6e0d4;
+    --dust-brown: #9a918a;
+    --dark-border: #6e6762;
+    --soft-dark-border: #56514d;
+    --lighted-red: #ce5252;
+    --autumn-green: #9dc940;
+    --maidenhair-yellow: #daac37;
+    --background: var(--dark-chocolate-surface);
+    --foreground: var(--snow-powder);
+    --card: var(--warm-charcoal);
+    --card-foreground: var(--white-chocolate);
+    --primary: var(--straw-chocolate);
+    --primary-foreground: var(--dark-chocolate-surface);
+    --primary-soft: rgb(210 173 155 / 0.16);
+    --secondary: var(--white-chocolate);
+    --secondary-foreground: var(--dark-chocolate-surface);
+    --muted: var(--warm-charcoal);
+    --muted-foreground: var(--dust-brown);
+    --active-accent: var(--straw-chocolate);
+    --active-accent-foreground: var(--dark-chocolate-surface);
+    --active-accent-soft: rgb(210 173 155 / 0.12);
+    --accent: var(--active-accent);
+    --accent-foreground: var(--active-accent-foreground);
+    --border: var(--dark-border);
+    --input: var(--warm-charcoal);
+    --ring: rgb(204 175 157 / 0.34);
+    --destructive: var(--lighted-red);
+    --destructive-foreground: var(--snow-powder);
+    --success: var(--autumn-green);
+    --warning: var(--maidenhair-yellow);
+    --soft-border: var(--soft-dark-border);
+    --metadata: var(--dust-brown);
+    --ledger: var(--white-chocolate);
+    --neutral-hover: #383633;
+    --outline-hover: #45423f;
+    --active-accent-hover: #d8bca9;
+    --danger-hover: #a94a45;
+    --success-hover: #93b44a;
+    --warning-hover: #bf9a37;
+    --field-hover-border: #8c837c;
+    --soft-surface: #45423f;
+    --panel-muted: #45423f;
+    --brand-surface: var(--active-accent-soft);
+    --user-surface: #45423f;
+    --error-surface: rgb(206 82 82 / 0.12);
+    --success-surface: rgb(157 201 64 / 0.14);
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    @apply scroll-smooth;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    min-height: 100vh;
+    letter-spacing: 0;
+  }
+
+  #root {
+    min-height: 100vh;
+  }
+}
+
+@layer components {
+  .editorial-kicker {
+    color: var(--muted-foreground);
+    font-family: var(--font-serif);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    line-height: 1.35;
+    text-transform: uppercase;
+  }
+
+  .display-title {
+    font-family: var(--font-serif);
+    font-size: clamp(2.9rem, 5.6vw, 4.25rem);
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    line-height: 1.05;
+    text-wrap: balance;
+  }
+
+  .page-title {
+    font-family: var(--font-serif);
+    font-size: clamp(1.4rem, 2vw, 1.625rem);
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    line-height: 1.24;
+    text-wrap: balance;
+  }
+
+  .project-mark {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 56px;
+    height: 56px;
+    border: 1.5px solid var(--primary);
+    border-radius: 18px;
+    background: var(--primary-soft);
+  }
+
+  .project-mark::before {
+    content: "";
+    position: absolute;
+    inset: 8px;
+    border: 1px solid var(--primary);
+    border-radius: 12px;
+  }
+
+  .project-mark span {
+    position: relative;
+    z-index: 1;
+    color: var(--foreground);
+    font-family: var(--font-serif);
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: -0.08em;
+    line-height: 1;
+  }
+
+  .paper-rule {
+    height: 3px;
+    width: 100%;
+    background: var(--foreground);
+    opacity: 0.12;
+  }
+
+  .provider-choice {
+    border-color: var(--border);
+    background: var(--card);
+    transition:
+      transform 160ms ease,
+      border-color 160ms ease,
+      background-color 160ms ease;
+  }
+
+  .provider-choice:hover {
+    transform: translateY(-1px);
+  }
+
+  .provider-choice[data-active="true"] {
+    border-color: var(--active-accent);
+    background: var(--brand-surface);
+  }
+
+  .provider-choice[data-active="true"] .provider-choice-icon {
+    border-color: var(--active-accent);
+    background: var(--active-accent);
+    color: var(--active-accent-foreground);
+  }
+
+  .provider-choice-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: transparent;
+    color: var(--foreground);
+    padding: 12px;
+  }
+
+  .task-status-panel {
+    border-color: var(--active-accent);
+    background: var(--brand-surface);
+  }
+
+  .connection-summary-panel {
+    border-color: var(--active-accent);
+    background: var(--brand-surface);
+  }
+
+  .message-user {
+    background: var(--user-surface);
+    border-color: var(--quiet-border);
+  }
+
+  .message-assistant {
+    background: var(--card);
+    border-color: var(--soft-border);
+  }
+
+  .message-error {
+    background: var(--error-surface);
+    border-color: var(--destructive);
+  }
+
+  .status-success {
+    background: var(--success-surface);
+    border-color: var(--success);
+  }
+
+  .status-error {
+    background: var(--error-surface);
+    border-color: var(--destructive);
+  }
+}
+
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.rise-in {
+  animation: rise-in 280ms ease both;
+}

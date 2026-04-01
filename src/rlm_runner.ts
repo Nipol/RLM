@@ -1,3 +1,13 @@
+/**
+ * Main RLM orchestration loop that combines prompts, REPL execution, and provider calls.
+ *
+ * @module
+ *
+ * @example
+ * ```ts
+ * import { runRLM } from './rlm_runner.ts';
+ * ```
+ */
 import type {
   RLMClient,
   RLMClientOptions,
@@ -430,7 +440,9 @@ function buildCombinedEvidenceText(input: {
     }>;
   }>;
 }): string {
-  return `${buildExecutionOutputEvidenceText(input.execution)}\n${buildTranscriptEvidenceText(input.transcript)}`;
+  return `${buildExecutionOutputEvidenceText(input.execution)}\n${
+    buildTranscriptEvidenceText(input.transcript)
+  }`;
 }
 
 function readCompetingTargetCandidates(input: {
@@ -687,7 +699,7 @@ function usesFirstCandidateFinalWithoutUniquenessGuard(code: string): boolean {
   const hasFirstCandidateSelection =
     /FINAL(?:_VAR)?\([\s\S]{0,240}(?:\[\s*0\s*\]|\.at\(\s*0\s*\))[\s\S]{0,240}\)/u.test(code) ||
     /(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*[\s\S]{0,240}\.find\([\s\S]{0,240}\)\s*(?:\|\||\?\?)\s*[A-Za-z_$][\w$]*\s*\[\s*0\s*\]/u
-      .test(code) && /FINAL(?:_VAR)?\(\s*[A-Za-z_$][\w$]*\s*\)/u.test(code);
+        .test(code) && /FINAL(?:_VAR)?\(\s*[A-Za-z_$][\w$]*\s*\)/u.test(code);
   if (!hasFirstCandidateSelection) {
     return false;
   }
@@ -699,13 +711,13 @@ function usesFirstCandidateFinalWithoutUniquenessGuard(code: string): boolean {
 }
 
 function usesMergedWorkingSetProjectionWithoutUniquenessGuard(code: string): boolean {
-  const hasMergedWorkingSet = /\.join\(\s*["'`]/u.test(code) || /join\(\s*["'`][\s\S]{0,8}["'`]\s*\)/u.test(code);
+  const hasMergedWorkingSet = /\.join\(\s*["'`]/u.test(code) ||
+    /join\(\s*["'`][\s\S]{0,8}["'`]\s*\)/u.test(code);
   if (!hasMergedWorkingSet || !/FINAL(?:_VAR)?\(/u.test(code)) {
     return false;
   }
 
-  const hasProjection =
-    /\.match\(/u.test(code);
+  const hasProjection = /\.match\(/u.test(code);
   if (!hasProjection) {
     return false;
   }
@@ -908,8 +920,12 @@ function buildEvaluatorInput(input: {
       `실행 ${index + 1}:`,
       `상태: ${execution.status}`,
       `코드:\n${execution.code}`,
-      `표준 출력:\n${execution.stdout.trim().length === 0 ? '(비어 있음)' : execution.stdout.trim()}`,
-      `표준 에러:\n${execution.stderr.trim().length === 0 ? '(비어 있음)' : execution.stderr.trim()}`,
+      `표준 출력:\n${
+        execution.stdout.trim().length === 0 ? '(비어 있음)' : execution.stdout.trim()
+      }`,
+      `표준 에러:\n${
+        execution.stderr.trim().length === 0 ? '(비어 있음)' : execution.stderr.trim()
+      }`,
       `관찰된 값:\n${buildEvaluatorObservedValuesText(execution)}`,
       `결과: ${execution.resultPreview}`,
       `최종값: ${execution.finalAnswer ?? '(없음)'}`,
@@ -1058,8 +1074,8 @@ export function createRLM(options: RLMClientOptions): RLMClient {
         prompt: input.prompt,
         rootModel: options.models.root,
         subModel: options.models.sub,
+        systemPromptExtension: input.systemPromptExtension ?? options.systemPromptExtension,
         systemPromptMarkdown: input.systemPromptMarkdown ?? options.systemPromptMarkdown,
-        systemPromptExtension: input.systemPromptExtension,
       }),
   };
 }
@@ -1332,7 +1348,6 @@ async function runRLMInternal(options: InternalRLMRunOptions): Promise<RLMRunRes
           usage: cloneUsageSummary(usageSummary),
         };
       }
-
     }
 
     if (!appendedTranscriptTurn) {
@@ -1372,6 +1387,9 @@ async function runRLMInternal(options: InternalRLMRunOptions): Promise<RLMRunRes
   throw new RLMMaxStepsError(options.maxSteps);
 }
 
+/**
+ * Exposes runner internals for targeted unit tests.
+ */
 export const __rlmRunnerTestables = {
   buildEvaluatorInput,
   collectRequestedEntityLabels,

@@ -1,3 +1,13 @@
+/**
+ * Journal logger implementations used by in-memory, null, and JSONL-backed RLM runs.
+ *
+ * @module
+ *
+ * @example
+ * ```ts
+ * import { InMemoryRLMLogger } from './logger.ts';
+ * ```
+ */
 import { appendJournalEntry, loadJournal } from './jsonl_journal.ts';
 import { createSubqueryJournalPath } from './subquery_path.ts';
 import type { CellEntry, JournalEntry, LoadedJournal, RLMLogger, SessionEntry } from './types.ts';

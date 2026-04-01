@@ -16,12 +16,16 @@ Deno.test('root mod entrypoint re-exports the library surface used by JSR consum
   assert.equal('createOpenAIRLM' in root, false);
   assert.equal('runOpenAIRLM' in root, false);
   assert.equal('OpenAIResponsesProvider' in root, false);
+  assert.equal('CodexOAuthProvider' in root, false);
+  assert.equal('loadRLMConfig' in root, false);
+  assert.equal('estimateOpenAIRunCostUsd' in root, false);
 });
 
 Deno.test('provider subpath entrypoints expose provider-specific helpers without going through the root mod', () => {
   assert.equal(typeof openAIProvider.createOpenAIRLM, 'function');
   assert.equal(typeof openAIProvider.runOpenAIRLM, 'function');
   assert.equal(typeof openAIProvider.OpenAIResponsesProvider, 'function');
+  assert.equal(typeof openAIProvider.estimateOpenAIRunCostUsd, 'function');
   assert.equal(typeof ollamaProvider.createOllamaRLM, 'function');
   assert.equal(typeof ollamaProvider.runOllamaRLM, 'function');
   assert.equal(typeof ollamaProvider.OllamaGenerateProvider, 'function');

@@ -1,3 +1,13 @@
+/**
+ * Prompt-construction helpers for system instructions and iterative RLM turn inputs.
+ *
+ * @module
+ *
+ * @example
+ * ```ts
+ * import { buildRLMSystemPrompt } from './rlm_prompt.ts';
+ * ```
+ */
 import type { JsonValue, ValueSignal } from './types.ts';
 import { DEFAULT_RLM_SYSTEM_PROMPT_MARKDOWN } from '../prompts/rlm_system.ts';
 
@@ -124,9 +134,7 @@ function formatPromptSections(
 ): string {
   return sections
     .map(({ lines, title }) =>
-      title === undefined || title.length === 0
-        ? lines.join('\n')
-        : `${title}\n${lines.join('\n')}`
+      title === undefined || title.length === 0 ? lines.join('\n') : `${title}\n${lines.join('\n')}`
     )
     .join('\n\n');
 }
@@ -190,7 +198,11 @@ function buildExecutionFeedbackText(
     formatPromptTextBlock(clipText(execution.resultPreview || '(비어 있음)', outputCharLimit)),
     '노출된 값:',
     signals,
-    `채택된 최종 답: ${execution.finalAnswer === null ? '(없음)' : clipInlineText(execution.finalAnswer, outputCharLimit)}`,
+    `채택된 최종 답: ${
+      execution.finalAnswer === null
+        ? '(없음)'
+        : clipInlineText(execution.finalAnswer, outputCharLimit)
+    }`,
   ].join('\n\n');
 }
 
@@ -203,9 +215,9 @@ function buildLatestExecutionFeedback(
     return null;
   }
 
-  const latestExecution = [...latestTurn.executions].reverse().find((execution) =>
-    execution.status === 'success'
-  ) ?? latestTurn.executions.at(-1);
+  const latestExecution =
+    [...latestTurn.executions].reverse().find((execution) => execution.status === 'success') ??
+      latestTurn.executions.at(-1);
 
   if (latestExecution === undefined) {
     return null;
@@ -328,9 +340,9 @@ function summarizeTopLevelValue(label: string, value: JsonValue): string {
     }
   }
 
-  return `${label}: 객체 (${keys.length}개 키: ${
-    keys.slice(0, 8).join(', ')
-  }; 예시 값 키: ${sampleValueKeys.join(', ') || '(없음)'})`;
+  return `${label}: 객체 (${keys.length}개 키: ${keys.slice(0, 8).join(', ')}; 예시 값 키: ${
+    sampleValueKeys.join(', ') || '(없음)'
+  })`;
 }
 
 /**
@@ -447,6 +459,9 @@ function isLargeContext(context: JsonValue | null): boolean {
   return Object.values(context).some((value) => isLargeContextValue(value));
 }
 
+/**
+ * Loads the packaged default system prompt markdown used by the runtime.
+ */
 export async function loadDefaultRLMSystemPromptMarkdown(): Promise<string> {
   return DEFAULT_RLM_SYSTEM_PROMPT_MARKDOWN;
 }
@@ -499,7 +514,12 @@ export function buildRLMTurnInput(options: BuildRLMTurnInputOptions): string {
   const delegatedExpectText = delegatedContext === null
     ? null
     : stringifyPromptValue(delegatedContext.expect);
+  // // 현재 단계와 총 단계가 모두 주어질 때만 단계 예산을 보여줍니다.
+  // if (options.currentStep !== undefined && options.totalSteps !== undefined) {
+  //   sections.push(`단계 예산: ${options.currentStep} / ${options.totalSteps}`);
+  // }
   const sections = [
+    `단계 예산: ${options.currentStep} / ${options.totalSteps}\n\n`,
     `## REPL 목표 :\n${taskText}\n`,
   ];
 
@@ -508,7 +528,9 @@ export function buildRLMTurnInput(options: BuildRLMTurnInputOptions): string {
     // payload가 실제로 있을 때만 별도 블록을 추가합니다.
     if (delegatedPayloadText !== null) {
       sections.push(
-        `context.payload :\n${formatPromptTextBlock(clipText(delegatedPayloadText, options.outputCharLimit))}`,
+        `context.payload :\n${
+          formatPromptTextBlock(clipText(delegatedPayloadText, options.outputCharLimit))
+        }`,
       );
     }
 
@@ -516,16 +538,19 @@ export function buildRLMTurnInput(options: BuildRLMTurnInputOptions): string {
     if (delegatedExpectText !== null) {
       sections.push(
         [
-        `context.expect :\n${formatPromptTextBlock(clipText(delegatedExpectText, options.outputCharLimit))}`,
-        '이를 통해 그 런타임 실행을 만족하는 JavaScript 값을 반환해야 합니다.',
-      ].join(' '));
+          `context.expect :\n${
+            formatPromptTextBlock(clipText(delegatedExpectText, options.outputCharLimit))
+          }`,
+          '이를 통해 그 런타임 실행을 만족하는 JavaScript 값을 반환해야 합니다.',
+        ].join(' '),
+      );
     }
   }
 
   // 위임 실행일 때만 payload-first 사용 규칙을 추가합니다.
   if (delegatedContext) {
     sections.push(
-        [
+      [
         '## 위임된 증거 안내',
         '`context.selectionHints.positiveSelectors`가 있으면, 좁힌 row를 고르거나 넘길 때 그 원본 필드 이름을 유지하십시오.',
         '검색을 넓히기 전에 위임된 payload를 현재 working set으로 사용하십시오.',
@@ -540,11 +565,6 @@ export function buildRLMTurnInput(options: BuildRLMTurnInputOptions): string {
     if (questionHints !== null) {
       sections.push(`질문형 문맥 필드:\n${questionHints}`);
     }
-  }
-
-  // 현재 단계와 총 단계가 모두 주어질 때만 단계 예산을 보여줍니다.
-  if (options.currentStep !== undefined && options.totalSteps !== undefined) {
-    sections.push(`단계 예산: ${options.currentStep} / ${options.totalSteps}`);
   }
 
   // // transcript가 비어 있으면 첫 turn이므로 이전 REPL 기록 없이 바로 시작 안내를 반환합니다.
@@ -596,6 +616,9 @@ export function buildRLMTurnInput(options: BuildRLMTurnInputOptions): string {
   return sections.join('\n\n');
 }
 
+/**
+ * Exposes prompt-construction helpers for focused tests.
+ */
 export const __rlmPromptTestables = {
   buildLatestExecutionFeedback,
   buildContextPreviews,

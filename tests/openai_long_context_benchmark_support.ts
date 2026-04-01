@@ -2,16 +2,25 @@ import assert from 'node:assert/strict';
 import { join } from 'node:path';
 
 import type { RLMEvaluatorOptions } from '../src/index.ts';
-import { CodexOAuthProvider } from '../src/providers/codex_oauth.ts';
-import { estimateOpenAIRunCostUsd, resolveOpenAITextModelPricing } from '../src/openai_pricing.ts';
-import type { OpenAIRunCostEstimate } from '../src/openai_pricing.ts';
+import {
+  estimateOpenAIRunCostUsd,
+  resolveOpenAITextModelPricing,
+} from '../src/providers/openai_pricing.ts';
+import type { OpenAIRunCostEstimate } from '../src/providers/openai_pricing.ts';
 import { runRLM } from '../src/rlm_runner.ts';
 import type { RLMRunResult } from '../src/rlm_runner.ts';
 import type { JsonValue } from '../src/types.ts';
-import { buildCodexLiveRunOptions } from './openai_live_scenario_support.ts';
+import type { CodexLiveHarness } from './openai_live_scenario_support.ts';
 
 const LONG_DOCUMENT_OUTPUT_CHAR_LIMIT = 1_200;
 const NEAR_MAX_CONTEXT_WINDOW_FACTOR = 0.6;
+
+export const LONG_CONTEXT_BENCHMARK_CAPS = {
+  maxStepsCap: 12,
+  maxSubcallDepthCap: 1,
+  minimumRequestTimeoutMs: 180_000,
+  outputCharLimitCap: LONG_DOCUMENT_OUTPUT_CHAR_LIMIT,
+} as const;
 
 const FILLER_PARAGRAPHS = [
   'River crews logged lantern cargo beside orchard roads while harbor clerks compared weather notes, copied transit numbers, and repeated routine maintenance phrases for the evening checkpoint summary.',
@@ -71,27 +80,6 @@ function createDeterministicRandom(seed: number): () => number {
 async function createIntegrationJournalPath(testName: string, variant: string): Promise<string> {
   const root = await Deno.makeTempDir({ prefix: `rlm-openai-long-context-${variant}-` });
   return join(root, testName, 'session.jsonl');
-}
-
-let cachedLongContextCodexConfig:
-  | ReturnType<typeof buildCodexLiveRunOptions>
-  | null = null;
-
-async function loadLongContextCodexConfig(): Promise<ReturnType<typeof buildCodexLiveRunOptions>> {
-  if (cachedLongContextCodexConfig !== null) {
-    return cachedLongContextCodexConfig;
-  }
-
-  const provider = new CodexOAuthProvider();
-  const availableModels = await provider.listModels();
-  cachedLongContextCodexConfig = buildCodexLiveRunOptions({
-    availableModels,
-    maxStepsCap: 12,
-    maxSubcallDepthCap: 1,
-    minimumRequestTimeoutMs: 180_000,
-    outputCharLimitCap: LONG_DOCUMENT_OUTPUT_CHAR_LIMIT,
-  });
-  return cachedLongContextCodexConfig;
 }
 
 export function buildLongContextEvaluatorOptions(
@@ -388,10 +376,14 @@ function createRepoQAInspiredScenario(): LongContextScenario {
   };
 }
 
-async function createRulerInspiredNearMaxScenario(): Promise<LongContextScenario> {
-  const config = await loadLongContextCodexConfig();
-  const pricing = resolveOpenAITextModelPricing(config.rootModel);
-  assert.ok(pricing !== null, `No OpenAI pricing metadata for model ${config.rootModel}.`);
+async function createRulerInspiredNearMaxScenario(
+  options: {
+    rootModel?: string;
+  } = {},
+): Promise<LongContextScenario> {
+  const rootModel = options.rootModel ?? 'gpt-5-mini';
+  const pricing = resolveOpenAITextModelPricing(rootModel);
+  assert.ok(pricing !== null, `No OpenAI pricing metadata for model ${rootModel}.`);
 
   const targetWordCount = Math.floor(pricing.contextWindowTokens * NEAR_MAX_CONTEXT_WINDOW_FACTOR);
   const city = 'Chicago';
@@ -412,7 +404,7 @@ async function createRulerInspiredNearMaxScenario(): Promise<LongContextScenario
     context: {
       document,
       retrievalQuestion: `What is the special magic ${city} number?`,
-      rootModel: config.rootModel,
+      rootModel,
     },
     expectedAnswer,
     expectedMinDocumentWords: targetWordCount,
@@ -438,6 +430,7 @@ function emitBenchmarkSummary(outcome: BenchmarkOutcome) {
 
 export async function runLongContextScenario(
   scenario: LongContextScenario,
+  harness: CodexLiveHarness,
   options: LongContextBenchmarkRunOptions = {},
 ): Promise<BenchmarkOutcome> {
   const variant = options.variant ?? 'baseline';
@@ -449,22 +442,20 @@ export async function runLongContextScenario(
   let lastNormalizedAnswer: string | null = null;
 
   try {
-    const provider = new CodexOAuthProvider();
-    const config = await loadLongContextCodexConfig();
     const result = await runRLM({
-      cellTimeoutMs: config.cellTimeoutMs,
+      cellTimeoutMs: harness.runOptions.cellTimeoutMs,
       context: scenario.context,
       evaluator: options.evaluator,
       journalPath,
-      llm: provider.createCaller({
-        requestTimeoutMs: config.requestTimeoutMs,
+      llm: harness.provider.createCaller({
+        requestTimeoutMs: harness.runOptions.requestTimeoutMs,
       }),
-      maxSteps: config.maxSteps,
-      maxSubcallDepth: config.maxSubcallDepth,
-      outputCharLimit: config.outputCharLimit,
+      maxSteps: harness.runOptions.maxSteps,
+      maxSubcallDepth: harness.runOptions.maxSubcallDepth,
+      outputCharLimit: harness.runOptions.outputCharLimit,
       prompt: scenario.prompt,
-      rootModel: config.rootModel,
-      subModel: config.subModel,
+      rootModel: harness.runOptions.rootModel,
+      subModel: harness.runOptions.subModel,
     });
     lastResult = result;
     const cost = estimateOpenAIRunCostUsd(result.usage);
@@ -533,7 +524,7 @@ export async function runLongContextScenario(
 }
 
 export const LONG_CONTEXT_SCENARIO_FACTORIES: Array<{
-  createScenario: () => LongContextScenario | Promise<LongContextScenario>;
+  createScenario: (options?: { rootModel?: string }) => LongContextScenario | Promise<LongContextScenario>;
   summaryLabel: string;
 }> = [
   {

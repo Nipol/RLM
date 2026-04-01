@@ -1,3 +1,13 @@
+/**
+ * JSONL journal persistence helpers for standalone and file-backed RLM runs.
+ *
+ * @module
+ *
+ * @example
+ * ```ts
+ * import { appendJournalEntry } from './jsonl_journal.ts';
+ * ```
+ */
 import { dirnameFilePath, importNodeBuiltin, isNotFoundError } from './platform.ts';
 import type { CellEntry, JournalEntry, LoadedJournal, SessionEntry } from './types.ts';
 

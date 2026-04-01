@@ -134,14 +134,8 @@ Deno.test('runner keeps provider turnState opaque and forwards it across root tu
   assert.equal(result.answer, '50');
   assert.match(llm.requests[0]?.input ?? '', /단계 예산: 1 \/ 3/u);
   assert.match(llm.requests[1]?.input ?? '', /단계 예산: 2 \/ 3/u);
-  assert.match(
-    llm.requests[0]?.systemPrompt ?? '',
-    /사용할 수 있는 최대 단계 예산은 3/u,
-  );
-  assert.match(
-    llm.requests[1]?.systemPrompt ?? '',
-    /사용할 수 있는 최대 단계 예산은 3/u,
-  );
+  assert.match(llm.requests[0]?.systemPrompt ?? '', /^# Recursive Language Agent/mu);
+  assert.match(llm.requests[1]?.systemPrompt ?? '', /^# Recursive Language Agent/mu);
   assert.equal(llm.requests[0]?.turnState, undefined);
   assert.deepEqual(llm.requests[1]?.turnState, { opaque: 'root-1' });
 });
@@ -212,6 +206,39 @@ Deno.test('runner helper utilities cover limit resolution, final acceptance, and
   assert.equal(__rlmRunnerTestables.isPlaceholderLikeFinalAnswer('unknown'), true);
   assert.equal(__rlmRunnerTestables.isPlaceholderLikeFinalAnswer('pending'), true);
   assert.equal(__rlmRunnerTestables.isPlaceholderLikeFinalAnswer('42'), false);
+  assert.match(
+    __rlmRunnerTestables.buildEvaluatorInput({
+      assistantText: '```repl\nconst sample = "amount=120";\n```',
+      executions: [{
+        code: 'const sample = "amount=120";',
+        finalAnswer: null,
+        resultPreview: '"amount=120"',
+        resultSignals: [{ kind: 'string', path: '$', preview: 'amount=120' }],
+        status: 'success',
+        stderr: '',
+        stdout: 'amount=120',
+      }],
+      prompt: 'Extract the approved amount.',
+      step: 1,
+      totalSteps: 3,
+    }),
+    /작업 프롬프트:\nExtract the approved amount\./u,
+  );
+  assert.equal(
+    __rlmRunnerTestables.summarizeWeakFinalization({
+      context: { document: 'alpha '.repeat(4_000) },
+      execution: {
+        code: 'FINAL_VAR("")',
+        finalAnswer: '',
+        resultPreview: '""',
+        stdout: '',
+      },
+      prompt: 'Return only the decimal digits through FINAL_VAR.',
+      role: 'root',
+      transcript: [],
+    }),
+    null,
+  );
   assert.deepEqual(
     __rlmRunnerTestables.collectRequestedEntityLabels(
       'Return only the exact stamp identifier through FINAL_VAR.',
@@ -664,7 +691,7 @@ Deno.test('OpenAI provider helper utilities cover provider-aware timeout and log
   assert.equal((logger as { path?: string }).path, journalPath);
 });
 
-Deno.test('runner feeds execution feedback into the next model turn so later code can build on it', async () => {
+Deno.test('runner keeps later root turns compact instead of replaying execution feedback', async () => {
   const adapter = new MockCaller([
     {
       outputText: '```repl\nconst subtotal = 40 + 2;\nsubtotal\n```',
@@ -692,11 +719,13 @@ Deno.test('runner feeds execution feedback into the next model turn so later cod
   });
 
   assert.equal(result.answer, '50');
-  assert.match(adapter.requests[1]?.input ?? '', /42/u);
-  assert.match(adapter.requests[1]?.input ?? '', /success/u);
+  assert.match(adapter.requests[1]?.input ?? '', /단계 예산: 2 \/ 3/u);
+  assert.match(adapter.requests[1]?.input ?? '', /## REPL 목표 :\nAdd eight after the first computation\./u);
+  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /42/u);
+  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /success/u);
 });
 
-Deno.test('runner carries exact nested result signals into the next turn so root can see propagated leaf values', async () => {
+Deno.test('runner does not replay nested result signals into the next compact turn input', async () => {
   const adapter = new MockCaller([
     {
       outputText:
@@ -725,10 +754,11 @@ Deno.test('runner carries exact nested result signals into the next turn so root
   });
 
   assert.equal(result.answer, 'done');
-  assert.match(adapter.requests[1]?.input ?? '', /\$\.operatorId \(string\): op-7/u);
-  assert.match(adapter.requests[1]?.input ?? '', /\$\.routing\.lockerId \(string\): locker-9/u);
-  assert.match(adapter.requests[1]?.input ?? '', /\$\.routing\.accessCode \(string\): 7318452/u);
-  assert.match(adapter.requests[1]?.input ?? '', /\$\.routing\.missingLockerId \(undefined\): undefined/u);
+  assert.match(adapter.requests[1]?.input ?? '', /단계 예산: 2 \/ 3/u);
+  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /\$\.operatorId \(string\): op-7/u);
+  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /\$\.routing\.lockerId \(string\): locker-9/u);
+  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /\$\.routing\.accessCode \(string\): 7318452/u);
+  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /\$\.routing\.missingLockerId \(undefined\): undefined/u);
 });
 
 Deno.test('runner routes llm_query through the sub-model as a plain completion without spawning a nested RLM journal', async () => {
@@ -764,7 +794,7 @@ Deno.test('runner routes llm_query through the sub-model as a plain completion w
     adapter.requests.map((request) => request.model),
     ['gpt-5-nano', 'gpt-5-mini'],
   );
-  assert.match(adapter.requests[0]?.systemPrompt ?? '', /# 재귀 에이전트/u);
+  assert.match(adapter.requests[0]?.systemPrompt ?? '', /^# Recursive Language Agent/mu);
   assert.match(adapter.requests[1]?.systemPrompt ?? '', /일반 언어 모델 하위 호출/u);
   assert.doesNotMatch(adapter.requests[1]?.systemPrompt ?? '', /focused child controller/u);
 
@@ -840,7 +870,7 @@ Deno.test('runner surfaces delegated contract mismatches into the next turn so r
 
   assert.equal(result.answer, 'V-554');
   assert.doesNotMatch(adapter.requests[2]?.input ?? '', /위임 계약 복구/u);
-  assert.match(adapter.requests[2]?.input ?? '', /RLMSubqueryContractError/u);
+  assert.doesNotMatch(adapter.requests[2]?.input ?? '', /RLMSubqueryContractError/u);
 });
 
 Deno.test('runner routes rlm_query through the sub-model and records the nested subquery in the journal', async () => {
@@ -876,10 +906,10 @@ Deno.test('runner routes rlm_query through the sub-model and records the nested 
     adapter.requests.map((request) => request.model),
     ['gpt-5-nano', 'gpt-5-mini'],
   );
-  assert.match(adapter.requests[0]?.systemPrompt ?? '', /# 재귀 에이전트/u);
-  assert.match(adapter.requests[1]?.systemPrompt ?? '', /# 재귀 에이전트/u);
-  assert.match(adapter.requests[1]?.systemPrompt ?? '', /상위 에이전트에서 위임/u);
-  assert.match(adapter.requests[1]?.input ?? '', /작업:\nCompute 6 \* 7\./u);
+  assert.match(adapter.requests[0]?.systemPrompt ?? '', /^# Recursive Language Agent/mu);
+  assert.match(adapter.requests[1]?.systemPrompt ?? '', /^# Recursive Language Agent/mu);
+  assert.doesNotMatch(adapter.requests[1]?.systemPrompt ?? '', /상위 에이전트에서 위임/u);
+  assert.match(adapter.requests[1]?.input ?? '', /## REPL 목표 :\nCompute 6 \* 7\./u);
 
   const journalText = await Deno.readTextFile(journalPath);
   assert.match(journalText, /"type":"subquery"/u);
@@ -932,14 +962,14 @@ Deno.test('runner keeps root step budget and metadata aligned after an internal 
   assert.equal(adapter.requests[1]?.metadata?.depth, 1);
 
   assert.match(adapter.requests[2]?.input ?? '', /단계 예산: 2 \/ 4/u);
-  assert.match(adapter.requests[2]?.input ?? '', /## 이전 REPL 기록/u);
-  assert.match(adapter.requests[2]?.input ?? '', /^REPL 표준 출력:/mu);
-  assert.match(adapter.requests[2]?.input ?? '', /\{"nested":"42"\}/u);
+  assert.doesNotMatch(adapter.requests[2]?.input ?? '', /## 이전 REPL 기록/u);
+  assert.doesNotMatch(adapter.requests[2]?.input ?? '', /^REPL 표준 출력:/mu);
+  assert.doesNotMatch(adapter.requests[2]?.input ?? '', /\{"nested":"42"\}/u);
   assert.equal(adapter.requests[2]?.metadata?.step, 2);
   assert.equal(adapter.requests[2]?.metadata?.depth, 0);
 });
 
-Deno.test('runner surfaces child final stdout into the next root transcript after rlm_query returns', async () => {
+Deno.test('runner does not surface child final stdout into the next root input after rlm_query returns', async () => {
   const adapter = new MockCaller([
     {
       outputText:
@@ -970,8 +1000,7 @@ Deno.test('runner surfaces child final stdout into the next root transcript afte
   });
 
   assert.equal(result.answer, '42');
-  assert.match(adapter.requests[2]?.input ?? '', /childExtracted/u);
-  assert.match(adapter.requests[2]?.input ?? '', /42/u);
+  assert.doesNotMatch(adapter.requests[2]?.input ?? '', /childExtracted/u);
 });
 
 Deno.test('runner closes nested child sessions after rlm_query returns so only the root session remains live', async () => {
@@ -1218,8 +1247,9 @@ Deno.test('runner ignores FINAL_VAR values from a cell that later errors and ask
 
   assert.equal(result.answer, 'fixed');
   assert.equal(result.steps, 2);
-  assert.match(adapter.requests[1]?.input ?? '', /Error: boom/u);
-  assert.match(adapter.requests[1]?.input ?? '', /^상태: error/mu);
+  assert.match(adapter.requests[1]?.input ?? '', /단계 예산: 2 \/ 3/u);
+  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /Error: boom/u);
+  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /^상태: error/mu);
 });
 
 Deno.test('runner ignores FINAL_VAR(undefined) and asks the model to keep working', async () => {
@@ -1249,7 +1279,8 @@ Deno.test('runner ignores FINAL_VAR(undefined) and asks the model to keep workin
 
   assert.equal(result.answer, '42');
   assert.equal(result.steps, 2);
-  assert.match(adapter.requests[1]?.input ?? '', /채택된 최종 답: undefined/u);
+  assert.match(adapter.requests[1]?.input ?? '', /단계 예산: 2 \/ 3/u);
+  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /채택된 최종 답: undefined/u);
 });
 
 Deno.test('runner ignores FINAL_VAR(null) and asks the model to keep working', async () => {
@@ -1279,10 +1310,11 @@ Deno.test('runner ignores FINAL_VAR(null) and asks the model to keep working', a
 
   assert.equal(result.answer, '42');
   assert.equal(result.steps, 2);
-  assert.match(adapter.requests[1]?.input ?? '', /채택된 최종 답: null/u);
+  assert.match(adapter.requests[1]?.input ?? '', /단계 예산: 2 \/ 3/u);
+  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /채택된 최종 답: null/u);
 });
 
-Deno.test('runner soft-rejects empty finals in large-context root turns and asks for another turn', async () => {
+Deno.test('runner accepts empty finals once execution succeeds under the current compact policy', async () => {
   const adapter = new MockCaller([
     {
       outputText: '```repl\nFINAL_VAR("");\n```',
@@ -1310,13 +1342,12 @@ Deno.test('runner soft-rejects empty finals in large-context root turns and asks
     subModel: 'gpt-5-mini',
   });
 
-  assert.equal(result.answer, '7318452');
-  assert.equal(result.steps, 2);
-  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /최종화 복구/u);
-  assert.match(adapter.requests[1]?.input ?? '', /previous FINAL produced an empty value/u);
+  assert.equal(result.answer, '');
+  assert.equal(result.steps, 1);
+  assert.equal(adapter.requests.length, 1);
 });
 
-Deno.test('runner soft-rejects weak multiple-choice finals in large-context root turns and asks for stronger evidence', async () => {
+Deno.test('runner accepts the first successful multiple-choice final under the current compact policy', async () => {
   const adapter = new MockCaller([
     {
       outputText: [
@@ -1362,13 +1393,9 @@ Deno.test('runner soft-rejects weak multiple-choice finals in large-context root
     subModel: 'gpt-5-mini',
   });
 
-  assert.equal(result.answer, 'C');
-  assert.equal(result.steps, 2);
-  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /최종화 복구/u);
-  assert.match(
-    adapter.requests[1]?.input ?? '',
-    /matches option C/u,
-  );
+  assert.equal(result.answer, 'D');
+  assert.equal(result.steps, 1);
+  assert.equal(adapter.requests.length, 1);
 });
 
 Deno.test('runner accepts placeholder-looking finals once execution succeeds', async () => {
@@ -1483,7 +1510,7 @@ Deno.test('runner accepts working-set projections once execution succeeds', asyn
   assert.equal(adapter.requests.length, 1);
 });
 
-Deno.test('runner soft-rejects first-row fallback finals when pivot and downstream rows still compete', async () => {
+Deno.test('runner accepts first-row fallback finals under the current compact policy', async () => {
   const adapter = new MockCaller([
     {
       outputText: [
@@ -1529,12 +1556,12 @@ Deno.test('runner soft-rejects first-row fallback finals when pivot and downstre
     subModel: 'gpt-5-mini',
   });
 
-  assert.equal(result.answer, 'Silver Fern');
-  assert.equal(result.steps, 2);
-  assert.match(adapter.requests[1]?.input ?? '', /multiple plausible candidates/u);
+  assert.equal(result.answer, 'Glass Lantern');
+  assert.equal(result.steps, 1);
+  assert.equal(adapter.requests.length, 1);
 });
 
-Deno.test('runner accepts a repeated non-literal multiple-choice final after one recovery turn instead of exhausting max steps', async () => {
+Deno.test('runner accepts a non-literal multiple-choice final on the first successful turn', async () => {
   const adapter = new MockCaller([
     {
       outputText: [
@@ -1585,11 +1612,11 @@ Deno.test('runner accepts a repeated non-literal multiple-choice final after one
   });
 
   assert.equal(result.answer, 'C');
-  assert.equal(result.steps, 2);
-  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /최종화 복구/u);
+  assert.equal(result.steps, 1);
+  assert.equal(adapter.requests.length, 1);
 });
 
-Deno.test('runner accepts a repeated literal multiple-choice final after one recovery turn instead of exhausting max steps', async () => {
+Deno.test('runner accepts a literal multiple-choice final on the first successful turn', async () => {
   const adapter = new MockCaller([
     {
       outputText: [
@@ -1632,8 +1659,8 @@ Deno.test('runner accepts a repeated literal multiple-choice final after one rec
   });
 
   assert.equal(result.answer, 'C');
-  assert.equal(result.steps, 2);
-  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /최종화 복구/u);
+  assert.equal(result.steps, 1);
+  assert.equal(adapter.requests.length, 1);
 });
 
 Deno.test('runner accepts multiple-choice finals when the supporting option text is only embedded inside the document', async () => {
@@ -1677,7 +1704,7 @@ Deno.test('runner accepts multiple-choice finals when the supporting option text
   assert.equal(result.steps, 1);
 });
 
-Deno.test('runner surfaces deterministic option-mismatch recovery when document evidence maps to a different choice', async () => {
+Deno.test('runner keeps the original option letter when no recovery path is active', async () => {
   const adapter = new MockCaller([
     {
       outputText: [
@@ -1718,9 +1745,9 @@ Deno.test('runner surfaces deterministic option-mismatch recovery when document 
     subModel: 'gpt-5-mini',
   });
 
-  assert.equal(result.answer, 'B');
-  assert.equal(result.steps, 2);
-  assert.match(adapter.requests[1]?.input ?? '', /matches option B/u);
+  assert.equal(result.answer, 'C');
+  assert.equal(result.steps, 1);
+  assert.equal(adapter.requests.length, 1);
 });
 
 Deno.test('runner continues executing later repl blocks in the same assistant turn after a failed block', async () => {
@@ -1939,49 +1966,28 @@ Deno.test('runner journaling stays backward-compatible with the existing session
   assert.equal(journal.cells.length, 1);
 });
 
-Deno.test('runOpenAIRLM boots the OpenAI adapter from env-backed config without touching live network', async () => {
-  const tempDir = await Deno.makeTempDir({ prefix: 'rlm-openai-env-' });
-  const previousCwd = Deno.cwd();
+Deno.test('runOpenAIRLM requires explicit OpenAI config instead of reading repository env state', async () => {
+  const runWithoutConfig = runOpenAIRLM as unknown as (options: Record<string, unknown>) => Promise<unknown>;
 
-  try {
-    await Deno.writeTextFile(
-      join(tempDir, '.env'),
-      [
-        'OPENAI_API_KEY=sk-test',
-        'RLM_OPENAI_ROOT_MODEL=gpt-5-nano',
-        'RLM_OPENAI_SUB_MODEL=gpt-5-mini',
-        'RLM_CELL_TIMEOUT_MS=2222',
-        'RLM_REQUEST_TIMEOUT_MS=54321',
-        'RLM_MAX_STEPS=2',
-        'RLM_MAX_SUBCALL_DEPTH=1',
-        'RLM_MAX_OUTPUT_CHARS=120',
-      ].join('\n'),
-    );
-    Deno.chdir(tempDir);
-
-    const journalPath = join(tempDir, 'openai', 'session.jsonl');
-    const result = await runOpenAIRLM({
-      context: null,
-      fetcher: async () =>
-        new Response(
-          JSON.stringify({
-            id: 'resp_openai_1',
-            output_text: '```repl\nFINAL_VAR("ok")\n```',
-          }),
-          {
-            headers: { 'Content-Type': 'application/json' },
-            status: 200,
-          },
-        ),
-      journalPath,
-      prompt: 'Finish immediately.',
-    });
-
-    assert.equal(result.answer, 'ok');
-    assert.equal(result.session.session.defaultTimeoutMs, 56_543);
-  } finally {
-    Deno.chdir(previousCwd);
-  }
+  await assert.rejects(
+    async () =>
+      await runWithoutConfig({
+        context: null,
+        fetcher: async () =>
+          new Response(
+            JSON.stringify({
+              id: 'resp_openai_1',
+              output_text: '```repl\nFINAL_VAR("ok")\n```',
+            }),
+            {
+              headers: { 'Content-Type': 'application/json' },
+              status: 200,
+            },
+          ),
+        prompt: 'Finish immediately.',
+      }),
+    /openAI/u,
+  );
 });
 
 Deno.test('runOpenAIRLM accepts explicit OpenAI config without loading repository env state', async () => {

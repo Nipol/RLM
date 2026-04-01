@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
 
+import type { LLMCaller } from '../src/llm_adapter.ts';
 import { buildOpenAILiveScenarioCatalog, createOpenAILiveSeed } from './openai_live_scenarios.ts';
 import {
   buildCodexLiveRunOptions,
+  loadCodexLiveHarness,
+  probeCodexLiveProvider,
   resolveCodexLiveModels,
 } from './openai_live_scenario_support.ts';
 
@@ -106,4 +109,104 @@ Deno.test('buildCodexLiveRunOptions combines provider timeouts with runtime caps
     rootModel: 'gpt-5-mini',
     subModel: 'gpt-5.3-instant',
   });
+});
+
+Deno.test('probeCodexLiveProvider requires granted chatgpt.com net permission and stored OAuth auth', async () => {
+  const calls: string[] = [];
+  const provider = {
+    async listModels() {
+      calls.push('listModels');
+      return ['gpt-5-mini'];
+    },
+    async loadAuth() {
+      calls.push('loadAuth');
+      return { provider: 'codex-oauth' };
+    },
+    createCaller() {
+      throw new Error('not used');
+    },
+  };
+
+  const denied = await probeCodexLiveProvider({
+    provider,
+    queryNetPermission: async () => ({ state: 'prompt' }),
+  });
+  assert.deepEqual(denied, {
+    enabled: false,
+    reason: 'chatgpt.com net permission is not granted.',
+  });
+
+  const missingAuth = await probeCodexLiveProvider({
+    provider: {
+      ...provider,
+      async loadAuth() {
+        return null;
+      },
+    },
+    queryNetPermission: async () => ({ state: 'granted' }),
+  });
+  assert.deepEqual(missingAuth, {
+    enabled: false,
+    reason: 'Codex OAuth auth is missing.',
+  });
+
+  const enabled = await probeCodexLiveProvider({
+    provider,
+    queryNetPermission: async () => ({ state: 'granted' }),
+  });
+  assert.deepEqual(enabled, {
+    enabled: true,
+    reason: null,
+  });
+  assert.deepEqual(calls, ['loadAuth']);
+});
+
+Deno.test('loadCodexLiveHarness keeps provider ownership in the caller file and derives run options from its model catalog', async () => {
+  const calls: string[] = [];
+  const fakeCaller: LLMCaller = {
+    async complete() {
+      throw new Error('not used');
+    },
+  };
+  const provider = {
+    async listModels() {
+      calls.push('listModels');
+      return ['gpt-5-mini', 'gpt-5.3-instant'];
+    },
+    async loadAuth() {
+      calls.push('loadAuth');
+      return { provider: 'codex-oauth' };
+    },
+    createCaller() {
+      calls.push('createCaller');
+      return fakeCaller;
+    },
+  };
+
+  const harness = await loadCodexLiveHarness({
+    maxStepsCap: 12,
+    maxSubcallDepthCap: 1,
+    minimumRequestTimeoutMs: 90_000,
+    outputCharLimitCap: 1_000,
+    provider,
+    requestTimeoutMs: 30_000,
+    runtime: {
+      cellTimeoutMs: 5_000,
+      maxSteps: 20,
+      maxSubcallDepth: 3,
+      outputCharLimit: 4_000,
+    },
+  });
+
+  assert.equal(harness.provider, provider);
+  assert.deepEqual(harness.runOptions, {
+    cellTimeoutMs: 95_000,
+    maxSteps: 12,
+    maxSubcallDepth: 1,
+    outputCharLimit: 1_000,
+    requestTimeoutMs: 90_000,
+    rootModel: 'gpt-5-mini',
+    subModel: 'gpt-5.3-instant',
+  });
+  assert.deepEqual(calls, ['listModels']);
 });

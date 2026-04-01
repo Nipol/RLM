@@ -1,3 +1,13 @@
+/**
+ * Bridges plain and recursive subqueries from the REPL into provider-backed execution.
+ *
+ * @module
+ *
+ * @example
+ * ```ts
+ * import { createRLMQueryHandler } from './llm_query.ts';
+ * ```
+ */
 import type { LLMCaller, LLMCallKind, LLMUsage } from './llm_adapter.ts';
 import { NullRLMLogger } from './logger.ts';
 import { createSubqueryJournalPath } from './subquery_path.ts';
@@ -917,6 +927,9 @@ export function createRLMQueryHandler(options: RLMQueryBridgeOptions): RLMQueryH
   };
 }
 
+/**
+ * Exposes query-construction helpers for isolated tests.
+ */
 export const __llmQueryTestables = {
   createInternalRLMQueryResultEnvelope,
   buildDelegatedChildContext,

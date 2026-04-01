@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "esnext"
+    ]
+  },
+  "nodeModulesDir": "auto",
+  "tasks": {
+    "build": "deno run -A npm:vite build --config ./vite.config.ts",
+    "dev": "deno run -A npm:vite dev --config ./vite.config.ts --host 0.0.0.0",
+    "serve": "deno run --allow-net --allow-read ./server.ts"
+  }
+}

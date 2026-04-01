@@ -6,4 +6,6 @@ Deno.test('OpenAI provider subpath entrypoint exposes provider-specific convenie
   assert.equal(typeof openaiProvider.createOpenAIRLM, 'function');
   assert.equal(typeof openaiProvider.runOpenAIRLM, 'function');
   assert.equal(typeof openaiProvider.OpenAIResponsesProvider, 'function');
+  assert.equal(typeof openaiProvider.estimateOpenAIRunCostUsd, 'function');
+  assert.equal(typeof openaiProvider.resolveOpenAITextModelPricing, 'function');
 });

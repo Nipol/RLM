@@ -138,7 +138,7 @@ Deno.test('delegated turn input keeps recursive note and plain feedback format',
   assert.match(input, /좁힌 row를 고르거나 넘길 때 그 원본 필드 이름을 유지/u);
   assert.doesNotMatch(input, /## REPL 기록 형식/u);
   assert.doesNotMatch(input, /다음 행동:/u);
-  assert.doesNotMatch(input, /단계 예산:/u);
+  assert.match(input, /단계 예산: undefined \/ undefined/u);
 });
 
 Deno.test('turn input no longer injects large-context or recovery banners', () => {
@@ -165,4 +165,33 @@ Deno.test('turn input no longer injects large-context or recovery banners', () =
   assert.doesNotMatch(input, /대형 문맥 모드가 활성화되었습니다\./u);
   assert.doesNotMatch(input, /최종화 복구/u);
   assert.doesNotMatch(input, /실행 복구/u);
+});
+
+Deno.test('root turn input keeps the current compact shape even after a failed finalization attempt', () => {
+  const input = buildRLMTurnInput({
+    context: { document: 'Program Orion entry: status=approved amount=120 reviewer=west.' },
+    currentStep: 2,
+    outputCharLimit: 160,
+    prompt: 'Extract the approved amount.',
+    totalSteps: 3,
+    transcript: [{
+      assistantText: '```repl\nFINAL_VAR(undefined)\n```',
+      executions: [{
+        code: 'FINAL_VAR(undefined)',
+        finalAnswer: 'undefined',
+        resultPreview: 'undefined',
+        status: 'success',
+        stderr: 'Error: boom',
+        stdout: 'sample row: amount=120',
+      }],
+      step: 1,
+    }],
+  });
+
+  assert.match(input, /단계 예산: 2 \/ 3/u);
+  assert.match(input, /## REPL 목표 :\nExtract the approved amount\./u);
+  assert.doesNotMatch(input, /## 최신 REPL 실행/u);
+  assert.doesNotMatch(input, /채택된 최종 답: undefined/u);
+  assert.doesNotMatch(input, /Error: boom/u);
+  assert.doesNotMatch(input, /sample row: amount=120/u);
 });

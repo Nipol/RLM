@@ -1,6 +1,29 @@
-import type { LLMCaller, LLMCallerRequest, LLMCallerResponse, LLMProvider } from './llm_adapter.ts';
+/**
+ * Ollama generate-endpoint adapters that satisfy the provider-neutral caller contract.
+ *
+ * @module
+ *
+ * @example
+ * ```ts
+ * import { OllamaGenerateProvider } from './ollama_adapter.ts';
+ * ```
+ */
+import type {
+  LLMCaller,
+  LLMCallerRequest,
+  LLMCallerResponse,
+  LLMProvider,
+} from '../llm_adapter.ts';
 
 type FetchLike = typeof fetch;
+
+function resolveFetcher(fetcher: FetchLike | undefined): FetchLike {
+  if (fetcher !== undefined) {
+    return fetcher;
+  }
+
+  return globalThis.fetch.bind(globalThis);
+}
 
 interface OllamaUsagePayload {
   eval_count?: number;
@@ -12,6 +35,9 @@ interface OllamaGeneratePayload extends OllamaUsagePayload {
   response?: string;
 }
 
+/**
+ * Describes the Ollama endpoint and model ids used to create callers.
+ */
 export interface OllamaProviderConfig {
   baseUrl: string;
   keepAlive?: number | string;
@@ -20,15 +46,24 @@ export interface OllamaProviderConfig {
   subModel: string;
 }
 
+/**
+ * Configures a low-level Ollama caller adapter.
+ */
 export interface OllamaGenerateAdapterOptions {
   config: OllamaProviderConfig;
   fetcher?: FetchLike;
 }
 
+/**
+ * Configures the reusable provider that manufactures Ollama callers.
+ */
 export interface OllamaGenerateProviderOptions {
   fetcher?: FetchLike;
 }
 
+/**
+ * Represents a transport or provider error returned by the Ollama generate API.
+ */
 export class OllamaGenerateError extends Error {
   readonly status: number;
 
@@ -100,13 +135,16 @@ function cleanupCompletionRequest(
   detachAbortListener(signal, handleExternalAbort);
 }
 
+/**
+ * Implements the provider-neutral caller contract on top of Ollama's generate endpoint.
+ */
 export class OllamaGenerateAdapter implements LLMCaller {
   readonly #config: OllamaProviderConfig;
   readonly #fetcher: FetchLike;
 
   constructor(options: OllamaGenerateAdapterOptions) {
     this.#config = options.config;
-    this.#fetcher = options.fetcher ?? fetch;
+    this.#fetcher = resolveFetcher(options.fetcher);
   }
 
   async complete(request: LLMCallerRequest): Promise<LLMCallerResponse> {
@@ -179,6 +217,9 @@ export class OllamaGenerateAdapter implements LLMCaller {
   }
 }
 
+/**
+ * Manufactures Ollama callers from provider config objects.
+ */
 export class OllamaGenerateProvider implements LLMProvider<OllamaProviderConfig> {
   readonly #fetcher?: FetchLike;
 
@@ -193,4 +234,3 @@ export class OllamaGenerateProvider implements LLMProvider<OllamaProviderConfig>
     });
   }
 }
-

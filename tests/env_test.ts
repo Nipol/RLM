@@ -7,7 +7,7 @@ import {
   loadRLMConfig,
   loadRLMRuntimeConfig,
   parseDotEnv,
-} from '../src/env.ts';
+} from '../src/standalone/env.ts';
 
 function createMissingEnvFileOptions() {
   return {
@@ -122,6 +122,22 @@ RLM_OPENAI_SUB_MODEL=gpt-5-nano
   assert.equal(config.subModel, 'gpt-5-nano');
   assert.equal(config.baseUrl, 'https://api.example.test/v1');
   assert.equal(config.requestTimeoutMs, 30_000);
+});
+
+Deno.test('OpenAI config loader reads optional root and sub reasoning effort values', () => {
+  const config = loadOpenAIProviderConfig({
+    env: {
+      OPENAI_API_KEY: 'sk-test',
+      RLM_OPENAI_ROOT_MODEL: 'gpt-5',
+      RLM_OPENAI_ROOT_REASONING_EFFORT: 'high',
+      RLM_OPENAI_SUB_MODEL: 'gpt-5-mini',
+      RLM_OPENAI_SUB_REASONING_EFFORT: 'minimal',
+    },
+    ...createMissingEnvFileOptions(),
+  });
+
+  assert.equal(config.rootReasoningEffort, 'high');
+  assert.equal(config.subReasoningEffort, 'minimal');
 });
 
 Deno.test('OpenAI config loader lets explicit overrides win over .env defaults', () => {
@@ -258,7 +274,23 @@ Deno.test('runtime config rejects non-positive numeric limits before a run start
           RLM_OPENAI_SUB_MODEL: 'gpt-5-mini',
         },
         ...createMissingEnvFileOptions(),
-      }),
+    }),
     /RLM_MAX_STEPS/u,
+  );
+});
+
+Deno.test('OpenAI config loader rejects unsupported reasoning effort values', () => {
+  assert.throws(
+    () =>
+      loadOpenAIProviderConfig({
+        env: {
+          OPENAI_API_KEY: 'sk-test',
+          RLM_OPENAI_ROOT_MODEL: 'gpt-5',
+          RLM_OPENAI_ROOT_REASONING_EFFORT: 'turbo',
+          RLM_OPENAI_SUB_MODEL: 'gpt-5-mini',
+        },
+        ...createMissingEnvFileOptions(),
+      }),
+    /RLM_OPENAI_ROOT_REASONING_EFFORT/u,
   );
 });

@@ -1,4 +1,14 @@
-import type { ModelUsageSummary, RLMUsageSummary } from './types.ts';
+/**
+ * OpenAI pricing metadata and cost-estimation helpers used by standalone reporting.
+ *
+ * @module
+ *
+ * @example
+ * ```ts
+ * import { estimateOpenAIRunCostUsd } from './openai_pricing.ts';
+ * ```
+ */
+import type { ModelUsageSummary, RLMUsageSummary } from '../types.ts';
 
 /**
  * Describes the static text-token pricing metadata used for current OpenAI models.
@@ -14,6 +24,9 @@ export interface OpenAITextModelPricing {
   outputUsdPerMillionTokens: number;
 }
 
+/**
+ * Summarizes estimated token costs for one model within a run.
+ */
 export interface OpenAIUsageCostEstimate {
   cachedInputCostUsd: number;
   inputCostUsd: number;
@@ -22,6 +35,9 @@ export interface OpenAIUsageCostEstimate {
   totalCostUsd: number;
 }
 
+/**
+ * Summarizes estimated token costs across all models involved in one RLM run.
+ */
 export interface OpenAIRunCostEstimate {
   byModel: OpenAIUsageCostEstimate[];
   missingPricingModels: string[];

@@ -1,3 +1,13 @@
+/**
+ * Execution backend abstractions that create REPL runtimes for RLM sessions.
+ *
+ * @module
+ *
+ * @example
+ * ```ts
+ * import { createDefaultExecutionBackend } from './execution_backend.ts';
+ * ```
+ */
 import type { ExecutionBackend, PersistentRuntimeLike } from './types.ts';
 import { importNodeBuiltin } from './platform.ts';
 import { PersistentSandboxRuntime } from './worker_runtime.ts';
@@ -151,8 +161,7 @@ function createPortableWorkerFactory(
   }
 
   const importWorkerThreads = options.importWorkerThreads ??
-    (async () =>
-      await importNodeBuiltin<NodeWorkerThreadsModule>('worker_threads'));
+    (async () => await importNodeBuiltin<NodeWorkerThreadsModule>('worker_threads'));
 
   return async (url) => {
     const workerThreads = await importWorkerThreads();
@@ -230,6 +239,9 @@ export function createDefaultExecutionBackend(): ExecutionBackend {
   return new WorkerExecutionBackend();
 }
 
+/**
+ * Exposes execution-backend internals for isolated tests.
+ */
 export const __executionBackendTestables = {
   adaptNodeWorkerThread,
   buildNodeWorkerSource,

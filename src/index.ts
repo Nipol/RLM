@@ -1,12 +1,14 @@
+/**
+ * Internal unified re-export surface used by the published package entrypoint.
+ *
+ * @module
+ *
+ * @example
+ * ```ts
+ * import { createRLM } from './index.ts';
+ * ```
+ */
 export { ReplSession } from './repl_session.ts';
-export {
-  loadDotEnvFile,
-  loadOpenAIProviderConfig,
-  loadProviderRequestTimeoutMs,
-  loadRLMConfig,
-  loadRLMRuntimeConfig,
-  parseDotEnv,
-} from './env.ts';
 export { createDefaultExecutionBackend, WorkerExecutionBackend } from './execution_backend.ts';
 export {
   createSubqueryLogger,
@@ -24,7 +26,6 @@ export {
   RLMSubqueryDepthError,
   RLMSubqueryResultError,
 } from './llm_query.ts';
-export { CodexOAuthProvider } from './providers/codex_oauth.ts';
 export { extractFinalSignal, extractReplCodeBlocks } from './repl_protocol.ts';
 export {
   buildRLMSystemPrompt,
@@ -40,12 +41,6 @@ export {
   runStandaloneCLI,
 } from './standalone/cli.ts';
 export { createRLM, RLMMaxStepsError, RLMProtocolError, runRLM } from './rlm_runner.ts';
-export {
-  estimateOpenAIRunCostUsd,
-  estimateOpenAIUsageCostUsd,
-  resolveOpenAITextModelPricing,
-} from './openai_pricing.ts';
-export type { OpenAIProviderConfig, RLMConfig, RLMRuntimeConfig } from './env.ts';
 export type {
   RLMClient,
   RLMClientOptions,
@@ -74,21 +69,6 @@ export type {
   LLMProvider,
   LLMUsage,
 } from './llm_adapter.ts';
-export type {
-  OpenAIRunCostEstimate,
-  OpenAITextModelPricing,
-  OpenAIUsageCostEstimate,
-} from './openai_pricing.ts';
-export type {
-  CodexOAuthAuthorizationCodeResult,
-  CodexOAuthAuthorizationReceiver,
-  CodexOAuthAuthorizationSession,
-  CodexOAuthAuthRecord,
-  CodexOAuthCallerConfig,
-  CodexOAuthLoginOptions,
-  CodexOAuthProviderOptions,
-  CodexOAuthTokenBundle,
-} from './providers/codex_oauth.ts';
 export type { FinalSignal, ReplCodeBlock } from './repl_protocol.ts';
 export type { RLMRunOptions, RLMRunResult } from './rlm_runner.ts';
 export type {

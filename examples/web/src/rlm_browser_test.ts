@@ -1,0 +1,137 @@
+import assert from 'node:assert/strict';
+
+import { buildConversationRunInput, emitBrowserRunDebugLog } from './rlm_browser.ts';
+import { createProviderSettings } from './lib/provider_config.ts';
+
+const settings = createProviderSettings({
+  apiKey: 'sk-test',
+  availableModels: ['gpt-5', 'gpt-5-mini'],
+  baseUrl: 'https://api.openai.com/v1',
+  kind: 'openai',
+  rootModel: 'gpt-5',
+  rootReasoningEffort: 'high',
+  subModel: 'gpt-5-mini',
+  subReasoningEffort: 'minimal',
+}, new Date('2026-03-31T00:00:00.000Z'));
+
+Deno.test('buildConversationRunInput forwards all previous turns into context and keeps the current prompt separate', () => {
+  const runInput = buildConversationRunInput(settings, [
+    {
+      content: '첫 질문',
+      createdAt: '2026-03-31T12:00:00.000Z',
+      id: 'u1',
+      role: 'user',
+    },
+    {
+      content: '첫 답변',
+      createdAt: '2026-03-31T12:00:02.000Z',
+      id: 'a1',
+      role: 'assistant',
+    },
+    {
+      content: '두 번째 질문',
+      createdAt: '2026-03-31T12:01:00.000Z',
+      id: 'u2',
+      role: 'user',
+    },
+  ], '세 번째 질문');
+
+  assert.equal(runInput.prompt, '세 번째 질문');
+  assert.deepEqual(runInput.context, {
+    app: 'examples/web',
+    conversation: [
+      {
+        content: '첫 질문',
+        createdAt: '2026-03-31T12:00:00.000Z',
+        error: null,
+        id: 'u1',
+        role: 'user',
+        steps: null,
+        usage: null,
+      },
+      {
+        content: '첫 답변',
+        createdAt: '2026-03-31T12:00:02.000Z',
+        error: null,
+        id: 'a1',
+        role: 'assistant',
+        steps: null,
+        usage: null,
+      },
+      {
+        content: '두 번째 질문',
+        createdAt: '2026-03-31T12:01:00.000Z',
+        error: null,
+        id: 'u2',
+        role: 'user',
+        steps: null,
+        usage: null,
+      },
+    ],
+    document: '1. 사용자: 첫 질문\n2. RLM: 첫 답변\n3. 사용자: 두 번째 질문',
+    conversationTranscript: '1. 사용자: 첫 질문\n2. RLM: 첫 답변\n3. 사용자: 두 번째 질문',
+    provider: {
+      kind: 'openai',
+      label: 'OpenAI',
+      requestTimeoutMs: 30000,
+      rootModel: 'gpt-5',
+      rootReasoningEffort: 'high',
+      subModel: 'gpt-5-mini',
+      subReasoningEffort: 'minimal',
+    },
+    storedTurnCount: 3,
+  });
+});
+
+Deno.test('emitBrowserRunDebugLog prints the run input and stores it on the global scope', () => {
+  const runInput = buildConversationRunInput(settings, [
+    {
+      content: '이전 질문',
+      createdAt: '2026-03-31T12:00:00.000Z',
+      id: 'u1',
+      role: 'user',
+    },
+  ], '새 질문');
+
+  const calls: unknown[][] = [];
+  const scope: { __RLM_LAST_RUN_INPUT__?: typeof runInput } = {};
+
+  emitBrowserRunDebugLog(runInput, {
+    groupCollapsed: (...args) => calls.push(['groupCollapsed', ...args]),
+    groupEnd: () => calls.push(['groupEnd']),
+    log: (...args) => calls.push(['log', ...args]),
+  }, scope);
+
+  assert.deepEqual(calls, [
+    ['groupCollapsed', '[RLM] Browser Run Input'],
+    ['log', 'prompt', '새 질문'],
+    ['log', 'context', {
+      app: 'examples/web',
+      conversation: [
+        {
+          content: '이전 질문',
+          createdAt: '2026-03-31T12:00:00.000Z',
+          error: null,
+          id: 'u1',
+          role: 'user',
+          steps: null,
+          usage: null,
+        },
+      ],
+      document: '1. 사용자: 이전 질문',
+      conversationTranscript: '1. 사용자: 이전 질문',
+      provider: {
+        kind: 'openai',
+        label: 'OpenAI',
+        requestTimeoutMs: 30000,
+        rootModel: 'gpt-5',
+        rootReasoningEffort: 'high',
+        subModel: 'gpt-5-mini',
+        subReasoningEffort: 'minimal',
+      },
+      storedTurnCount: 1,
+    }],
+    ['groupEnd'],
+  ]);
+  assert.deepEqual(scope.__RLM_LAST_RUN_INPUT__, runInput);
+});

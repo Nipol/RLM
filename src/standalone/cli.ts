@@ -1,8 +1,18 @@
-import { loadProviderRequestTimeoutMs, loadRLMConfig, loadRLMRuntimeConfig } from '../env.ts';
+/**
+ * Standalone CLI parsing, progress logging, login, and run orchestration helpers.
+ *
+ * @module
+ *
+ * @example
+ * ```ts
+ * import { runStandaloneCLI } from './cli.ts';
+ * ```
+ */
+import { loadProviderRequestTimeoutMs, loadRLMConfig, loadRLMRuntimeConfig } from './env.ts';
 import type { LLMCaller } from '../llm_adapter.ts';
 import { JsonlFileLogger } from '../logger.ts';
-import { OpenAIResponsesProvider } from '../openai_adapter.ts';
-import { estimateOpenAIRunCostUsd } from '../openai_pricing.ts';
+import { OpenAIResponsesProvider } from '../providers/openai_adapter.ts';
+import { estimateOpenAIRunCostUsd } from '../providers/openai_pricing.ts';
 import {
   importNodeBuiltin,
   joinFilePath,
@@ -17,7 +27,7 @@ import {
   CodexOAuthProvider,
   extractAuthorizationCodeFromCallbackUrl,
 } from '../providers/codex_oauth.ts';
-import { createOpenAIRLM, runOpenAIRLM } from '../providers/openai.ts';
+import { runOpenAIRLM } from '../providers/openai.ts';
 import type { RunOpenAIRLMOptions } from '../providers/openai.ts';
 import { runRLM } from '../rlm_runner.ts';
 import type { RLMRunOptions } from '../rlm_runner.ts';
@@ -100,6 +110,20 @@ interface StandaloneRunResult {
   usage?: RLMUsageSummary;
 }
 
+interface StandaloneModelCostEstimate {
+  cachedInputCostUsd?: number;
+  inputCostUsd?: number;
+  model: string;
+  outputCostUsd?: number;
+  totalCostUsd?: number;
+}
+
+interface StandaloneRunCostEstimate {
+  byModel: StandaloneModelCostEstimate[];
+  missingPricingModels?: string[];
+  totalCostUsd?: number;
+}
+
 interface StandaloneCodexOAuthProviderLike {
   createCaller(config?: { requestTimeoutMs?: number }): Pick<LLMCaller, 'complete'>;
   listModels(): Promise<string[]>;
@@ -131,6 +155,7 @@ export interface StandaloneCLIDependencies {
    * @deprecated Use `llm`.
    */
   adapter?: Pick<LLMCaller, 'complete'>;
+  estimateRunCost?: (usage: RLMUsageSummary) => StandaloneRunCostEstimate | null;
   fetcher?: typeof fetch;
   llm?: Pick<LLMCaller, 'complete'>;
   readLoginLine?: (signal?: AbortSignal) => Promise<string | null>;
@@ -981,7 +1006,10 @@ function formatUsd(value: number): string {
   return `$${value.toFixed(6)}`;
 }
 
-function buildStandaloneUsageLines(usage: RLMUsageSummary | undefined): string[] {
+function buildStandaloneUsageLines(
+  usage: RLMUsageSummary | undefined,
+  estimateRunCost?: (usage: RLMUsageSummary) => StandaloneRunCostEstimate | null,
+): string[] {
   if (usage === undefined) {
     return [];
   }
@@ -989,17 +1017,32 @@ function buildStandaloneUsageLines(usage: RLMUsageSummary | undefined): string[]
   const lines = [
     `[usage] input_tokens=${usage.inputTokens} output_tokens=${usage.outputTokens} total_tokens=${usage.totalTokens}`,
   ];
-  const estimate = estimateOpenAIRunCostUsd(usage);
+  const estimate = estimateRunCost?.(usage) ?? null;
+  if (estimate === null) {
+    lines.push('[cost] input_usd= output_usd= total_usd=');
+    return lines;
+  }
+
   const inputCostUsd = estimate.byModel.reduce(
-    (sum, entry) => sum + entry.cachedInputCostUsd + entry.inputCostUsd,
+    (sum, entry) => sum + (entry.cachedInputCostUsd ?? 0) + (entry.inputCostUsd ?? 0),
     0,
   );
-  const outputCostUsd = estimate.byModel.reduce((sum, entry) => sum + entry.outputCostUsd, 0);
+  const outputCostUsd = estimate.byModel.reduce(
+    (sum, entry) => sum + (entry.outputCostUsd ?? 0),
+    0,
+  );
+  const missingPricingModels = estimate.missingPricingModels ?? [];
 
-  if (estimate.missingPricingModels.length > 0) {
+  if (missingPricingModels.length > 0 || estimate.totalCostUsd === undefined) {
     lines.push(
-      `[cost] input_usd=n/a output_usd=n/a total_usd=n/a missing_pricing_models=${
-        estimate.missingPricingModels.join(', ')
+      `[cost] input_usd= output_usd= total_usd=${
+        missingPricingModels.length > 0 || estimate.totalCostUsd === undefined
+          ? ''
+          : formatUsd(estimate.totalCostUsd)
+      }${
+        missingPricingModels.length === 0
+          ? ''
+          : ` missing_pricing_models=${missingPricingModels.join(', ')}`
       }`,
     );
     return lines;
@@ -1055,6 +1098,9 @@ export async function runStandaloneCLI(
   const runOpenAI = resolveStandaloneRun(dependencies.run);
   const runGeneric = resolveStandaloneGenericRun(dependencies.runGeneric);
   const fetcher = dependencies.fetcher ?? fetch;
+  const estimateRunCost = resolved.provider === 'openai'
+    ? dependencies.estimateRunCost ?? estimateOpenAIRunCostUsd
+    : dependencies.estimateRunCost;
 
   if (resolved.provider === 'codex-oauth' && resolved.login === true) {
     const provider = dependencies.createCodexOAuthProvider?.() ??
@@ -1164,12 +1210,9 @@ export async function runStandaloneCLI(
         return { render, runResult };
       })()
       : await (async () => {
-        const needsProviderConfig = dependencies.run === undefined ||
-          dependencies.render === undefined ||
-          resolved.requestTimeoutMs !== undefined;
-        const config = needsProviderConfig ? loadRLMConfig({ path: envPath }) : undefined;
-        const requestTimeoutMs = resolved.requestTimeoutMs ?? config?.openAI.requestTimeoutMs;
-        const effectiveConfig = config === undefined ? undefined : {
+        const config = loadRLMConfig({ path: envPath });
+        const requestTimeoutMs = resolved.requestTimeoutMs ?? config.openAI.requestTimeoutMs;
+        const effectiveConfig = {
           ...config,
           openAI: {
             ...config.openAI,
@@ -1182,15 +1225,16 @@ export async function runStandaloneCLI(
               fetcher,
               llm: new OpenAIResponsesProvider({
                 fetcher,
-              }).createCaller(effectiveConfig!.openAI),
-              rootModel: effectiveConfig!.openAI.rootModel,
+              }).createCaller(effectiveConfig.openAI),
+              rootModel: effectiveConfig.openAI.rootModel,
             }));
         const runResult = await runOpenAI({
           cellTimeoutMs: resolved.cellTimeoutMs,
-          config: effectiveConfig,
           context,
+          defaults: effectiveConfig.runtime,
           fetcher,
           logger,
+          openAI: effectiveConfig.openAI,
           prompt: query,
         });
         return { render, runResult };
@@ -1205,7 +1249,7 @@ export async function runStandaloneCLI(
     });
 
     writeLine(`[final] ${renderedAnswer}`);
-    for (const usageLine of buildStandaloneUsageLines(result.runResult.usage)) {
+    for (const usageLine of buildStandaloneUsageLines(result.runResult.usage, estimateRunCost)) {
       writeLine(usageLine);
     }
     return {
@@ -1226,6 +1270,9 @@ export async function runStandaloneCLI(
   }
 }
 
+/**
+ * Exposes standalone CLI helpers for isolated tests.
+ */
 export const __standaloneCLITestables = {
   buildStandaloneUsageLines,
   createStandaloneCodexOAuthAuthorizationReceiver,

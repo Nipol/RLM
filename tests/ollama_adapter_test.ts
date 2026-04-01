@@ -4,7 +4,7 @@ import {
   OllamaGenerateAdapter,
   OllamaGenerateError,
   OllamaGenerateProvider,
-} from '../src/ollama_adapter.ts';
+} from '../src/providers/ollama_adapter.ts';
 import type { LLMCallerRequest } from '../src/llm_adapter.ts';
 
 function createRequest(overrides: Partial<LLMCallerRequest> = {}): LLMCallerRequest {
@@ -95,11 +95,15 @@ Deno.test('Ollama adapter surfaces HTTP failures with provider messages', async 
   );
 });
 
-Deno.test('Ollama adapter can use global fetch when no fetcher is provided', async () => {
+Deno.test('Ollama adapter binds the global fetch in browser-like runtimes', async () => {
   const originalFetch = globalThis.fetch;
   try {
-    globalThis.fetch = async () =>
-      new Response(
+    globalThis.fetch = (async function (this: typeof globalThis) {
+      if (this !== globalThis) {
+        throw new TypeError('Illegal invocation');
+      }
+
+      return new Response(
         JSON.stringify({
           done: true,
           response: 'FINAL("global fetch")',
@@ -109,6 +113,7 @@ Deno.test('Ollama adapter can use global fetch when no fetcher is provided', asy
           status: 200,
         },
       );
+    }) as typeof fetch;
 
     const adapter = new OllamaGenerateAdapter({
       config: {

@@ -1,4 +1,14 @@
 /**
+ * Protocol extractors for REPL code fences and explicit final-answer signals.
+ *
+ * @module
+ *
+ * @example
+ * ```ts
+ * import { extractReplCodeBlocks } from './repl_protocol.ts';
+ * ```
+ */
+/**
  * Describes one executable `repl` code fence extracted from assistant text.
  *
  * @example

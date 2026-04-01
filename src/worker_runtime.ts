@@ -1,3 +1,13 @@
+/**
+ * Worker-backed sandbox runtime used to execute REPL cells safely and persistently.
+ *
+ * @module
+ *
+ * @example
+ * ```ts
+ * import { executeCellInSandbox } from './worker_runtime.ts';
+ * ```
+ */
 import { splitTrailingExpression } from './code_guard.ts';
 import type {
   CellEntry,
@@ -906,7 +916,9 @@ function startsRegexLiteral(source: string, index: number): boolean {
     return true;
   }
 
-  if (previousChar === ')' || previousChar === ']' || previousChar === '}' || previousChar === '.') {
+  if (
+    previousChar === ')' || previousChar === ']' || previousChar === '}' || previousChar === '.'
+  ) {
     return false;
   }
 
@@ -2313,9 +2325,7 @@ export class PersistentSandboxRuntime {
           return;
         }
 
-        const envelope = isInternalRLMQueryResultEnvelope(value)
-          ? value
-          : null;
+        const envelope = isInternalRLMQueryResultEnvelope(value) ? value : null;
 
         worker.postMessage({
           queryId: message.queryId,
@@ -2426,6 +2436,9 @@ export class PersistentSandboxRuntime {
   }
 }
 
+/**
+ * Exposes worker-runtime internals for focused tests.
+ */
 export const __workerRuntimeTestables = {
   abortPendingQueryControllers,
   buildCurrentCellCode,

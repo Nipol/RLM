@@ -1,3 +1,13 @@
+/**
+ * Codex OAuth provider implementation for interactive login and provider-neutral model calls.
+ *
+ * @module
+ *
+ * @example
+ * ```ts
+ * import { CodexOAuthProvider } from './codex_oauth.ts';
+ * ```
+ */
 import type {
   LLMCaller,
   LLMCallerRequest,
@@ -972,6 +982,9 @@ function normalizeAuthRecord(
   };
 }
 
+/**
+ * Extracts the OAuth authorization code and state from a completed callback URL.
+ */
 export function extractAuthorizationCodeFromCallbackUrl(
   callbackUrl: string,
 ): CodexOAuthAuthorizationCodeResult | null {
@@ -1583,6 +1596,9 @@ export class CodexOAuthProvider implements LLMProvider<CodexOAuthCallerConfig> {
   }
 }
 
+/**
+ * Exposes Codex OAuth internals for focused unit and integration tests.
+ */
 export const __codexOAuthProviderTestables = {
   attachAbortListener,
   buildAuthorizeUrl,

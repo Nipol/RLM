@@ -1,0 +1,15 @@
+import type { TextareaHTMLAttributes } from 'react';
+
+import { cn } from '@/lib/utils.ts';
+
+export function Textarea({ className, ...props }: TextareaHTMLAttributes<HTMLTextAreaElement>) {
+  return (
+    <textarea
+      className={cn(
+        'flex min-h-[120px] w-full rounded-xl border-[1.5px] border-border bg-input px-4 py-[14px] text-sm text-foreground outline-none transition-[border-color,background-color,color,box-shadow] placeholder:text-[color:var(--metadata)] hover:border-[color:var(--field-hover-border)] focus-visible:border-foreground focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:border-[color:var(--soft-border)] disabled:bg-[color:var(--soft-surface)] disabled:text-muted-foreground',
+        className,
+      )}
+      {...props}
+    />
+  );
+}

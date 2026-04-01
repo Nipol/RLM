@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { dirname, join } from 'node:path';
 
-import { loadProviderRequestTimeoutMs, loadRLMRuntimeConfig } from '../src/env.ts';
-import { CodexOAuthProvider } from '../src/providers/codex_oauth.ts';
+import type { LLMCaller } from '../src/llm_adapter.ts';
+import { loadProviderRequestTimeoutMs, loadRLMRuntimeConfig } from '../src/standalone/env.ts';
 import { runRLM } from '../src/rlm_runner.ts';
 import type { JsonValue } from '../src/types.ts';
 
@@ -40,8 +40,32 @@ export interface CodexLiveRunOptions {
   subModel: string;
 }
 
-let cachedCodexLiveProvider: CodexOAuthProvider | null = null;
-let cachedCodexIntegrationRunOptionsPromise: Promise<CodexLiveRunOptions> | null = null;
+export interface CodexLiveProviderLike {
+  createCaller(config: { requestTimeoutMs?: number }): LLMCaller;
+  listModels(): Promise<string[]>;
+  loadAuth(): Promise<unknown | null>;
+}
+
+export interface CodexLiveHarness {
+  provider: CodexLiveProviderLike;
+  runOptions: CodexLiveRunOptions;
+}
+
+interface PermissionStatusLike {
+  state: Deno.PermissionState;
+}
+
+export interface ProbeCodexLiveProviderOptions {
+  provider: CodexLiveProviderLike;
+  queryNetPermission?: (
+    descriptor: Deno.PermissionDescriptor,
+  ) => Promise<PermissionStatusLike>;
+}
+
+export interface CodexLiveProviderAvailability {
+  enabled: boolean;
+  reason: string | null;
+}
 
 export async function createOpenAILiveJournalPath(
   suite: OpenAILiveScenarioSuite,
@@ -167,24 +191,66 @@ export function buildCodexLiveRunOptions(
   };
 }
 
-async function loadCodexIntegrationRunOptions(): Promise<CodexLiveRunOptions> {
-  if (cachedCodexIntegrationRunOptionsPromise !== null) {
-    return await cachedCodexIntegrationRunOptionsPromise;
+export async function probeCodexLiveProvider(
+  options: ProbeCodexLiveProviderOptions,
+): Promise<CodexLiveProviderAvailability> {
+  const queryNetPermission = options.queryNetPermission ??
+    ((descriptor) => Deno.permissions.query(descriptor));
+  const netPermission = await queryNetPermission({
+    name: 'net',
+    host: 'chatgpt.com',
+  });
+
+  if (netPermission.state !== 'granted') {
+    return {
+      enabled: false,
+      reason: 'chatgpt.com net permission is not granted.',
+    };
   }
 
-  cachedCodexIntegrationRunOptionsPromise = (async () => {
-    cachedCodexLiveProvider ??= new CodexOAuthProvider();
-    const availableModels = await cachedCodexLiveProvider.listModels();
-    return buildCodexLiveRunOptions({
-      availableModels,
-      maxStepsCap: 12,
-      maxSubcallDepthCap: 1,
-      minimumRequestTimeoutMs: 90_000,
-      outputCharLimitCap: 1_000,
-    });
-  })();
+  const auth = await options.provider.loadAuth();
+  if (auth === null) {
+    return {
+      enabled: false,
+      reason: 'Codex OAuth auth is missing.',
+    };
+  }
 
-  return await cachedCodexIntegrationRunOptionsPromise;
+  return {
+    enabled: true,
+    reason: null,
+  };
+}
+
+export async function loadCodexLiveHarness(
+  options: {
+    maxStepsCap?: number;
+    maxSubcallDepthCap?: number;
+    minimumRequestTimeoutMs?: number;
+    modelOverrides?: {
+      rootModel?: string;
+      subModel?: string;
+    };
+    outputCharLimitCap?: number;
+    provider: CodexLiveProviderLike;
+    requestTimeoutMs?: number;
+    runtime?: ReturnType<typeof loadRLMRuntimeConfig>;
+  },
+): Promise<CodexLiveHarness> {
+  const availableModels = await options.provider.listModels();
+  return {
+    provider: options.provider,
+    runOptions: buildCodexLiveRunOptions({
+      availableModels,
+      maxStepsCap: options.maxStepsCap,
+      maxSubcallDepthCap: options.maxSubcallDepthCap,
+      minimumRequestTimeoutMs: options.minimumRequestTimeoutMs,
+      modelOverrides: options.modelOverrides,
+      outputCharLimitCap: options.outputCharLimitCap,
+      requestTimeoutMs: options.requestTimeoutMs,
+      runtime: options.runtime,
+    }),
+  };
 }
 
 export function createDeterministicRandom(seed: number): () => number {
@@ -246,26 +312,25 @@ export async function readSubqueryJournals(journalDir: string): Promise<string[]
 
 export async function runOpenAILiveScenario(
   scenario: OpenAILiveScenario,
+  harness: CodexLiveHarness,
 ): Promise<void> {
-  cachedCodexLiveProvider ??= new CodexOAuthProvider();
-  const config = await loadCodexIntegrationRunOptions();
   const journalPath = await createOpenAILiveJournalPath(
     scenario.suite,
     scenario.journalPathName,
   );
   const result = await runRLM({
-    cellTimeoutMs: config.cellTimeoutMs,
+    cellTimeoutMs: harness.runOptions.cellTimeoutMs,
     context: scenario.context,
     journalPath,
-    llm: cachedCodexLiveProvider.createCaller({
-      requestTimeoutMs: config.requestTimeoutMs,
+    llm: harness.provider.createCaller({
+      requestTimeoutMs: harness.runOptions.requestTimeoutMs,
     }),
-    maxSteps: config.maxSteps,
-    maxSubcallDepth: config.maxSubcallDepth,
-    outputCharLimit: config.outputCharLimit,
+    maxSteps: harness.runOptions.maxSteps,
+    maxSubcallDepth: harness.runOptions.maxSubcallDepth,
+    outputCharLimit: harness.runOptions.outputCharLimit,
     prompt: scenario.prompt,
-    rootModel: config.rootModel,
-    subModel: config.subModel,
+    rootModel: harness.runOptions.rootModel,
+    subModel: harness.runOptions.subModel,
   });
 
   const normalizedAnswer = scenario.normalizeAnswer?.(result.answer) ?? result.answer;

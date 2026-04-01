@@ -1,50 +1,54 @@
 import assert from 'node:assert/strict';
 
+import { CodexOAuthProvider } from '../src/providers/codex_oauth.ts';
 import {
   buildLongContextEvaluatorOptions,
+  LONG_CONTEXT_BENCHMARK_CAPS,
   LONG_CONTEXT_SCENARIO_FACTORIES,
   runLongContextScenario,
 } from './openai_long_context_benchmark_support.ts';
-import { buildCodexLiveRunOptions } from './openai_live_scenario_support.ts';
-import { CodexOAuthProvider } from '../src/providers/codex_oauth.ts';
+import {
+  loadCodexLiveHarness,
+  probeCodexLiveProvider,
+} from './openai_live_scenario_support.ts';
 
-let cachedEvaluatorModel: string | null = null;
+const evaluatorProvider = new CodexOAuthProvider();
+const evaluatorAvailability = await probeCodexLiveProvider({
+  provider: evaluatorProvider,
+});
+let cachedEvaluatorHarnessPromise:
+  | ReturnType<typeof loadCodexLiveHarness>
+  | null = null;
 
-async function loadEvaluatorModel(): Promise<string> {
-  if (cachedEvaluatorModel !== null) {
-    return cachedEvaluatorModel;
-  }
-
-  const provider = new CodexOAuthProvider();
-  const availableModels = await provider.listModels();
-  const config = buildCodexLiveRunOptions({
-    availableModels,
-    maxStepsCap: 12,
-    maxSubcallDepthCap: 1,
-    minimumRequestTimeoutMs: 180_000,
-    outputCharLimitCap: 1_200,
+function loadEvaluatorHarness() {
+  cachedEvaluatorHarnessPromise ??= loadCodexLiveHarness({
+    ...LONG_CONTEXT_BENCHMARK_CAPS,
+    provider: evaluatorProvider,
   });
-  cachedEvaluatorModel = config.subModel;
-  return cachedEvaluatorModel;
+  return cachedEvaluatorHarnessPromise;
 }
 
 for (const { createScenario, summaryLabel } of LONG_CONTEXT_SCENARIO_FACTORIES) {
-  Deno.test(`live long-context benchmark with evaluator ${summaryLabel}`, async () => {
-    const scenario = await createScenario();
-    const evaluatorModel = await loadEvaluatorModel();
-    const outcome = await runLongContextScenario(scenario, {
-      evaluator: buildLongContextEvaluatorOptions({
-        subModel: evaluatorModel,
-      }),
-      variant: 'evaluator',
-    });
+  Deno.test({
+    name: `live long-context benchmark with evaluator ${summaryLabel}`,
+    ignore: !evaluatorAvailability.enabled,
+    fn: async () => {
+      const harness = await loadEvaluatorHarness();
+      const scenario = await createScenario({ rootModel: harness.runOptions.rootModel });
+      const outcome = await runLongContextScenario(scenario, harness, {
+        evaluator: buildLongContextEvaluatorOptions({
+          subModel: harness.runOptions.subModel,
+        }),
+        variant: 'evaluator',
+      });
 
-    assert.equal(
-      outcome.passed,
-      true,
-      outcome.error ?? `${scenario.summaryLabel} failed without an explicit error.`,
-    );
-    assert.ok(outcome.contextWords > 0);
-    assert.equal(outcome.variant, 'evaluator');
+      assert.equal(
+        outcome.passed,
+        true,
+        outcome.error ?? `${scenario.summaryLabel} failed without an explicit error.`,
+      );
+      assert.ok(outcome.contextWords > 0);
+      assert.equal(outcome.variant, 'evaluator');
+    },
   });
 }

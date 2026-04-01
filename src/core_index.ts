@@ -1,3 +1,13 @@
+/**
+ * Internal core re-export surface used by the published `@yoonsung/rlm/core` entrypoint.
+ *
+ * @module
+ *
+ * @example
+ * ```ts
+ * import { ReplSession } from './core_index.ts';
+ * ```
+ */
 export { ReplSession } from './repl_session.ts';
 export { createDefaultExecutionBackend, WorkerExecutionBackend } from './execution_backend.ts';
 export { InMemoryRLMLogger, NullRLMLogger } from './logger.ts';

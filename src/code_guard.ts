@@ -1,3 +1,13 @@
+/**
+ * Runnable-code validation helpers for the RLM REPL.
+ *
+ * @module
+ *
+ * @example
+ * ```ts
+ * import { assertCodeIsRunnable } from './code_guard.ts';
+ * ```
+ */
 const RESERVED_IDENTIFIERS = [
   'FINAL',
   'FINAL_VAR',
@@ -337,6 +347,9 @@ export function splitTrailingExpression(
   return { body: trimmed, expression: null };
 }
 
+/**
+ * Exposes internal code-guard helpers for focused unit tests.
+ */
 export const __codeGuardTestables = {
   assertNoModuleSyntax,
   assertNoReservedIdentifierOverride,

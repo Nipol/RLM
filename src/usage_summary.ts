@@ -1,3 +1,13 @@
+/**
+ * Usage-summary builders and aggregators for provider-neutral token accounting.
+ *
+ * @module
+ *
+ * @example
+ * ```ts
+ * import { createUsageSummary } from './usage_summary.ts';
+ * ```
+ */
 import type { LLMUsage } from './llm_adapter.ts';
 import type { ModelUsageSummary, RLMUsageSummary } from './types.ts';
 

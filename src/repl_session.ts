@@ -1,3 +1,13 @@
+/**
+ * REPL session orchestration for persistent code execution inside RLM runs.
+ *
+ * @module
+ *
+ * @example
+ * ```ts
+ * import { ReplSession } from './repl_session.ts';
+ * ```
+ */
 import { assertCodeIsRunnable } from './code_guard.ts';
 import { createDefaultExecutionBackend } from './execution_backend.ts';
 import { resolveRLMLogger } from './logger.ts';
@@ -82,6 +92,9 @@ function normalizeTimeout(timeoutMs: number | undefined): number {
   return resolved;
 }
 
+/**
+ * Exposes REPL session helpers for isolated tests.
+ */
 export const __replSessionTestables = {
   appendErrorToStderr,
   createErrorSnapshot,

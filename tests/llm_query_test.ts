@@ -7,6 +7,7 @@ import type {
   LLMCallerResponse,
 } from '../src/llm_adapter.ts';
 import {
+  buildLLMQuerySystemPrompt,
   createLLMQueryHandler,
   createRLMQueryHandler,
   createSubqueryJournalPath,
@@ -53,6 +54,18 @@ function createDeferred<T>() {
   return { promise, reject, resolve };
 }
 
+function assertRLMQueryResultEnvelope(
+  actual: unknown,
+  expectedValue: JsonValue,
+  expectedStdout?: string,
+): void {
+  assert.deepEqual(actual, {
+    __rlmQueryResultEnvelope: true,
+    stdout: expectedStdout,
+    value: expectedValue,
+  });
+}
+
 Deno.test('llm_query forwards prompts into plain sub-model completions', async () => {
   const llm = new MockCaller([
     {
@@ -92,7 +105,7 @@ Deno.test('llm_query forwards prompts into plain sub-model completions', async (
     depth: 0,
     queryIndex: 0,
   });
-  assert.match(llm.requests[0]?.systemPrompt ?? '', /plain language model subcall/u);
+  assert.equal(llm.requests[0]?.systemPrompt, buildLLMQuerySystemPrompt());
   assert.match(llm.requests[0]?.input ?? '', /solve 6 \* 7/u);
   assert.deepEqual(captured, [
     {
@@ -181,7 +194,7 @@ Deno.test('rlm_query forwards delegated prompts into nested RLM runs with narrow
 
   const answer = await handler('solve 6 * 7');
 
-  assert.deepEqual(answer, { answer: 42 });
+  assertRLMQueryResultEnvelope(answer, { answer: 42 });
   assert.deepEqual(calls, [
     {
       context: {
@@ -220,7 +233,7 @@ Deno.test('rlm_query parses JSON delegated prompts into narrowed child payloads'
   });
   const answer = await handler(delegatedPrompt);
 
-  assert.equal(answer, 'ok');
+  assertRLMQueryResultEnvelope(answer, 'ok');
   assert.deepEqual(capturedContext, {
     payload: {
       candidates: [{ profile: 'orion', vaultKey: 'V-554' }],
@@ -253,7 +266,7 @@ Deno.test('rlm_query uses an explicit delegated task field when the narrowed pro
   });
   const answer = await handler(delegatedPrompt);
 
-  assert.equal(answer, 'V-554');
+  assertRLMQueryResultEnvelope(answer, 'V-554');
   assert.deepEqual(capturedContext, {
     payload: {
       candidates: [{ profile: 'orion', vaultKey: 'V-554' }],
@@ -359,7 +372,7 @@ Deno.test('rlm_query accepts direct delegation objects with optional expect cont
       'Return only the vaultKey string for the active primary dispatch dossier of profile "orion".',
   });
 
-  assert.equal(answer, 'V-554');
+  assertRLMQueryResultEnvelope(answer, 'V-554');
   assert.equal(
     capturedPrompt,
     'Return only the vaultKey string for the active primary dispatch dossier of profile "orion".',
@@ -406,7 +419,7 @@ Deno.test('rlm_query normalizes shorthand object expect contracts before the chi
     task: 'Return the vaultKey object.',
   });
 
-  assert.deepEqual(answer, { vaultKey: 'V-554' });
+  assertRLMQueryResultEnvelope(answer, { vaultKey: 'V-554' });
   assert.deepEqual(capturedContext, {
     expect: {
       fields: {
@@ -450,7 +463,7 @@ Deno.test('rlm_query normalizes scalar string expect shorthands into scalar cont
     task: 'Return only the vaultKey string.',
   });
 
-  assert.equal(answer, 'V-554');
+  assertRLMQueryResultEnvelope(answer, 'V-554');
   assert.deepEqual(capturedContext, {
     expect: {
       type: 'string',
@@ -490,7 +503,7 @@ Deno.test('rlm_query normalizes string field shorthands into field-based scalar 
     task: 'Return an object containing vaultKey.',
   });
 
-  assert.equal(answer, 'V-554');
+  assertRLMQueryResultEnvelope(answer, 'V-554');
   assert.deepEqual(capturedContext, {
     expect: {
       field: 'vaultKey',
@@ -527,7 +540,7 @@ Deno.test('rlm_query extracts a scalar field when field-based scalar expect rece
     task: 'Return the vaultKey field.',
   });
 
-  assert.equal(answer, 'V-554');
+  assertRLMQueryResultEnvelope(answer, 'V-554');
 });
 
 Deno.test('rlm_query wraps a scalar value into a single-field object contract when requested', async () => {
@@ -553,7 +566,7 @@ Deno.test('rlm_query wraps a scalar value into a single-field object contract wh
     task: 'Return an object containing vaultKey.',
   });
 
-  assert.deepEqual(answer, { vaultKey: 'V-554' });
+  assertRLMQueryResultEnvelope(answer, { vaultKey: 'V-554' });
 });
 
 Deno.test('rlm_query wraps a scalar number into a single-field object contract when requested', async () => {
@@ -579,7 +592,7 @@ Deno.test('rlm_query wraps a scalar number into a single-field object contract w
     task: 'Return an object containing index.',
   });
 
-  assert.deepEqual(answer, { index: 3 });
+  assertRLMQueryResultEnvelope(answer, { index: 3 });
 });
 
 Deno.test('rlm_query rejects a delegated selection that ignores positive selector hints', async () => {
@@ -636,7 +649,7 @@ Deno.test('rlm_query accepts a delegated selection that matches the hinted posit
     task: 'Return an object containing vaultKey.',
   });
 
-  assert.deepEqual(answer, { vaultKey: 'V-554' });
+  assertRLMQueryResultEnvelope(answer, { vaultKey: 'V-554' });
 });
 
 Deno.test('rlm_query rejects child values that violate scalar expect contracts', async () => {
@@ -789,7 +802,7 @@ Deno.test('rlm_query defaults the starting depth to zero when the parent run omi
 
   const answer = await handler('start from zero');
 
-  assert.equal(answer, 'ok');
+  assertRLMQueryResultEnvelope(answer, 'ok');
   assert.deepEqual(calls, [1]);
 });
 
@@ -833,11 +846,11 @@ Deno.test('rlm_query serializes sibling nested runs instead of starting them in 
   assert.deepEqual(started, ['first prompt']);
 
   first.resolve({ answer: 'first', steps: 1, usage: createUsageSummary(), value: 'first' });
-  assert.equal(await firstAnswerPromise, 'first');
+  assertRLMQueryResultEnvelope(await firstAnswerPromise, 'first');
 
   await flushMicrotasks(2);
   assert.deepEqual(started, ['first prompt', 'second prompt']);
 
   second.resolve({ answer: 'second', steps: 1, usage: createUsageSummary(), value: 'second' });
-  assert.equal(await secondAnswerPromise, 'second');
+  assertRLMQueryResultEnvelope(await secondAnswerPromise, 'second');
 });

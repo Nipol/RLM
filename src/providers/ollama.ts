@@ -1,13 +1,26 @@
+/**
+ * Ollama convenience entrypoints that adapt the provider-neutral core into packaged clients.
+ *
+ * @module
+ *
+ * @example
+ * ```ts
+ * import { createOllamaRLM } from './ollama.ts';
+ * ```
+ */
 import type { RLMClient, RLMDefaults, RLMRunInput } from '../library_entrypoint.ts';
 import { resolveRLMLogger } from '../logger.ts';
-import { OllamaGenerateProvider } from '../ollama_adapter.ts';
-import type { OllamaProviderConfig } from '../ollama_adapter.ts';
+import { OllamaGenerateProvider } from './ollama_adapter.ts';
+import type { OllamaProviderConfig } from './ollama_adapter.ts';
 import { createRLM } from '../rlm_runner.ts';
 import type { RLMRunResult } from '../rlm_runner.ts';
 import type { ExecutionBackend, RLMLogger } from '../types.ts';
 
 const DEFAULT_CELL_TIMEOUT_MS = 5_000;
 
+/**
+ * Configures a packaged Ollama-backed RLM client.
+ */
 export interface OllamaRLMClientOptions {
   clock?: () => Date;
   defaults?: RLMDefaults;
@@ -16,8 +29,12 @@ export interface OllamaRLMClientOptions {
   idGenerator?: () => string;
   logger?: RLMLogger;
   ollama: OllamaProviderConfig;
+  systemPromptExtension?: string;
 }
 
+/**
+ * Configures a one-shot Ollama-backed RLM execution.
+ */
 export interface RunOllamaRLMOptions extends RLMRunInput {
   clock?: () => Date;
   executionBackend?: ExecutionBackend;
@@ -45,6 +62,9 @@ function resolveOllamaRunLogger(
   }));
 }
 
+/**
+ * Creates an RLM client backed by the Ollama generate API.
+ */
 export function createOllamaRLM(options: OllamaRLMClientOptions): RLMClient {
   const provider = new OllamaGenerateProvider({
     fetcher: options.fetcher,
@@ -70,6 +90,7 @@ export function createOllamaRLM(options: OllamaRLMClientOptions): RLMClient {
       root: options.ollama.rootModel,
       sub: options.ollama.subModel,
     },
+    systemPromptExtension: options.systemPromptExtension,
   });
 
   return {
@@ -87,6 +108,9 @@ export function createOllamaRLM(options: OllamaRLMClientOptions): RLMClient {
   };
 }
 
+/**
+ * Runs a single Ollama-backed RLM invocation without manually constructing a client.
+ */
 export async function runOllamaRLM(options: RunOllamaRLMOptions): Promise<RLMRunResult> {
   const client = createOllamaRLM({
     clock: options.clock,
@@ -114,6 +138,9 @@ export async function runOllamaRLM(options: RunOllamaRLMOptions): Promise<RLMRun
   });
 }
 
+/**
+ * Exposes Ollama convenience-layer helpers for isolated tests.
+ */
 export const __ollamaProviderTestables = {
   resolveOllamaRunLogger,
   resolveProviderAwareCellTimeoutMs,
@@ -123,9 +150,9 @@ export {
   OllamaGenerateAdapter,
   OllamaGenerateError,
   OllamaGenerateProvider,
-} from '../ollama_adapter.ts';
+} from './ollama_adapter.ts';
 export type {
   OllamaGenerateAdapterOptions,
   OllamaGenerateProviderOptions,
   OllamaProviderConfig,
-} from '../ollama_adapter.ts';
+} from './ollama_adapter.ts';

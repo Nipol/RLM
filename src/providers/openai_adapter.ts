@@ -1,7 +1,30 @@
-import type { OpenAIProviderConfig } from './env.ts';
-import type { LLMCaller, LLMCallerRequest, LLMCallerResponse, LLMProvider } from './llm_adapter.ts';
+/**
+ * OpenAI Responses API adapters that satisfy the provider-neutral caller contract.
+ *
+ * @module
+ *
+ * @example
+ * ```ts
+ * import { OpenAIResponsesProvider } from './openai_adapter.ts';
+ * ```
+ */
+import type {
+  LLMCaller,
+  LLMCallerRequest,
+  LLMCallerResponse,
+  LLMProvider,
+} from '../llm_adapter.ts';
+import type { OpenAIProviderConfig, OpenAIReasoningEffort } from './openai_config.ts';
 
 type FetchLike = typeof fetch;
+
+function resolveFetcher(fetcher: FetchLike | undefined): FetchLike {
+  if (fetcher !== undefined) {
+    return fetcher;
+  }
+
+  return globalThis.fetch.bind(globalThis);
+}
 
 interface OpenAIUsagePayload {
   input_tokens_details?: {
@@ -30,6 +53,10 @@ interface OpenAIResponsePayload {
   output?: OpenAIMessagePayload[];
   output_text?: string;
   usage?: OpenAIUsagePayload;
+}
+
+interface OpenAIReasoningRequestPayload {
+  effort?: OpenAIReasoningEffort;
 }
 
 /**
@@ -185,6 +212,17 @@ function cleanupCompletionRequest(
   detachAbortListener(signal, handleExternalAbort);
 }
 
+function resolveReasoningEffortForRequest(
+  config: OpenAIProviderConfig,
+  request: LLMCallerRequest,
+): OpenAIReasoningEffort | undefined {
+  if (request.kind === 'root_turn') {
+    return config.rootReasoningEffort;
+  }
+
+  return config.subReasoningEffort;
+}
+
 /**
  * Implements the provider-neutral adapter interface on top of the OpenAI Responses API.
  *
@@ -224,12 +262,7 @@ export class OpenAIResponsesAdapter implements LLMCaller {
    */
   constructor(options: OpenAIResponsesAdapterOptions) {
     this.#config = options.config;
-    if (options.fetcher === undefined) {
-      this.#fetcher = fetch;
-      return;
-    }
-
-    this.#fetcher = options.fetcher;
+    this.#fetcher = resolveFetcher(options.fetcher);
   }
 
   /**
@@ -251,11 +284,17 @@ export class OpenAIResponsesAdapter implements LLMCaller {
     attachAbortListener(request.signal, controller, handleExternalAbort);
 
     try {
-      const requestBody: Record<string, string> = {
+      const requestBody: Record<string, unknown> = {
         input: request.input,
         instructions: request.systemPrompt,
         model: request.model,
       };
+      const reasoningEffort = resolveReasoningEffortForRequest(this.#config, request);
+      if (reasoningEffort !== undefined) {
+        requestBody.reasoning = {
+          effort: reasoningEffort,
+        } satisfies OpenAIReasoningRequestPayload;
+      }
       if (typeof request.turnState === 'string' && request.turnState.length > 0) {
         requestBody.previous_response_id = request.turnState;
       }
@@ -375,8 +414,13 @@ export class OpenAIResponsesProvider implements LLMProvider<OpenAIProviderConfig
   }
 }
 
+/**
+ * Exposes OpenAI adapter internals for focused unit tests.
+ */
 export const __openAIAdapterTestables = {
   attachAbortListener,
   cleanupCompletionRequest,
   detachAbortListener,
+  resolveFetcher,
+  resolveReasoningEffortForRequest,
 };

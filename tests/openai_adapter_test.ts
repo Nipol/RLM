@@ -5,7 +5,7 @@ import {
   OpenAIResponsesAdapter,
   OpenAIResponsesError,
   OpenAIResponsesProvider,
-} from '../src/openai_adapter.ts';
+} from '../src/providers/openai_adapter.ts';
 import type { LLMCallerRequest } from '../src/llm_adapter.ts';
 
 function createRequest(overrides: Partial<LLMCallerRequest> = {}): LLMCallerRequest {
@@ -16,6 +16,14 @@ function createRequest(overrides: Partial<LLMCallerRequest> = {}): LLMCallerRequ
     systemPrompt: 'Use the REPL.',
     ...overrides,
   };
+}
+
+function readRequestBody(init: unknown): Record<string, unknown> {
+  if (typeof init !== 'object' || init === null) {
+    return {};
+  }
+
+  return JSON.parse(String((init as { body?: BodyInit | null }).body ?? '{}')) as Record<string, unknown>;
 }
 
 Deno.test('OpenAI adapter posts model instructions and input to the Responses API', async () => {
@@ -86,6 +94,76 @@ Deno.test('OpenAI adapter posts model instructions and input to the Responses AP
     outputTokens: 5,
     totalTokens: 15,
   });
+});
+
+Deno.test('OpenAI adapter forwards root and sub reasoning effort based on the request kind', async () => {
+  const payloads: Array<Record<string, unknown>> = [];
+  const adapter = new OpenAIResponsesAdapter({
+    config: {
+      apiKey: 'sk-test',
+      baseUrl: 'https://api.openai.com/v1',
+      requestTimeoutMs: 30_000,
+      rootModel: 'gpt-5',
+      rootReasoningEffort: 'high',
+      subModel: 'gpt-5-mini',
+      subReasoningEffort: 'minimal',
+    },
+    fetcher: async (_input, init) => {
+      payloads.push(readRequestBody(init));
+
+      return new Response(
+        JSON.stringify({
+          id: 'resp_reasoning_1',
+          output_text: 'FINAL("ok")',
+        }),
+        {
+          headers: { 'Content-Type': 'application/json' },
+          status: 200,
+        },
+      );
+    },
+  });
+
+  await adapter.complete(createRequest({
+    kind: 'root_turn',
+    model: 'gpt-5',
+  }));
+  await adapter.complete(createRequest({
+    kind: 'child_turn',
+    model: 'gpt-5-mini',
+  }));
+  await adapter.complete(createRequest({
+    input: 'ping',
+    kind: 'plain_query',
+    model: 'gpt-5-mini',
+  }));
+
+  assert.deepEqual(payloads, [
+    {
+      input: 'Solve the task.',
+      instructions: 'Use the REPL.',
+      model: 'gpt-5',
+      reasoning: {
+        effort: 'high',
+      },
+    },
+    {
+      input: 'Solve the task.',
+      instructions: 'Use the REPL.',
+      model: 'gpt-5-mini',
+      reasoning: {
+        effort: 'minimal',
+      },
+    },
+    {
+      input: 'ping',
+      instructions: 'Use the REPL.',
+      model: 'gpt-5-mini',
+      reasoning: {
+        effort: 'minimal',
+      },
+    },
+  ]);
 });
 
 Deno.test('OpenAI adapter surfaces API failures with the provider message intact', async () => {
@@ -452,12 +530,16 @@ Deno.test('OpenAI adapter falls back from empty output_text and treats payload-l
   );
 });
 
-Deno.test('OpenAI adapter can use the global fetch and skip message items without content', async () => {
+Deno.test('OpenAI adapter binds the global fetch in browser-like runtimes and skips message items without content', async () => {
   const originalFetch = globalThis.fetch;
 
   try {
-    globalThis.fetch = async () =>
-      new Response(
+    globalThis.fetch = (async function (this: typeof globalThis) {
+      if (this !== globalThis) {
+        throw new TypeError('Illegal invocation');
+      }
+
+      return new Response(
         JSON.stringify({
           id: 'resp_global_1',
           output: [
@@ -480,6 +562,7 @@ Deno.test('OpenAI adapter can use the global fetch and skip message items withou
           status: 200,
         },
       );
+    }) as typeof fetch;
 
     const adapter = new OpenAIResponsesAdapter({
       config: {
