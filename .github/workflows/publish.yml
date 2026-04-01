@@ -15,8 +15,5 @@ jobs:
       - name: Set up Deno 2
         uses: denoland/setup-deno@v2
 
-      - name: Set version # Get the version from the release tag and update in [config].json
-        uses: maks11060/deno-publish-version@v2
-
       - name: Publish to JSR
         run: deno publish --allow-dirty
