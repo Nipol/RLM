@@ -133,16 +133,50 @@ export interface LLMProvider<Config = unknown> {
 }
 
 /**
+ * Backward-compatible alias for the provider-neutral request shape.
+ *
  * @deprecated Use `LLMCallerRequest`.
+ *
+ * @example
+ * ```ts
+ * const request: LLMCompletionRequest = {
+ *   input: 'Summarize the chapter.',
+ *   kind: 'root_turn',
+ *   model: 'demo-root',
+ *   systemPrompt: 'Use concise Korean.',
+ * };
+ * ```
  */
 export type LLMCompletionRequest = LLMCallerRequest;
 
 /**
+ * Backward-compatible alias for the provider-neutral completion payload.
+ *
  * @deprecated Use `LLMCallerResponse`.
+ *
+ * @example
+ * ```ts
+ * const response: LLMCompletionResponse = {
+ *   outputText: '```repl\\nFINAL_VAR(\"ok\")\\n```',
+ * };
+ * ```
  */
 export type LLMCompletionResponse = LLMCallerResponse;
 
 /**
+ * Backward-compatible alias for the provider-neutral caller interface.
+ *
  * @deprecated Use `LLMCaller`.
+ *
+ * @example
+ * ```ts
+ * const adapter: LLMAdapter = {
+ *   async complete() {
+ *     return {
+ *       outputText: '```repl\\nFINAL_VAR(\"ok\")\\n```',
+ *     };
+ *   },
+ * };
+ * ```
  */
 export type LLMAdapter = LLMCaller;

@@ -48,11 +48,25 @@ async function collectPublishedTypeScriptFiles(): Promise<string[]> {
 
 function findPrecedingJsdoc(source: string, declarationIndex: number): string | null {
   const precedingSource = source.slice(0, declarationIndex);
-  const match = precedingSource.match(/\/\*\*[\s\S]*?\*\/\s*$/u);
-  return match?.[0] ?? null;
+  const matches = [...precedingSource.matchAll(/\/\*\*[\s\S]*?\*\//gu)];
+  if (matches.length === 0) {
+    return null;
+  }
+
+  const lastMatch = matches.at(-1);
+  if (lastMatch === undefined) {
+    return null;
+  }
+
+  const trailingWhitespace = precedingSource.slice((lastMatch.index ?? 0) + lastMatch[0].length);
+  if (trailingWhitespace.trim().length > 0) {
+    return null;
+  }
+
+  return lastMatch[0];
 }
 
-Deno.test('published TypeScript files include module docs and example-bearing JSDoc on declarations', async () => {
+Deno.test('published TypeScript files include module docs and standalone symbol docs on declarations', async () => {
   const files = await collectPublishedTypeScriptFiles();
   const failures: string[] = [];
 
@@ -71,6 +85,16 @@ Deno.test('published TypeScript files include module docs and example-bearing JS
       if (jsdoc === null) {
         failures.push(`${label}: missing JSDoc for "${declaration}".`);
         continue;
+      }
+
+      const plainTextLines = jsdoc
+        .replace(/^\/\*\*|\*\/$/gu, '')
+        .split('\n')
+        .map((line) => line.replace(/^\s*\*\s?/u, '').trim())
+        .filter((line) => line.length > 0 && !line.startsWith('@'));
+
+      if (plainTextLines.length === 0) {
+        failures.push(`${label}: symbol doc for "${declaration}" is missing descriptive text.`);
       }
     }
   }
