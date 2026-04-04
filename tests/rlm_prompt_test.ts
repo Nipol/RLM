@@ -33,6 +33,35 @@ Deno.test('system prompts load from embedded markdown source and render injected
   assert.match(injectedPrompt, /동적 프롬프트입니다\./u);
 });
 
+Deno.test('system prompt injects runtime helper markdown blocks directly below FINAL_VAR guidance', async () => {
+  const prompt = await buildRLMSystemPrompt({
+    runtimeHelperPromptBlocks: [
+      [
+        '- `aot(question)`',
+        '  - 복잡한 질의를 atom 단위로 분해하고 축소된 질문을 반환합니다.',
+      ].join('\n'),
+      [
+        '- `aot_status()`',
+        '  - 현재 AoT helper의 축소 상태를 요약합니다.',
+      ].join('\n'),
+      '   ',
+    ],
+  });
+
+  const finalVarIndex = prompt.indexOf('- `FINAL_VAR(value)`');
+  const aotIndex = prompt.indexOf('- `aot(question)`');
+  const aotStatusIndex = prompt.indexOf('- `aot_status()`');
+  const nextSectionIndex = prompt.indexOf('**`llm_query`와 `rlm_query`를 구분해 사용하는 기준:**');
+
+  assert.notEqual(finalVarIndex, -1);
+  assert.notEqual(aotIndex, -1);
+  assert.notEqual(aotStatusIndex, -1);
+  assert.notEqual(nextSectionIndex, -1);
+  assert(aotIndex > finalVarIndex);
+  assert(aotStatusIndex > aotIndex);
+  assert(nextSectionIndex > aotStatusIndex);
+});
+
 Deno.test('surfaced execution feedback renders as plain-text transcript sections', () => {
   const record = __rlmPromptTestables.buildExecutionFeedbackText(
     2,

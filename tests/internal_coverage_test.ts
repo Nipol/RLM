@@ -54,6 +54,22 @@ Deno.test('llm_query helpers cover payload parsing, contract normalization, and 
 
   assert.equal(__llmQueryTestables.parseDelegatedPayload('not json'), undefined);
   assert.deepEqual(__llmQueryTestables.parseDelegatedPayload('{"answer":42}'), { answer: 42 });
+  assert.equal(__llmQueryTestables.buildQueryTracePromptPreview(' short '), 'short');
+  assert.equal(
+    __llmQueryTestables.buildQueryTracePromptPreview('A'.repeat(300)).length,
+    240,
+  );
+  assert.equal(
+    __llmQueryTestables.extractQueryTracePromptTag('AOT_STEP\nquestion'),
+    'AOT_STEP',
+  );
+  assert.equal(
+    __llmQueryTestables.extractQueryTracePromptTag('AoT mixed case\nquestion'),
+    undefined,
+  );
+  assert.equal(__llmQueryTestables.normalizeQueryTraceMaxSteps(undefined), undefined);
+  assert.equal(__llmQueryTestables.normalizeQueryTraceMaxSteps(12), 12);
+  assert.equal(__llmQueryTestables.normalizeQueryTraceMaxSteps(Number.POSITIVE_INFINITY), 'unbounded');
   assert.deepEqual(
     __llmQueryTestables.buildDelegatedChildPayload(undefined, { answer: 42 }),
     { answer: 42 },
@@ -114,6 +130,22 @@ Deno.test('llm_query helpers cover payload parsing, contract normalization, and 
   assert.throws(
     () => __llmQueryTestables.normalizeExpectContract('task', ''),
     RLMSubqueryContractError,
+  );
+  assert.throws(
+    () => __llmQueryTestables.normalizeDelegatedMaxSubcallDepth(0),
+    /positive integer maxSubcallDepth/u,
+  );
+  assert.throws(
+    () => __llmQueryTestables.normalizeDelegatedMaxSubcallDepth(1.5),
+    /positive integer maxSubcallDepth/u,
+  );
+  assert.throws(
+    () => __llmQueryTestables.normalizeDelegatedMaxSteps(0),
+    /positive integer maxSteps/u,
+  );
+  assert.throws(
+    () => __llmQueryTestables.normalizeDelegatedMaxSteps(1.5),
+    /positive integer maxSteps/u,
   );
   assert.throws(
     () => __llmQueryTestables.normalizeExpectContract('task', 42 as never),
@@ -580,6 +612,16 @@ Deno.test('llm_query helpers cover scalar selection extraction and delegated val
 
 Deno.test('rlm prompt helpers cover summaries, previews, and current prompt formatting', () => {
   assert.equal(
+    __rlmPromptTestables.formatPromptSections([
+      { lines: ['alpha'] },
+      { lines: ['beta', 'gamma'], title: 'Section' },
+      { lines: ['delta'], title: '' },
+    ]),
+    'alpha\n\nSection\nbeta\ngamma\n\ndelta',
+  );
+  assert.equal(__rlmPromptTestables.formatExecutionSignals(undefined), null);
+  assert.equal(__rlmPromptTestables.formatExecutionSignals([]), null);
+  assert.equal(
     __rlmPromptTestables.summarizeString('context', ''),
     'context: string (0 chars, 0 words)',
   );
@@ -636,6 +678,13 @@ Deno.test('rlm prompt helpers cover summaries, previews, and current prompt form
     __rlmPromptTestables.summarizeTopLevelValue('register', { alpha: {} }),
     'register: 객체 (1개 키: alpha; 예시 값 키: (없음))',
   );
+  assert.match(
+    __rlmPromptTestables.summarizeTopLevelValue('deduped', {
+      left: { shared: 1, alpha: 2 },
+      right: { shared: 3, beta: 4 },
+    }),
+    /예시 값 키: shared, alpha, beta/u,
+  );
   assert.doesNotMatch(
     __rlmPromptTestables.summarizeTopLevelValue('context', {
       a: { a1: 1, a2: 2, a3: 3 },
@@ -656,8 +705,21 @@ Deno.test('rlm prompt helpers cover summaries, previews, and current prompt form
     __rlmPromptTestables.buildContextSummary({ title: 'Book' }),
     /- title: string/u,
   );
+  assert.match(
+    __rlmPromptTestables.buildExecutionFeedbackText(2, 1, {
+      code: 'const answer = 42;\nanswer',
+      finalAnswer: null,
+      resultPreview: '42',
+      resultSignals: [{ kind: 'number', path: 'answer', preview: '42' }],
+      status: 'success',
+      stderr: '',
+      stdout: '',
+    }, 120),
+    /실행: 1/u,
+  );
   assert.equal(__rlmPromptTestables.buildContextPreviews(null), null);
   assert.equal(__rlmPromptTestables.buildContextPreviews(42 as never), null);
+  assert.equal(__rlmPromptTestables.buildContextPreviews({ short: 'tiny' }), null);
   assert.match(
     __rlmPromptTestables.buildContextPreviews('token '.repeat(25_000)) ?? '',
     /context 앞부분 미리보기/u,
@@ -693,6 +755,8 @@ Deno.test('rlm prompt helpers cover summaries, previews, and current prompt form
   assert.equal(__rlmPromptTestables.isLargeContextValue('tiny'), false);
   assert.equal(__rlmPromptTestables.isLargeContextValue('token '.repeat(25_000)), true);
   assert.equal(__rlmPromptTestables.isLargeContextValue(new Array(2_000).fill(1)), true);
+  assert.equal(__rlmPromptTestables.isLargeContextValue({ nope: true } as never), false);
+  assert.equal(__rlmPromptTestables.isLargeContext(null), false);
   assert.equal(__rlmPromptTestables.isLargeContext('token '.repeat(25_000) as never), true);
   assert.equal(__rlmPromptTestables.isLargeContext(new Array(2_000).fill(1) as never), true);
   assert.equal(__rlmPromptTestables.isLargeContext(42 as never), false);
@@ -710,6 +774,22 @@ Deno.test('rlm prompt helpers cover summaries, previews, and current prompt form
       transcript: [],
     }),
     /## 위임된 증거 안내/u,
+  );
+  assert.match(
+    buildRLMTurnInput({
+      context: {
+        expect: { answer: 'string' },
+        payload: { rows: [{ active: true, code: 'A-1' }] },
+        task: 'Child payload task',
+      },
+      currentStep: 2,
+      outputCharLimit: 120,
+      prompt: 'Child prompt',
+      role: 'child',
+      totalSteps: 4,
+      transcript: [],
+    }),
+    /context\.expect/u,
   );
 });
 
@@ -847,4 +927,31 @@ Deno.test('worker runtime helpers cover stale worker detection and pending-query
   assert.equal(secondController.signal.aborted, false);
   assert.equal(pendingControllers.has(1), false);
   assert.equal(pendingControllers.has(2), true);
+});
+
+Deno.test('worker runtime helper internals cover regex-literal heuristics and default helper input kinds', () => {
+  assert.equal(__workerRuntimeTestables.startsRegexLiteral('/abc/', 0), true);
+  assert.equal(__workerRuntimeTestables.startsRegexLiteral('value / other', 6), false);
+  assert.equal(__workerRuntimeTestables.startsRegexLiteral('return /abc/', 7), true);
+  assert.equal(__workerRuntimeTestables.startsRegexLiteral('items[0] / 2', 9), false);
+  assert.equal(__workerRuntimeTestables.startsRegexLiteral('value // comment', 6), false);
+  assert.equal(__workerRuntimeTestables.startsRegexLiteral('value /* comment */', 6), false);
+
+  assert.deepEqual(
+    __workerRuntimeTestables.buildRuntimeHelperAllowedInputKinds({
+      description: 'default',
+      name: 'default_helper',
+      source: 'input',
+    }),
+    ['text'],
+  );
+  assert.deepEqual(
+    __workerRuntimeTestables.buildRuntimeHelperAllowedInputKinds({
+      description: 'explicit',
+      inputKinds: ['object', 'array'],
+      name: 'explicit_helper',
+      source: 'input',
+    }),
+    ['object', 'array'],
+  );
 });

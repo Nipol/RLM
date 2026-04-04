@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { dirname, join } from 'node:path';
 
 import type { LLMCaller } from '../src/llm_adapter.ts';
-import { loadProviderRequestTimeoutMs, loadRLMRuntimeConfig } from '../src/standalone/env.ts';
+import { loadProviderRequestTimeoutMs, loadRLMRuntimeConfig } from '../examples/standalone/env.ts';
 import { runRLM } from '../src/rlm_runner.ts';
 import type { JsonValue } from '../src/types.ts';
 

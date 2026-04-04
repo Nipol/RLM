@@ -8,40 +8,47 @@
  * import { runStandaloneCLI } from './cli.ts';
  * ```
  */
-import { loadProviderRequestTimeoutMs, loadRLMConfig, loadRLMRuntimeConfig } from './env.ts';
-import type { LLMCaller } from '../llm_adapter.ts';
-import { JsonlFileLogger } from '../logger.ts';
-import { OpenAIResponsesProvider } from '../providers/openai_adapter.ts';
-import { estimateOpenAIRunCostUsd } from '../providers/openai_pricing.ts';
+import {
+  loadPreferredStandaloneModelConfig,
+  loadProviderRequestTimeoutMs,
+  loadRLMConfig,
+  loadRLMRuntimeConfig,
+} from './env.ts';
+import type { LLMCaller } from '../../src/llm_adapter.ts';
+import { JsonlFileLogger } from '../../src/logger.ts';
+import { OpenAIResponsesProvider } from '../../src/providers/openai_adapter.ts';
+import { estimateOpenAIRunCostUsd } from '../../src/providers/openai_pricing.ts';
 import {
   importNodeBuiltin,
   joinFilePath,
   type ReadTextFile,
   resolveCurrentWorkingDirectory,
   resolveFilePath,
-} from '../platform.ts';
+} from '../../src/platform.ts';
 import {
   type CodexOAuthAuthorizationCodeResult,
   type CodexOAuthAuthorizationReceiver,
   type CodexOAuthAuthorizationSession,
   CodexOAuthProvider,
   extractAuthorizationCodeFromCallbackUrl,
-} from '../providers/codex_oauth.ts';
-import { runOpenAIRLM } from '../providers/openai.ts';
-import type { RunOpenAIRLMOptions } from '../providers/openai.ts';
-import { runRLM } from '../rlm_runner.ts';
-import type { RLMRunOptions } from '../rlm_runner.ts';
+} from '../../src/providers/codex_oauth.ts';
+import { runOpenAIRLM } from '../../src/providers/openai.ts';
+import type { RunOpenAIRLMOptions } from '../../src/providers/openai.ts';
+import type { RLMPlugin } from '../../src/plugin.ts';
+import { runRLM } from '../../src/rlm_runner.ts';
+import type { RLMRunOptions } from '../../src/rlm_runner.ts';
 import type {
   AssistantTurnEntry,
   CellEntry,
   JournalEntry,
   JsonValue,
+  QueryTraceEntry,
   RLMLogger,
   RLMUsageSummary,
   SessionEntry,
   StandaloneErrorEntry,
   SubqueryEntry,
-} from '../types.ts';
+} from '../../src/types.ts';
 
 /**
  * Identifies which standalone provider bootstrap path should be used.
@@ -61,6 +68,8 @@ export type StandaloneProviderName = 'codex-oauth' | 'openai';
  * ```
  */
 export interface ParsedStandaloneCLIArgs {
+  aotDebug?: boolean;
+  aotMode?: 'hard' | 'lite';
   cellTimeoutMs?: number;
   inputPath?: string;
   listModels?: boolean;
@@ -88,6 +97,8 @@ export interface ParsedStandaloneCLIArgs {
  * ```
  */
 export interface ResolvedStandaloneCLIOptions {
+  aotDebug?: boolean;
+  aotMode?: 'hard' | 'lite';
   cellTimeoutMs?: number;
   inputPath?: string;
   listModels?: boolean;
@@ -149,6 +160,7 @@ interface StandaloneCodexOAuthProviderLike {
  */
 export interface StandaloneCLIDependencies {
   clock?: () => Date;
+  createAOTPlugin?: () => Promise<RLMPlugin> | RLMPlugin;
   createCodexOAuthProvider?: () => StandaloneCodexOAuthProviderLike;
   cwd?: string;
   /**
@@ -178,7 +190,6 @@ export interface StandaloneCLIDependencies {
  * ```ts
  * const input: StandaloneFinalRenderInput = {
  *   finalValue: '42',
- *   inputFilePath: '/workspace/book.txt',
  *   query: 'What is the answer?',
  *   rlmAnswer: '42',
  *   systemPrompt: 'Answer in concise Korean.',
@@ -187,7 +198,7 @@ export interface StandaloneCLIDependencies {
  */
 export interface StandaloneFinalRenderInput {
   finalValue?: JsonValue | null;
-  inputFilePath: string;
+  inputFilePath?: string;
   query: string;
   rlmAnswer: string;
   systemPrompt: string;
@@ -447,6 +458,71 @@ function resolveStandaloneGenericRun(
   return run ?? runRLM;
 }
 
+async function loadStandaloneAOTPlugin(
+  loadPluginModule: () => Promise<{ createAoTPlugin: () => RLMPlugin }> = async () =>
+    await import('../../plugin/aot/mod.ts'),
+): Promise<RLMPlugin> {
+  try {
+    const { createAoTPlugin } = await loadPluginModule();
+    return createAoTPlugin();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      [
+        'Standalone AoT mode requires plugin/aot/mod.ts to be available.',
+        `Failed to load the default AoT plugin: ${message}`,
+      ].join(' '),
+    );
+  }
+}
+
+async function resolveStandalonePlugins(
+  options: Pick<ResolvedStandaloneCLIOptions, 'aotMode'>,
+  dependencies: Pick<StandaloneCLIDependencies, 'createAOTPlugin'>,
+): Promise<RLMPlugin[] | undefined> {
+  if (options.aotMode === undefined) {
+    return undefined;
+  }
+
+  const plugin = await (dependencies.createAOTPlugin?.() ?? loadStandaloneAOTPlugin());
+  return [plugin];
+}
+
+function resolveStandaloneSystemPromptExtension(
+  options: Pick<ResolvedStandaloneCLIOptions, 'aotMode'>,
+): string | undefined {
+  if (options.aotMode === undefined) {
+    return undefined;
+  }
+
+  if (options.aotMode === 'lite') {
+    return [
+      'AoT-lite mode is enabled for this run.',
+      'If `context.document` is empty, missing, or insufficient for a direct grounded answer, you must call `aot(...)` before `FINAL(...)` or `FINAL_VAR(...)`.',
+      'For multipart, explanatory, comparative, synthetic, or teach-back questions, prefer `aot(...)` even if you think you can answer directly.',
+      'Do not manually imitate AoT by writing the decomposition yourself in the first cell. Call `aot(...)` and then use its returned result.',
+      'For the first AoT attempt in standalone mode, prefer one lightweight object-form call instead of `aot("question")`.',
+      'Start with: `await aot({ question, maxIterations: 1, maxIndependentSubquestions: 2, maxRefinements: 0, includeTrace: false })`.',
+      'AoT-lite should keep a single decomposition-contraction path and avoid judge/frontier-heavy search by default.',
+      'If AoT-lite times out or raises a runtime error, reduce the question scope or answer without AoT.',
+      'Only escalate to AoT-hard when a completed AoT-lite attempt clearly needs judge, refinement, or frontier search.',
+      'Only skip `aot(...)` when the answer is a short, direct extraction from `context.document` and no decomposition or synthesis is needed.',
+    ].join('\n');
+  }
+
+  return [
+    'AOT-hard mode is enabled for this run.',
+    'If `context.document` is empty, missing, or insufficient for a direct grounded answer, you must call `aot(...)` before `FINAL(...)` or `FINAL_VAR(...)`.',
+    'For multipart, explanatory, comparative, synthetic, or teach-back questions, prefer `aot(...)` even if you think you can answer directly.',
+    'Do not manually imitate AoT by writing the decomposition yourself in the first cell. Call `aot(...)` and then use its returned result.',
+    'For the first AoT-hard attempt in standalone mode, prefer one conservative object-form call instead of `aot("question")`.',
+    'Start with: `await aot({ question, maxIterations: 3, maxIndependentSubquestions: 4, transitionSamples: 2, beamWidth: 2, maxRefinements: 1, includeTrace: false })`.',
+    'Only widen AoT search after a completed, non-timeout attempt that clearly needed more decomposition. Increase one knob at a time.',
+    'Do not widen AoT search after a timeout or runtime error. In that case, keep `transitionSamples: 1`, `beamWidth: 1`, reduce the question scope, or answer without AoT.',
+    'Only skip `aot(...)` when the answer is a short, direct extraction from `context.document` and no decomposition or synthesis is needed.',
+  ].join('\n');
+}
+
 function resolveCodexOAuthProvider(
   createProvider: StandaloneCLIDependencies['createCodexOAuthProvider'],
 ): StandaloneCodexOAuthProviderLike {
@@ -519,6 +595,10 @@ function resolveCodexOAuthModels(
     rootModel?: string;
     subModel?: string;
   },
+  preferredModels: {
+    rootModel?: string;
+    subModel?: string;
+  } = {},
 ): { rootModel: string; subModel: string } {
   const ensureExactModel = (requestedModel: string | undefined): string | undefined => {
     if (requestedModel === undefined) {
@@ -538,7 +618,16 @@ function resolveCodexOAuthModels(
     );
   };
 
+  const pickPreferredExactModel = (requestedModel: string | undefined): string | undefined => {
+    if (requestedModel === undefined) {
+      return undefined;
+    }
+
+    return availableModels.includes(requestedModel) ? requestedModel : undefined;
+  };
+
   const rootModel = ensureExactModel(overrides.rootModel) ??
+    pickPreferredExactModel(preferredModels.rootModel) ??
     pickPreferredModel(
       availableModels,
       ['gpt-5-4-t-mini', 'gpt-5-mini', 'gpt-5-4-thinking', 'gpt-5', 'gpt-5-3'],
@@ -548,6 +637,7 @@ function resolveCodexOAuthModels(
   }
 
   const subModel = (ensureExactModel(overrides.subModel) ??
+    pickPreferredExactModel(preferredModels.subModel) ??
     pickPreferredModel(
       availableModels,
       ['gpt-5-3-instant', 'gpt-5-t-mini', rootModel, 'gpt-5-mini', 'gpt-5-2-instant'],
@@ -587,6 +677,10 @@ function isSubqueryEntry(entry: JournalEntry): entry is SubqueryEntry {
   return entry.type === 'subquery';
 }
 
+function isQueryTraceEntry(entry: JournalEntry): entry is QueryTraceEntry {
+  return entry.type === 'query_trace';
+}
+
 function isStandaloneErrorEntry(entry: JournalEntry): entry is StandaloneErrorEntry {
   return entry.type === 'standalone_error';
 }
@@ -604,6 +698,72 @@ function formatStandaloneFinalSuffix(finalAnswer: string | null): string {
   }
 
   return ` final=${finalAnswer}`;
+}
+
+function parseStandaloneTimeMs(timestamp: string | undefined): number | null {
+  if (timestamp === undefined) {
+    return null;
+  }
+
+  const parsed = Date.parse(timestamp);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatStandaloneDurationMs(durationMs: number): string {
+  if (!Number.isFinite(durationMs) || durationMs < 0) {
+    return 'unknown';
+  }
+
+  if (durationMs < 1_000) {
+    return `${Math.round(durationMs)}ms`;
+  }
+
+  if (durationMs < 60_000) {
+    const seconds = durationMs / 1_000;
+    return seconds >= 10 ? `${seconds.toFixed(0)}s` : `${seconds.toFixed(1)}s`;
+  }
+
+  const minutes = Math.floor(durationMs / 60_000);
+  const seconds = (durationMs % 60_000) / 1_000;
+  if (seconds < 10) {
+    return `${minutes}m ${seconds.toFixed(1)}s`;
+  }
+
+  return `${minutes}m ${seconds.toFixed(0)}s`;
+}
+
+function formatStandaloneElapsedSuffix(durationMs: number | null): string {
+  if (durationMs === null) {
+    return '';
+  }
+
+  return ` elapsed=${formatStandaloneDurationMs(durationMs)}`;
+}
+
+function formatStandaloneQueryTraceMaxSteps(
+  maxSteps: QueryTraceEntry['maxSteps'],
+): string | null {
+  if (maxSteps === undefined) {
+    return null;
+  }
+
+  return `maxSteps=${String(maxSteps)}`;
+}
+
+function formatStandaloneStepGapSuffix(
+  previousAssistantCreatedAtMs: number | null,
+  nextAssistantCreatedAt: string,
+): string {
+  if (previousAssistantCreatedAtMs === null) {
+    return '';
+  }
+
+  const nextAssistantCreatedAtMs = parseStandaloneTimeMs(nextAssistantCreatedAt);
+  if (nextAssistantCreatedAtMs === null || nextAssistantCreatedAtMs < previousAssistantCreatedAtMs) {
+    return '';
+  }
+
+  return ` after=${formatStandaloneDurationMs(nextAssistantCreatedAtMs - previousAssistantCreatedAtMs)}`;
 }
 
 /**
@@ -631,9 +791,11 @@ function resolveStandaloneCellTimeoutMs(
  *
  * Supported flags:
  * - `--provider <openai|codex-oauth>` (optional)
+ * - `--aot` or `--aot-hard` (optional)
+ * - `--aot-debug` (optional, requires `--aot` or `--aot-hard`)
  * - `--login` (Codex OAuth only)
  * - `--list-models` (Codex OAuth only)
- * - `--input <path>`
+ * - `--input <path>` (optional)
  * - `--query <text>`
  * - `--system-prompt <path>`
  * - `--root-model <model>` (optional)
@@ -679,6 +841,27 @@ export function parseStandaloneCLIArgs(args: string[]): ParsedStandaloneCLIArgs 
 
     if (flag === '--login') {
       values.login = true;
+      continue;
+    }
+
+    if (flag === '--aot') {
+      if (values.aotMode !== undefined) {
+        throw new Error('Choose either --aot or --aot-hard, not both.');
+      }
+      values.aotMode = 'lite';
+      continue;
+    }
+
+    if (flag === '--aot-hard') {
+      if (values.aotMode !== undefined) {
+        throw new Error('Choose either --aot or --aot-hard, not both.');
+      }
+      values.aotMode = 'hard';
+      continue;
+    }
+
+    if (flag === '--aot-debug') {
+      values.aotDebug = true;
       continue;
     }
 
@@ -783,12 +966,18 @@ export function parseStandaloneCLIArgs(args: string[]): ParsedStandaloneCLIArgs 
   }
 
   if (values.login !== true && values.listModels !== true) {
-    if (
-      values.inputPath === undefined || values.query === undefined ||
-      values.systemPromptPath === undefined
-    ) {
-      throw new Error('Missing required CLI flags: --input, --query, --system-prompt.');
+    const missingRequiredFlags = [
+      values.query === undefined ? '--query' : null,
+      values.systemPromptPath === undefined ? '--system-prompt' : null,
+    ].filter((flag): flag is string => flag !== null);
+
+    if (missingRequiredFlags.length > 0) {
+      throw new Error(`Missing required CLI flags: ${missingRequiredFlags.join(', ')}.`);
     }
+  }
+
+  if (values.aotDebug === true && values.aotMode === undefined) {
+    throw new Error('--aot-debug requires --aot or --aot-hard.');
   }
 
   return values as ParsedStandaloneCLIArgs;
@@ -840,6 +1029,8 @@ export function resolveStandaloneCLIOptions(
 ): ResolvedStandaloneCLIOptions {
   const cwd = options.cwd ?? resolveCurrentWorkingDirectory();
   return {
+    aotDebug: args.aotDebug,
+    aotMode: args.aotMode,
     cellTimeoutMs: args.cellTimeoutMs,
     inputPath: args.inputPath === undefined
       ? undefined
@@ -877,11 +1068,13 @@ export function resolveStandaloneCLIOptions(
 export function createStandaloneProgressLogger(
   options: {
     baseLogger: RLMLogger;
+    showQueryTrace?: boolean;
     writeLine?: (line: string) => void;
   },
 ): RLMLogger & { path?: string } {
   const writeLine = resolveStandaloneWriteLine(options.writeLine);
   let currentStep = 0;
+  let previousAssistantCreatedAtMs: number | null = null;
   const path = 'path' in options.baseLogger
     ? (options.baseLogger as { path?: string }).path
     : undefined;
@@ -898,18 +1091,46 @@ export function createStandaloneProgressLogger(
 
       if (isAssistantTurnEntry(entry)) {
         currentStep = entry.step;
-        writeLine(`[step ${entry.step}] assistant turn`);
+        writeLine(
+          `[step ${entry.step}] assistant turn${
+            formatStandaloneStepGapSuffix(previousAssistantCreatedAtMs, entry.createdAt)
+          }`,
+        );
+        previousAssistantCreatedAtMs = parseStandaloneTimeMs(entry.createdAt);
         return;
       }
 
       if (isCellEntry(entry)) {
         const finalSuffix = formatStandaloneFinalSuffix(entry.finalAnswer);
-        writeLine(`[step ${currentStep}] cell ${entry.status}${finalSuffix}`);
+        writeLine(
+          `[step ${currentStep}] cell ${entry.status}${
+            formatStandaloneElapsedSuffix(entry.durationMs)
+          }${finalSuffix}`,
+        );
         return;
       }
 
       if (isSubqueryEntry(entry)) {
         writeLine(`[step ${currentStep}] subquery depth=${entry.depth} steps=${entry.steps}`);
+        return;
+      }
+
+      if (isQueryTraceEntry(entry) && options.showQueryTrace === true) {
+        const detailParts = [
+          `query=${String(entry.queryIndex)}`,
+          `depth=${String(entry.depth)}`,
+          `elapsed=${formatStandaloneDurationMs(entry.durationMs)}`,
+          `status=${entry.status}`,
+          `model=${entry.model}`,
+          formatStandaloneQueryTraceMaxSteps(entry.maxSteps),
+          typeof entry.maxSubcallDepth === 'number'
+            ? `maxSubcallDepth=${String(entry.maxSubcallDepth)}`
+            : null,
+          typeof entry.steps === 'number' ? `steps=${String(entry.steps)}` : null,
+        ].filter((value): value is string => value !== null);
+        writeLine(
+          `[aot-debug] ${entry.kind} tag=${entry.promptTag ?? '(none)'} ${detailParts.join(' ')}`,
+        );
         return;
       }
 
@@ -934,7 +1155,6 @@ export function createStandaloneProgressLogger(
  * ```ts
  * const answer = await renderStandaloneFinalAnswer({
  *   finalValue: '42',
- *   inputFilePath: '/workspace/book.txt',
  *   query: 'What is the answer?',
  *   rlmAnswer: '42',
  *   systemPrompt: 'Answer in concise Korean.',
@@ -950,22 +1170,32 @@ export async function renderStandaloneFinalAnswer(
       fetcher: dependencies.fetcher,
     }).createCaller(loadRLMConfig().openAI);
   const model = dependencies.rootModel ?? loadRLMConfig().openAI.rootModel;
-  const response = await llm.complete({
-    input: [
-      'User query:',
-      input.query,
-      '',
-      'Verified RLM answer:',
-      input.rlmAnswer,
-      '',
-      'Structured final value:',
-      JSON.stringify(input.finalValue ?? null),
+  const promptSections = [
+    'User query:',
+    input.query,
+    '',
+    'Verified RLM answer:',
+    input.rlmAnswer,
+    '',
+    'Structured final value:',
+    JSON.stringify(input.finalValue ?? null),
+  ];
+
+  if (input.inputFilePath !== undefined) {
+    promptSections.push(
       '',
       'Input file path:',
       input.inputFilePath,
-      '',
-      'Write the final user-facing answer now.',
-    ].join('\n'),
+    );
+  }
+
+  promptSections.push(
+    '',
+    'Write the final user-facing answer now.',
+  );
+
+  const response = await llm.complete({
+    input: promptSections.join('\n'),
     kind: 'plain_query',
     metadata: {
       depth: 0,
@@ -1141,16 +1371,19 @@ export async function runStandaloneCLI(
     return { answer: '' };
   }
 
-  const inputPath = resolved.inputPath!;
+  const inputPath = resolved.inputPath;
   const query = resolved.query!;
   const systemPromptPath = resolved.systemPromptPath!;
-  const document = await readTextFile(inputPath);
+  const document = inputPath === undefined ? '' : await readTextFile(inputPath);
   const systemPrompt = await readTextFile(systemPromptPath);
   const baseLogger = new JsonlFileLogger(resolved.logPath);
   const logger = createStandaloneProgressLogger({
     baseLogger,
+    showQueryTrace: resolved.aotDebug === true,
     writeLine,
   });
+  const plugins = await resolveStandalonePlugins(resolved, dependencies);
+  const systemPromptExtension = resolveStandaloneSystemPromptExtension(resolved);
   let resultSession:
     | {
       close?(): Promise<void> | void;
@@ -1158,14 +1391,20 @@ export async function runStandaloneCLI(
     | undefined;
 
   writeLine(`[standalone] provider: ${resolved.provider}`);
-  writeLine(`[standalone] input: ${inputPath}`);
+  if (resolved.aotMode !== undefined) {
+    writeLine(`[standalone] aot: ${resolved.aotMode}`);
+  }
+  if (resolved.aotDebug === true) {
+    writeLine('[standalone] aot debug: enabled');
+  }
+  writeLine(`[standalone] input: ${inputPath ?? '(none)'}`);
   writeLine(`[standalone] system prompt: ${systemPromptPath}`);
   writeLine(`[standalone] log: ${resolved.logPath}`);
 
   try {
     const context = {
       document,
-      inputFilePath: inputPath,
+      inputFilePath: inputPath ?? null,
     };
     const result = resolved.provider === 'codex-oauth'
       ? await (async () => {
@@ -1177,10 +1416,11 @@ export async function runStandaloneCLI(
             fetcher,
           });
         const availableModels = await provider.listModels();
+        const preferredModels = loadPreferredStandaloneModelConfig({ path: envPath });
         const models = resolveCodexOAuthModels(availableModels, {
           rootModel: resolved.rootModel,
           subModel: resolved.subModel,
-        });
+        }, preferredModels);
         const llm = provider.createCaller({
           requestTimeoutMs,
         });
@@ -1202,9 +1442,12 @@ export async function runStandaloneCLI(
           context,
           llm,
           logger,
+          plugins,
           prompt: query,
           rootModel: models.rootModel,
           subModel: models.subModel,
+          systemPromptExtension,
+          ...(resolved.aotDebug === true ? { queryTrace: true } : {}),
         });
 
         return { render, runResult };
@@ -1235,7 +1478,10 @@ export async function runStandaloneCLI(
           fetcher,
           logger,
           openAI: effectiveConfig.openAI,
+          plugins,
           prompt: query,
+          systemPromptExtension,
+          ...(resolved.aotDebug === true ? { queryTrace: true } : {}),
         });
         return { render, runResult };
       })();
@@ -1277,13 +1523,21 @@ export const __standaloneCLITestables = {
   buildStandaloneUsageLines,
   createStandaloneCodexOAuthAuthorizationReceiver,
   closeStandaloneBaseLogger,
+  formatStandaloneDurationMs,
+  formatStandaloneElapsedSuffix,
   formatStandaloneFinalSuffix,
+  formatStandaloneQueryTraceMaxSteps,
+  formatStandaloneStepGapSuffix,
   formatStandaloneTimestamp,
+  loadStandaloneAOTPlugin,
+  parseStandaloneTimeMs,
   readStandaloneLoginLine,
   receiveStandaloneLoopbackAuthorizationCode,
   resolveCodexOAuthModels,
   resolveCodexOAuthProvider,
   resolveStandaloneGenericRun,
+  resolveStandalonePlugins,
+  resolveStandaloneSystemPromptExtension,
   createStandaloneFetchLogger,
   resolveStandaloneReadLoginLine,
   resolveStandaloneReadTextFile,

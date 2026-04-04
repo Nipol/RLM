@@ -10,6 +10,7 @@ const indexFile = path.join(__dirname, 'index.html');
 const appFile = path.join(__dirname, 'app.mjs');
 const coreFile = path.resolve(__dirname, '..', '..', 'dist', 'core', 'index.mjs');
 const sharedScenarioFile = path.resolve(__dirname, '..', 'shared', 'runtime_scenario.mjs');
+const sharedPluginScenarioFile = path.resolve(__dirname, '..', 'shared', 'plugin_scenario.mjs');
 const sharedOllamaProviderScenarioFile = path.resolve(
   __dirname,
   '..',
@@ -33,6 +34,9 @@ const server = http.createServer(async (request, response) => {
   } else if (request.url === '/shared/runtime_scenario.mjs') {
     requestPath = sharedScenarioFile;
     contentType = 'application/javascript; charset=utf-8';
+  } else if (request.url === '/shared/plugin_scenario.mjs') {
+    requestPath = sharedPluginScenarioFile;
+    contentType = 'application/javascript; charset=utf-8';
   } else if (request.url === '/shared/ollama_provider_scenario.mjs') {
     requestPath = sharedOllamaProviderScenarioFile;
     contentType = 'application/javascript; charset=utf-8';
@@ -47,6 +51,20 @@ const server = http.createServer(async (request, response) => {
     contentType = 'application/javascript; charset=utf-8';
   } else if (request.url === '/dist/providers/ollama/index.mjs') {
     requestPath = path.resolve(__dirname, '..', '..', 'dist', 'providers', 'ollama', 'index.mjs');
+    contentType = 'application/javascript; charset=utf-8';
+  } else if (request.url === '/dist/plugin/aot/index.mjs') {
+    requestPath = path.resolve(__dirname, '..', '..', 'dist', 'plugin', 'aot', 'index.mjs');
+    contentType = 'application/javascript; charset=utf-8';
+  } else if (request.url === '/dist/plugin/pingpong/index.mjs') {
+    requestPath = path.resolve(
+      __dirname,
+      '..',
+      '..',
+      'dist',
+      'plugin',
+      'pingpong',
+      'index.mjs',
+    );
     contentType = 'application/javascript; charset=utf-8';
   }
 

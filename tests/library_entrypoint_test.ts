@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 
+import { createAoTPlugin } from '../plugin/aot/mod.ts';
+import { createPingPongPlugin } from '../plugin/pingpong/mod.ts';
 import type { ExecutionBackend, PersistentRuntimeLike } from '../src/index.ts';
 import { createRLM, InMemoryRLMLogger, NullRLMLogger, runRLM } from '../src/index.ts';
 import type { LLMCaller, LLMCallerRequest, LLMCallerResponse } from '../src/llm_adapter.ts';
@@ -213,6 +215,104 @@ Deno.test('createRLM lets runs override the client-level system prompt extension
   assert.equal(result.answer, 'ok');
   assert.match(llm.requests[0]?.systemPrompt ?? '', /Use the per-run extension instead\./u);
   assert.doesNotMatch(llm.requests[0]?.systemPrompt ?? '', /Use the client default extension\./u);
+});
+
+Deno.test('createRLM appends runtime helper prompt blocks into the rendered system prompt', async () => {
+  const llm = new MockCaller([
+    {
+      outputText: '```repl\nFINAL_VAR("ok");\n```',
+      turnState: { opaque: 'root-1' },
+    },
+  ]);
+
+  const client = createRLM({
+    llm,
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    models: {
+      root: 'gpt-5-nano',
+      sub: 'gpt-5-mini',
+    },
+    runtimeHelperPromptBlocks: [
+      [
+        '- `aot(question)`',
+        '  - 질의를 atom 단위로 분해하고 축소합니다.',
+      ].join('\n'),
+    ],
+  });
+
+  const result = await client.run({
+    context: null,
+    prompt: 'Return ok.',
+  });
+
+  assert.equal(result.answer, 'ok');
+  assert.match(llm.requests[0]?.systemPrompt ?? '', /- `aot\(question\)`/u);
+  assert.match(llm.requests[0]?.systemPrompt ?? '', /질의를 atom 단위로 분해하고 축소합니다\./u);
+});
+
+Deno.test('createRLM can expose plugin runtime helpers and inject their prompt text', async () => {
+  const llm = new MockCaller([
+    {
+      outputText: '```repl\nconst reply = await ping_pong("PING");\nFINAL_VAR(reply);\n```',
+      turnState: { opaque: 'root-1' },
+    },
+  ]);
+
+  const client = createRLM({
+    llm,
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    models: {
+      root: 'gpt-5-nano',
+      sub: 'gpt-5-mini',
+    },
+    plugins: [createPingPongPlugin()],
+  });
+
+  const result = await client.run({
+    context: null,
+    prompt: 'Use the ping helper and return its reply.',
+  });
+
+  assert.equal(result.answer, 'PONG');
+  assert.match(llm.requests[0]?.systemPrompt ?? '', /`ping_pong\(text\)`/u);
+  assert.match(llm.requests[0]?.systemPrompt ?? '', /PING을 입력으로 받으면 PONG을 반환합니다\./u);
+  assert.match(llm.requests[0]?.systemPrompt ?? '', /입력값: 비어 있지 않은 텍스트 문자열/u);
+});
+
+Deno.test('createRLM injects AoT plugin guidance into the rendered system prompt', async () => {
+  const llm = new MockCaller([
+    {
+      outputText: '```repl\nFINAL_VAR("ok");\n```',
+      turnState: { opaque: 'root-1' },
+    },
+  ]);
+
+  const client = createRLM({
+    llm,
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    models: {
+      root: 'gpt-5-nano',
+      sub: 'gpt-5-mini',
+    },
+    plugins: [createAoTPlugin()],
+  });
+
+  const result = await client.run({
+    context: null,
+    prompt: 'Return ok.',
+  });
+
+  assert.equal(result.answer, 'ok');
+  assert.match(llm.requests[0]?.systemPrompt ?? '', /`aot\(input\)`/u);
+  assert.match(llm.requests[0]?.systemPrompt ?? '', /AoT/u);
+  assert.match(llm.requests[0]?.systemPrompt ?? '', /dependency DAG로 분해/u);
+  assert.match(
+    llm.requests[0]?.systemPrompt ?? '',
+    /직접적인 답이 없더라도.*풍부한 답변/u,
+  );
 });
 
 Deno.test('createRLM can request optional evaluator feedback through the same injected caller', async () => {

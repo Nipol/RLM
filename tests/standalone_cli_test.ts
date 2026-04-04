@@ -1,9 +1,7 @@
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
 
-import { InMemoryRLMLogger } from '../src/logger.ts';
-import { estimateOpenAIRunCostUsd } from '../src/providers/openai.ts';
-import type { AssistantTurnEntry, CellEntry, SessionEntry } from '../src/types.ts';
+import { createAoTPlugin } from '../plugin/aot/mod.ts';
 import {
   __standaloneCLITestables,
   createStandaloneLogPath,
@@ -12,7 +10,10 @@ import {
   renderStandaloneFinalAnswer,
   resolveStandaloneCLIOptions,
   runStandaloneCLI,
-} from '../src/standalone/cli.ts';
+} from '../examples/standalone/cli.ts';
+import { InMemoryRLMLogger } from '../src/logger.ts';
+import { estimateOpenAIRunCostUsd } from '../src/providers/openai.ts';
+import type { AssistantTurnEntry, CellEntry, QueryTraceEntry, SessionEntry } from '../src/types.ts';
 
 function createClock(timestamp = Date.parse('2026-03-26T11:22:33.456Z')): () => Date {
   return () => new Date(timestamp);
@@ -138,6 +139,97 @@ Deno.test('parseStandaloneCLIArgs accepts required flags and reject missing ones
 
   assert.deepEqual(
     parseStandaloneCLIArgs([
+      '--aot',
+      '--input',
+      'fixtures/book.txt',
+      '--query',
+      'Find the answer.',
+      '--system-prompt',
+      'prompts/ebook-system.txt',
+    ]),
+    {
+      aotMode: 'lite',
+      inputPath: 'fixtures/book.txt',
+      provider: 'openai',
+      query: 'Find the answer.',
+      systemPromptPath: 'prompts/ebook-system.txt',
+    },
+  );
+
+  assert.deepEqual(
+    parseStandaloneCLIArgs([
+      '--aot-hard',
+      '--aot-debug',
+      '--input',
+      'fixtures/book.txt',
+      '--query',
+      'Find the answer.',
+      '--system-prompt',
+      'prompts/ebook-system.txt',
+    ]),
+    {
+      aotDebug: true,
+      aotMode: 'hard',
+      inputPath: 'fixtures/book.txt',
+      provider: 'openai',
+      query: 'Find the answer.',
+      systemPromptPath: 'prompts/ebook-system.txt',
+    },
+  );
+
+  assert.throws(
+    () =>
+      parseStandaloneCLIArgs([
+        '--aot',
+        '--aot-hard',
+        '--query',
+        'Find the answer.',
+        '--system-prompt',
+        'prompts/ebook-system.txt',
+      ]),
+    /Choose either --aot or --aot-hard/u,
+  );
+  assert.throws(
+    () =>
+      parseStandaloneCLIArgs([
+        '--aot-hard',
+        '--aot',
+        '--query',
+        'Find the answer.',
+        '--system-prompt',
+        'prompts/ebook-system.txt',
+      ]),
+    /Choose either --aot or --aot-hard/u,
+  );
+
+  assert.throws(
+    () =>
+      parseStandaloneCLIArgs([
+        '--aot-debug',
+        '--query',
+        'Find the answer.',
+        '--system-prompt',
+        'prompts/ebook-system.txt',
+      ]),
+    /--aot-debug requires --aot or --aot-hard/u,
+  );
+
+  assert.deepEqual(
+    parseStandaloneCLIArgs([
+      '--query',
+      'Find the answer.',
+      '--system-prompt',
+      'prompts/ebook-system.txt',
+    ]),
+    {
+      provider: 'openai',
+      query: 'Find the answer.',
+      systemPromptPath: 'prompts/ebook-system.txt',
+    },
+  );
+
+  assert.deepEqual(
+    parseStandaloneCLIArgs([
       '--input',
       'fixtures/book.txt',
       '--query',
@@ -180,6 +272,8 @@ Deno.test('resolveStandaloneCLIOptions makes paths absolute and creates a defaul
   assert.equal(resolved.inputPath, '/workspace/rlm/fixtures/book.txt');
   assert.equal(resolved.systemPromptPath, '/workspace/rlm/prompts/ebook-system.txt');
   assert.equal(resolved.cellTimeoutMs, undefined);
+  assert.equal(resolved.aotMode, undefined);
+  assert.equal(resolved.aotDebug, undefined);
   assert.equal(resolved.provider, 'openai');
   assert.equal(resolved.query, 'Find the answer.');
   assert.match(
@@ -187,8 +281,25 @@ Deno.test('resolveStandaloneCLIOptions makes paths absolute and creates a defaul
     /\/workspace\/rlm\/logs\/standalone\/20260326-112233-456\.jsonl$/u,
   );
 
+  const withoutInput = resolveStandaloneCLIOptions(
+    {
+      provider: 'openai',
+      query: 'Find the answer.',
+      systemPromptPath: 'prompts/ebook-system.txt',
+    },
+    {
+      clock: createClock(),
+      cwd: '/workspace/rlm',
+    },
+  );
+
+  assert.equal(withoutInput.inputPath, undefined);
+  assert.equal(withoutInput.systemPromptPath, '/workspace/rlm/prompts/ebook-system.txt');
+
   const withExplicitLog = resolveStandaloneCLIOptions(
     {
+      aotDebug: true,
+      aotMode: 'hard',
       cellTimeoutMs: 45_000,
       inputPath: 'fixtures/book.txt',
       logPath: 'logs/custom.jsonl',
@@ -203,6 +314,8 @@ Deno.test('resolveStandaloneCLIOptions makes paths absolute and creates a defaul
     },
   );
   assert.equal(withExplicitLog.logPath, '/workspace/rlm/logs/custom.jsonl');
+  assert.equal(withExplicitLog.aotMode, 'hard');
+  assert.equal(withExplicitLog.aotDebug, true);
   assert.equal(withExplicitLog.cellTimeoutMs, 45_000);
   assert.equal(withExplicitLog.requestTimeoutMs, 90_000);
 });
@@ -276,6 +389,50 @@ Deno.test('resolveCodexOAuthModels rejects explicit Codex model overrides that a
       subModel: 'gpt-5-4-t-mini',
     },
   );
+  assert.deepEqual(
+    __standaloneCLITestables.resolveCodexOAuthModels(
+      ['gpt-5-4-t-mini', 'gpt-5-3-instant', 'gpt-5-mini'],
+      {},
+      {
+        rootModel: 'gpt-5-4-t-mini',
+        subModel: 'gpt-5-3-instant',
+      },
+    ),
+    {
+      rootModel: 'gpt-5-4-t-mini',
+      subModel: 'gpt-5-3-instant',
+    },
+  );
+  assert.deepEqual(
+    __standaloneCLITestables.resolveCodexOAuthModels(
+      ['gpt-5-4-t-mini', 'gpt-5-3-instant', 'gpt-5-mini'],
+      {
+        rootModel: 'gpt-5-mini',
+      },
+      {
+        rootModel: 'gpt-5-4-t-mini',
+        subModel: 'gpt-5-3-instant',
+      },
+    ),
+    {
+      rootModel: 'gpt-5-mini',
+      subModel: 'gpt-5-3-instant',
+    },
+  );
+  assert.deepEqual(
+    __standaloneCLITestables.resolveCodexOAuthModels(
+      ['gpt-5-4-t-mini', 'gpt-5-3-instant', 'gpt-5-mini'],
+      {},
+      {
+        rootModel: 'gpt-5.4-mini',
+        subModel: 'gpt-5.3-instant',
+      },
+    ),
+    {
+      rootModel: 'gpt-5-4-t-mini',
+      subModel: 'gpt-5-3-instant',
+    },
+  );
 });
 
 Deno.test('createStandaloneLogPath can generate a deterministic standalone journal path', () => {
@@ -317,10 +474,105 @@ Deno.test('standalone CLI helpers expose deterministic timestamp, path resolutio
   );
   assert.equal(__standaloneCLITestables.formatStandaloneFinalSuffix(null), '');
   assert.equal(__standaloneCLITestables.formatStandaloneFinalSuffix('42'), ' final=42');
+  assert.equal(__standaloneCLITestables.formatStandaloneDurationMs(12), '12ms');
+  assert.equal(__standaloneCLITestables.formatStandaloneDurationMs(Number.NaN), 'unknown');
+  assert.equal(__standaloneCLITestables.formatStandaloneDurationMs(-1), 'unknown');
+  assert.equal(__standaloneCLITestables.formatStandaloneDurationMs(1_250), '1.3s');
+  assert.equal(__standaloneCLITestables.formatStandaloneDurationMs(12_000), '12s');
+  assert.equal(__standaloneCLITestables.formatStandaloneDurationMs(300_061), '5m 0.1s');
+  assert.equal(__standaloneCLITestables.formatStandaloneDurationMs(305_000), '5m 5.0s');
+  assert.equal(__standaloneCLITestables.formatStandaloneDurationMs(315_000), '5m 15s');
+  assert.equal(__standaloneCLITestables.formatStandaloneElapsedSuffix(null), '');
+  assert.equal(__standaloneCLITestables.formatStandaloneElapsedSuffix(1_250), ' elapsed=1.3s');
+  assert.equal(__standaloneCLITestables.parseStandaloneTimeMs(undefined), null);
+  assert.equal(__standaloneCLITestables.parseStandaloneTimeMs('not-a-time'), null);
+  assert.equal(
+    __standaloneCLITestables.parseStandaloneTimeMs('2026-03-26T11:22:33.456Z'),
+    Date.parse('2026-03-26T11:22:33.456Z'),
+  );
+  assert.equal(__standaloneCLITestables.formatStandaloneQueryTraceMaxSteps(undefined), null);
+  assert.equal(__standaloneCLITestables.formatStandaloneQueryTraceMaxSteps(3), 'maxSteps=3');
+  assert.equal(
+    __standaloneCLITestables.formatStandaloneStepGapSuffix(null, '2026-03-26T11:22:34.000Z'),
+    '',
+  );
+  assert.equal(
+    __standaloneCLITestables.formatStandaloneStepGapSuffix(
+      Date.parse('2026-03-26T11:22:35.000Z'),
+      '2026-03-26T11:22:34.000Z',
+    ),
+    '',
+  );
+  assert.equal(
+    __standaloneCLITestables.formatStandaloneStepGapSuffix(
+      Date.parse('2026-03-26T11:22:33.000Z'),
+      '2026-03-26T11:22:35.250Z',
+    ),
+    ' after=2.3s',
+  );
   assert.equal(
     __standaloneCLITestables.formatStandaloneFinalSuffix('first line\nsecond line'),
     ' final=<captured>',
   );
+});
+
+Deno.test('standalone AoT plugin helpers load the built-in plugin and resolve injected plugin overrides', async () => {
+  const loadedPlugin = await __standaloneCLITestables.loadStandaloneAOTPlugin();
+  assert.equal(loadedPlugin.name, 'aot');
+  await assert.rejects(
+    () =>
+      __standaloneCLITestables.loadStandaloneAOTPlugin(async () => {
+        throw new Error('missing aot plugin');
+      }),
+    /Failed to load the default AoT plugin: missing aot plugin/u,
+  );
+
+  const injectedPlugin = { name: 'custom-aot' } as const;
+  assert.deepEqual(
+    await __standaloneCLITestables.resolveStandalonePlugins(
+      { aotMode: undefined },
+      { createAOTPlugin: async () => injectedPlugin as never },
+    ),
+    undefined,
+  );
+  assert.deepEqual(
+    await __standaloneCLITestables.resolveStandalonePlugins(
+      { aotMode: 'lite' },
+      { createAOTPlugin: async () => injectedPlugin as never },
+    ),
+    [injectedPlugin],
+  );
+  assert.match(
+    __standaloneCLITestables.resolveStandaloneSystemPromptExtension({ aotMode: 'lite' }) ?? '',
+    /aot/u,
+  );
+  assert.match(
+    __standaloneCLITestables.resolveStandaloneSystemPromptExtension({ aotMode: 'hard' }) ?? '',
+    /aot/u,
+  );
+});
+
+Deno.test('standalone readTextFile resolver fails clearly when the runtime exposes no default file reader', () => {
+  const originalReadTextFile = Deno.readTextFile;
+
+  try {
+    Object.defineProperty(Deno, 'readTextFile', {
+      configurable: true,
+      value: undefined,
+      writable: true,
+    });
+
+    assert.throws(
+      () => __standaloneCLITestables.resolveStandaloneReadTextFile(undefined),
+      /No default readTextFile implementation is available in this runtime/u,
+    );
+  } finally {
+    Object.defineProperty(Deno, 'readTextFile', {
+      configurable: true,
+      value: originalReadTextFile,
+      writable: true,
+    });
+  }
 });
 
 Deno.test('readStandaloneLoginLine reads one line from stdin and returns buffered EOF content when no newline arrives', async () => {
@@ -449,7 +701,7 @@ Deno.test('createStandaloneProgressLogger reports assistant turns, cells, and su
   assert.deepEqual(lines, [
     '[session] started',
     '[step 1] assistant turn',
-    '[step 1] cell success final=2',
+    '[step 1] cell success elapsed=12ms final=2',
     '[step 1] subquery depth=1 steps=2',
   ]);
 
@@ -509,7 +761,89 @@ Deno.test('createStandaloneProgressLogger summarizes long or multiline final ans
   assert.deepEqual(lines, [
     '[session] started',
     '[step 1] assistant turn',
-    '[step 1] cell success final=<captured>',
+    '[step 1] cell success elapsed=12ms final=<captured>',
+  ]);
+});
+
+Deno.test('createStandaloneProgressLogger reports elapsed time between assistant turns', async () => {
+  const lines: string[] = [];
+  const logger = createStandaloneProgressLogger({
+    baseLogger: new InMemoryRLMLogger(),
+    writeLine: (line) => lines.push(line),
+  });
+
+  await logger.append({
+    context: null,
+    createdAt: '2026-03-26T00:00:00.000Z',
+    defaultTimeoutMs: 5_000,
+    sessionId: 'session-1',
+    type: 'session',
+  });
+  await logger.append({
+    assistantText: '```repl\n1 + 1\n```',
+    createdAt: '2026-03-26T00:00:01.000Z',
+    model: 'gpt-5.4-mini',
+    step: 1,
+    type: 'assistant_turn',
+  });
+  await logger.append({
+    cellId: 'cell-1',
+    code: '1 + 1',
+    durationMs: 300_061,
+    endedAt: '2026-03-26T00:05:01.061Z',
+    error: { message: 'timed out', name: 'TimeoutError' },
+    finalAnswer: null,
+    replayedCellIds: [],
+    result: { kind: 'undefined', preview: 'undefined' },
+    startedAt: '2026-03-26T00:00:01.000Z',
+    status: 'error',
+    stderr: 'TimeoutError: timed out',
+    stdout: '',
+    type: 'cell',
+  });
+  await logger.append({
+    assistantText: '```repl\n2 + 2\n```',
+    createdAt: '2026-03-26T00:05:02.000Z',
+    model: 'gpt-5.4-mini',
+    step: 2,
+    type: 'assistant_turn',
+  });
+
+  assert.deepEqual(lines, [
+    '[session] started',
+    '[step 1] assistant turn',
+    '[step 1] cell error elapsed=5m 0.1s',
+    '[step 2] assistant turn after=5m 1.0s',
+  ]);
+});
+
+Deno.test('createStandaloneProgressLogger can report AoT query trace entries when debug output is enabled', async () => {
+  const lines: string[] = [];
+  const logger = createStandaloneProgressLogger({
+    baseLogger: new InMemoryRLMLogger(),
+    showQueryTrace: true,
+    writeLine: (line) => lines.push(line),
+  });
+
+  const entry: QueryTraceEntry = {
+    createdAt: '2026-03-26T00:00:01.000Z',
+    depth: 1,
+    durationMs: 42,
+    kind: 'llm_query',
+    maxSteps: 'unbounded',
+    maxSubcallDepth: 1,
+    model: 'gpt-5.4-mini',
+    promptPreview: 'AOT_DECOMPOSE_JSON\\nCurrent question:\\nExplain gravity.',
+    promptTag: 'AOT_DECOMPOSE_JSON',
+    queryIndex: 0,
+    status: 'success',
+    type: 'query_trace',
+  };
+
+  await logger.append(entry);
+
+  assert.deepEqual(lines, [
+    '[aot-debug] llm_query tag=AOT_DECOMPOSE_JSON query=0 depth=1 elapsed=42ms status=success model=gpt-5.4-mini maxSteps=unbounded maxSubcallDepth=1',
   ]);
 });
 
@@ -638,6 +972,36 @@ Deno.test('renderStandaloneFinalAnswer serializes omitted final values as null a
 
   assert.equal(answer, '최종 답변입니다.');
   assert.match(requests[0]?.input ?? '', /Structured final value:\nnull/u);
+});
+
+Deno.test('renderStandaloneFinalAnswer omits the input file path section when no input file exists', async () => {
+  const requests: Array<{ input: string; model: string; systemPrompt: string }> = [];
+
+  const answer = await renderStandaloneFinalAnswer(
+    {
+      query: 'Answer from general reasoning.',
+      rlmAnswer: 'General answer',
+      systemPrompt: 'Always answer in concise Korean.',
+    },
+    {
+      llm: {
+        async complete(request) {
+          requests.push({
+            input: request.input,
+            model: request.model,
+            systemPrompt: request.systemPrompt,
+          });
+          return {
+            outputText: ' 일반 추론 답변입니다. ',
+          };
+        },
+      },
+      rootModel: 'gpt-5.4-mini',
+    },
+  );
+
+  assert.equal(answer, '일반 추론 답변입니다.');
+  assert.doesNotMatch(requests[0]?.input ?? '', /Input file path:/u);
 });
 
 Deno.test('standalone helpers can leave cost fields blank without provider pricing and report missing model pricing when an estimator exists', async () => {
@@ -788,7 +1152,7 @@ Deno.test('runStandaloneCLI loads the input and system prompt files, writes prog
   }> = [];
   const renderCalls: Array<{
     finalValue: unknown;
-    inputFilePath: string;
+    inputFilePath: string | undefined;
     query: string;
     rlmAnswer: string;
     systemPrompt: string;
@@ -918,11 +1282,229 @@ Deno.test('runStandaloneCLI loads the input and system prompt files, writes prog
     `[standalone] log: ${join(root, 'logs/standalone/20260326-112233-456.jsonl')}`,
     '[session] started',
     '[step 1] assistant turn',
-    '[step 1] cell success final=42',
+    '[step 1] cell success elapsed=10ms final=42',
     '[final] 정답은 42입니다.',
     '[usage] input_tokens=120 output_tokens=30 total_tokens=150',
     '[cost] input_usd=$0.000090 output_usd=$0.000135 total_usd=$0.000225',
   ]);
+});
+
+Deno.test('runStandaloneCLI can attach the AoT plugin and AoT-lite controller guidance to OpenAI runs when --aot is enabled', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'rlm-standalone-cli-aot-openai-' });
+  const inputPath = join(root, 'book.txt');
+  const systemPromptPath = join(root, 'ebook-system.txt');
+  await Deno.writeTextFile(inputPath, 'Chapter 1\nThe answer is 42.\n');
+  await Deno.writeTextFile(systemPromptPath, 'Always answer in concise Korean.');
+  await Deno.writeTextFile(
+    join(root, '.env'),
+    [
+      'OPENAI_API_KEY=sk-test',
+      'RLM_OPENAI_ROOT_MODEL=gpt-5.4-mini',
+      'RLM_OPENAI_SUB_MODEL=gpt-5.4-nano',
+      'RLM_REQUEST_TIMEOUT_MS=30000',
+      'RLM_CELL_TIMEOUT_MS=5000',
+    ].join('\n'),
+  );
+
+  const plugin = createAoTPlugin();
+  const runCalls: Array<
+    {
+      plugins: unknown;
+      prompt: string;
+      queryTrace: boolean | undefined;
+      systemPromptExtension: string | undefined;
+    }
+  > = [];
+
+  const result = await runStandaloneCLI(
+    [
+      '--aot',
+      '--input',
+      inputPath,
+      '--query',
+      'Answer richly when the document is incomplete.',
+      '--system-prompt',
+      systemPromptPath,
+    ],
+    {
+      clock: createClock(),
+      createAOTPlugin: () => plugin,
+      cwd: root,
+      render: async () => '정답은 42입니다.',
+      run: async (options) => {
+        runCalls.push({
+          plugins: options.plugins,
+          prompt: options.prompt,
+          queryTrace: options.queryTrace,
+          systemPromptExtension: options.systemPromptExtension,
+        });
+
+        return {
+          answer: '42',
+          finalValue: '42',
+        };
+      },
+      writeLine: () => {},
+    },
+  );
+
+  assert.equal(result.answer, '정답은 42입니다.');
+  assert.deepEqual(runCalls, [{
+    plugins: [plugin],
+    prompt: 'Answer richly when the document is incomplete.',
+    queryTrace: undefined,
+    systemPromptExtension: runCalls[0]?.systemPromptExtension,
+  }]);
+  assert.match(runCalls[0]?.systemPromptExtension ?? '', /must call `aot\(/u);
+  assert.match(runCalls[0]?.systemPromptExtension ?? '', /AoT-lite mode is enabled/u);
+  assert.match(
+    runCalls[0]?.systemPromptExtension ?? '',
+    /document` is empty, missing, or insufficient/u,
+  );
+  assert.match(runCalls[0]?.systemPromptExtension ?? '', /maxIterations: 1/u);
+  assert.match(runCalls[0]?.systemPromptExtension ?? '', /maxIndependentSubquestions: 2/u);
+  assert.match(runCalls[0]?.systemPromptExtension ?? '', /maxRefinements: 0/u);
+  assert.match(runCalls[0]?.systemPromptExtension ?? '', /includeTrace: false/u);
+  assert.match(runCalls[0]?.systemPromptExtension ?? '', /answer without AoT/u);
+});
+
+Deno.test('runStandaloneCLI can attach the AoT-hard controller guidance and debug tracing to OpenAI runs when --aot-hard and --aot-debug are enabled', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'rlm-standalone-cli-aot-hard-openai-' });
+  const inputPath = join(root, 'book.txt');
+  const systemPromptPath = join(root, 'ebook-system.txt');
+  await Deno.writeTextFile(inputPath, 'Chapter 1\nThe answer is 42.\n');
+  await Deno.writeTextFile(systemPromptPath, 'Always answer in concise Korean.');
+  await Deno.writeTextFile(
+    join(root, '.env'),
+    [
+      'OPENAI_API_KEY=sk-test',
+      'RLM_OPENAI_ROOT_MODEL=gpt-5.4-mini',
+      'RLM_OPENAI_SUB_MODEL=gpt-5.4-nano',
+      'RLM_REQUEST_TIMEOUT_MS=30000',
+      'RLM_CELL_TIMEOUT_MS=5000',
+    ].join('\n'),
+  );
+
+  const plugin = createAoTPlugin();
+  const runCalls: Array<
+    {
+      plugins: unknown;
+      prompt: string;
+      queryTrace: boolean | undefined;
+      systemPromptExtension: string | undefined;
+    }
+  > = [];
+
+  const result = await runStandaloneCLI(
+    [
+      '--aot-hard',
+      '--aot-debug',
+      '--input',
+      inputPath,
+      '--query',
+      'Answer richly when the document is incomplete.',
+      '--system-prompt',
+      systemPromptPath,
+    ],
+    {
+      clock: createClock(),
+      createAOTPlugin: () => plugin,
+      cwd: root,
+      render: async () => '정답은 42입니다.',
+      run: async (options) => {
+        runCalls.push({
+          plugins: options.plugins,
+          prompt: options.prompt,
+          queryTrace: options.queryTrace,
+          systemPromptExtension: options.systemPromptExtension,
+        });
+
+        return {
+          answer: '42',
+          finalValue: '42',
+        };
+      },
+      writeLine: () => {},
+    },
+  );
+
+  assert.equal(result.answer, '정답은 42입니다.');
+  assert.deepEqual(runCalls, [{
+    plugins: [plugin],
+    prompt: 'Answer richly when the document is incomplete.',
+    queryTrace: true,
+    systemPromptExtension: runCalls[0]?.systemPromptExtension,
+  }]);
+  assert.match(runCalls[0]?.systemPromptExtension ?? '', /AOT-hard mode is enabled/u);
+  assert.match(runCalls[0]?.systemPromptExtension ?? '', /transitionSamples: 1/u);
+  assert.match(runCalls[0]?.systemPromptExtension ?? '', /beamWidth: 1/u);
+  assert.match(runCalls[0]?.systemPromptExtension ?? '', /maxRefinements: 1/u);
+  assert.match(runCalls[0]?.systemPromptExtension ?? '', /Do not widen AoT search after a timeout/u);
+});
+
+Deno.test('runStandaloneCLI can execute without an input file by using an empty document context', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'rlm-standalone-cli-no-input-' });
+  const systemPromptPath = join(root, 'ebook-system.txt');
+  await Deno.writeTextFile(systemPromptPath, 'Always answer in concise Korean.');
+  await Deno.writeTextFile(
+    join(root, '.env'),
+    [
+      'OPENAI_API_KEY=sk-test',
+      'RLM_OPENAI_ROOT_MODEL=gpt-5.4-mini',
+      'RLM_OPENAI_SUB_MODEL=gpt-5.4-nano',
+      'RLM_REQUEST_TIMEOUT_MS=30000',
+      'RLM_CELL_TIMEOUT_MS=5000',
+    ].join('\n'),
+  );
+
+  const lines: string[] = [];
+  const runCalls: Array<{ context: unknown; prompt: string }> = [];
+  const renderCalls: Array<{ inputFilePath: string | undefined; query: string }> = [];
+
+  const result = await runStandaloneCLI(
+    [
+      '--query',
+      'Answer from general reasoning.',
+      '--system-prompt',
+      systemPromptPath,
+    ],
+    {
+      clock: createClock(),
+      cwd: root,
+      render: async (input) => {
+        renderCalls.push({
+          inputFilePath: input.inputFilePath,
+          query: input.query,
+        });
+        return '일반 추론 답변입니다.';
+      },
+      run: async (options) => {
+        runCalls.push({
+          context: options.context,
+          prompt: options.prompt,
+        });
+        return {
+          answer: 'General answer',
+          finalValue: 'General answer',
+        };
+      },
+      writeLine: (line) => lines.push(line),
+    },
+  );
+
+  assert.equal(result.answer, '일반 추론 답변입니다.');
+  assert.deepEqual(runCalls, [{
+    context: {
+      document: '',
+      inputFilePath: null,
+    },
+    prompt: 'Answer from general reasoning.',
+  }]);
+  assert.deepEqual(renderCalls, [{
+    inputFilePath: undefined,
+    query: 'Answer from general reasoning.',
+  }]);
+  assert.ok(lines.includes('[standalone] input: (none)'));
 });
 
 Deno.test('runStandaloneCLI closes the returned session so standalone runs can exit cleanly after FINAL', async () => {
@@ -1704,6 +2286,293 @@ Deno.test('runStandaloneCLI can execute a Codex OAuth-backed run through the gen
   assert.ok(lines.includes('[cost] input_usd= output_usd= total_usd='));
 });
 
+Deno.test('runStandaloneCLI uses CLI model overrides first, then .env model defaults, then fallback for Codex OAuth runs', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'rlm-standalone-cli-codex-model-priority-' });
+  const inputPath = join(root, 'book.txt');
+  const systemPromptPath = join(root, 'ebook-system.txt');
+  await Deno.writeTextFile(inputPath, 'Chapter 1\nThe answer is 42.\n');
+  await Deno.writeTextFile(systemPromptPath, 'Always answer in concise Korean.');
+  await Deno.writeTextFile(
+    join(root, '.env'),
+    [
+      'RLM_OPENAI_ROOT_MODEL=gpt-5-4-t-mini',
+      'RLM_OPENAI_SUB_MODEL=gpt-5-3-instant',
+    ].join('\n'),
+  );
+
+  const envRunCalls: Array<{ rootModel: string; subModel: string }> = [];
+  await runStandaloneCLI(
+    [
+      '--provider',
+      'codex-oauth',
+      '--input',
+      inputPath,
+      '--query',
+      'What is the answer?',
+      '--system-prompt',
+      systemPromptPath,
+    ],
+    {
+      clock: createClock(),
+      createCodexOAuthProvider: () => ({
+        createCaller() {
+          return {
+            async complete() {
+              return { outputText: 'unused' };
+            },
+          };
+        },
+        async listModels() {
+          return ['gpt-5-4-t-mini', 'gpt-5-3-instant', 'gpt-5'];
+        },
+        async login() {
+          throw new Error('run mode should use the stored auth state instead of forcing login');
+        },
+      }),
+      cwd: root,
+      render: async () => '정답은 42입니다.',
+      runGeneric: async (options) => {
+        envRunCalls.push({
+          rootModel: options.rootModel,
+          subModel: options.subModel,
+        });
+        return {
+          answer: '42',
+          finalValue: '42',
+        };
+      },
+      writeLine: () => {},
+    },
+  );
+
+  assert.deepEqual(envRunCalls, [{
+    rootModel: 'gpt-5-4-t-mini',
+    subModel: 'gpt-5-3-instant',
+  }]);
+
+  const cliRunCalls: Array<{ rootModel: string; subModel: string }> = [];
+  await runStandaloneCLI(
+    [
+      '--provider',
+      'codex-oauth',
+      '--root-model',
+      'gpt-5',
+      '--sub-model',
+      'gpt-5-3-instant',
+      '--input',
+      inputPath,
+      '--query',
+      'What is the answer?',
+      '--system-prompt',
+      systemPromptPath,
+    ],
+    {
+      clock: createClock(),
+      createCodexOAuthProvider: () => ({
+        createCaller() {
+          return {
+            async complete() {
+              return { outputText: 'unused' };
+            },
+          };
+        },
+        async listModels() {
+          return ['gpt-5-4-t-mini', 'gpt-5-3-instant', 'gpt-5'];
+        },
+        async login() {
+          throw new Error('run mode should use the stored auth state instead of forcing login');
+        },
+      }),
+      cwd: root,
+      render: async () => '정답은 42입니다.',
+      runGeneric: async (options) => {
+        cliRunCalls.push({
+          rootModel: options.rootModel,
+          subModel: options.subModel,
+        });
+        return {
+          answer: '42',
+          finalValue: '42',
+        };
+      },
+      writeLine: () => {},
+    },
+  );
+
+  assert.deepEqual(cliRunCalls, [{
+    rootModel: 'gpt-5',
+    subModel: 'gpt-5-3-instant',
+  }]);
+});
+
+Deno.test('runStandaloneCLI can attach the AoT-lite controller guidance to Codex OAuth runs when --aot is enabled', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'rlm-standalone-cli-aot-codex-' });
+  const inputPath = join(root, 'book.txt');
+  const systemPromptPath = join(root, 'ebook-system.txt');
+  await Deno.writeTextFile(inputPath, 'Chapter 1\nThe answer is 42.\n');
+  await Deno.writeTextFile(systemPromptPath, 'Always answer in concise Korean.');
+
+  const plugin = createAoTPlugin();
+  const runCalls: Array<
+    {
+      plugins: unknown;
+      prompt: string;
+      queryTrace: boolean | undefined;
+      systemPromptExtension: string | undefined;
+    }
+  > = [];
+
+  const result = await runStandaloneCLI(
+    [
+      '--provider',
+      'codex-oauth',
+      '--aot',
+      '--input',
+      inputPath,
+      '--query',
+      'Answer richly when the document is incomplete.',
+      '--system-prompt',
+      systemPromptPath,
+    ],
+    {
+      clock: createClock(),
+      createAOTPlugin: () => plugin,
+      createCodexOAuthProvider: () => ({
+        createCaller() {
+          return {
+            async complete() {
+              return {
+                outputText: 'unused',
+              };
+            },
+          };
+        },
+        async listModels() {
+          return ['gpt-5-4-t-mini', 'gpt-5-3-instant'];
+        },
+        async login() {
+          throw new Error('run mode should use the stored auth state instead of forcing login');
+        },
+      }),
+      cwd: root,
+      render: async () => '정답은 42입니다.',
+      runGeneric: async (options) => {
+        runCalls.push({
+          plugins: options.plugins,
+          prompt: options.prompt,
+          queryTrace: options.queryTrace,
+          systemPromptExtension: options.systemPromptExtension,
+        });
+
+        return {
+          answer: '42',
+          finalValue: '42',
+        };
+      },
+      writeLine: () => {},
+    },
+  );
+
+  assert.equal(result.answer, '정답은 42입니다.');
+  assert.deepEqual(runCalls, [{
+    plugins: [plugin],
+    prompt: 'Answer richly when the document is incomplete.',
+    queryTrace: undefined,
+    systemPromptExtension: runCalls[0]?.systemPromptExtension,
+  }]);
+  assert.match(runCalls[0]?.systemPromptExtension ?? '', /must call `aot\(/u);
+  assert.match(runCalls[0]?.systemPromptExtension ?? '', /AoT-lite mode is enabled/u);
+  assert.match(
+    runCalls[0]?.systemPromptExtension ?? '',
+    /document` is empty, missing, or insufficient/u,
+  );
+  assert.match(runCalls[0]?.systemPromptExtension ?? '', /maxIterations: 1/u);
+  assert.match(runCalls[0]?.systemPromptExtension ?? '', /maxIndependentSubquestions: 2/u);
+  assert.match(runCalls[0]?.systemPromptExtension ?? '', /maxRefinements: 0/u);
+  assert.match(runCalls[0]?.systemPromptExtension ?? '', /includeTrace: false/u);
+  assert.match(runCalls[0]?.systemPromptExtension ?? '', /answer without AoT/u);
+});
+
+Deno.test('runStandaloneCLI can attach the AoT-hard controller guidance and debug tracing to Codex OAuth runs when --aot-hard and --aot-debug are enabled', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'rlm-standalone-cli-aot-hard-codex-' });
+  const inputPath = join(root, 'book.txt');
+  const systemPromptPath = join(root, 'ebook-system.txt');
+  await Deno.writeTextFile(inputPath, 'Chapter 1\nThe answer is 42.\n');
+  await Deno.writeTextFile(systemPromptPath, 'Always answer in concise Korean.');
+
+  const plugin = createAoTPlugin();
+  const runCalls: Array<
+    {
+      plugins: unknown;
+      prompt: string;
+      queryTrace: boolean | undefined;
+      systemPromptExtension: string | undefined;
+    }
+  > = [];
+
+  const result = await runStandaloneCLI(
+    [
+      '--provider',
+      'codex-oauth',
+      '--aot-hard',
+      '--aot-debug',
+      '--input',
+      inputPath,
+      '--query',
+      'Answer richly when the document is incomplete.',
+      '--system-prompt',
+      systemPromptPath,
+    ],
+    {
+      clock: createClock(),
+      createAOTPlugin: () => plugin,
+      createCodexOAuthProvider: () => ({
+        createCaller() {
+          return {
+            async complete() {
+              return {
+                outputText: 'unused',
+              };
+            },
+          };
+        },
+        async listModels() {
+          return ['gpt-5-4-t-mini', 'gpt-5-3-instant'];
+        },
+        async login() {
+          throw new Error('run mode should use the stored auth state instead of forcing login');
+        },
+      }),
+      cwd: root,
+      render: async () => '정답은 42입니다.',
+      runGeneric: async (options) => {
+        runCalls.push({
+          plugins: options.plugins,
+          prompt: options.prompt,
+          queryTrace: options.queryTrace,
+          systemPromptExtension: options.systemPromptExtension,
+        });
+
+        return {
+          answer: '42',
+          finalValue: '42',
+        };
+      },
+      writeLine: () => {},
+    },
+  );
+
+  assert.equal(result.answer, '정답은 42입니다.');
+  assert.deepEqual(runCalls, [{
+    plugins: [plugin],
+    prompt: 'Answer richly when the document is incomplete.',
+    queryTrace: true,
+    systemPromptExtension: runCalls[0]?.systemPromptExtension,
+  }]);
+  assert.match(runCalls[0]?.systemPromptExtension ?? '', /AOT-hard mode is enabled/u);
+  assert.match(runCalls[0]?.systemPromptExtension ?? '', /must call `aot\(/u);
+});
+
 Deno.test('runStandaloneCLI can use the default Codex provider and default final renderer in run mode', async () => {
   const root = await Deno.makeTempDir({ prefix: 'rlm-standalone-cli-default-codex-run-' });
   const inputPath = join(root, 'book.txt');
@@ -2096,7 +2965,7 @@ Deno.test('runStandaloneCLI surfaces missing required run flags after provider-o
         writeLine: () => {},
       });
     },
-    /Missing required CLI flags/u,
+    /Missing required CLI flags: --query, --system-prompt\./u,
   );
 });
 

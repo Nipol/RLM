@@ -667,6 +667,475 @@ Deno.test('runner helper utilities cover limit resolution, final acceptance, and
   assert.doesNotThrow(() => __rlmRunnerTestables.throwIfAborted(undefined));
 });
 
+Deno.test('runner evidence helpers cover null contexts, embedded string documents, transcript matches, and surfaced candidate signals', () => {
+  assert.deepEqual(
+    __rlmRunnerTestables.collectRequestedEntityLabels(
+      'Summarize the ledger.',
+      { note: 'irrelevant' } as never,
+    ),
+    [],
+  );
+  assert.deepEqual(
+    __rlmRunnerTestables.collectRequestedEntityLabels(
+      'Return only the exact final requested dossier name through FINAL_VAR.',
+      { question: 'Which exact final requested dossier name is assigned to the moon garden initiative?' },
+    ),
+    ['exact final requested dossier name', 'dossier name', 'dossier'],
+  );
+
+  assert.equal(__rlmRunnerTestables.readContextOptions(null), null);
+  assert.equal(__rlmRunnerTestables.readContextOptions('plain text' as never), null);
+  assert.equal(__rlmRunnerTestables.readContextOptions([] as never), null);
+  assert.equal(
+    __rlmRunnerTestables.readContextOptions({
+      options: { A: 1, B: false },
+    } as never),
+    null,
+  );
+
+  assert.deepEqual(
+    __rlmRunnerTestables.readAvailableOptions([
+      'Question options: A=west route.',
+      'Question options: B=east route.',
+    ].join('\n') as never),
+    {
+      A: 'west route',
+      B: 'east route',
+    },
+  );
+  assert.equal(__rlmRunnerTestables.readAvailableOptions({ document: 'no options here' }), null);
+
+  assert.equal(
+    __rlmRunnerTestables.matchOptionFromEvidence(
+      'Return the multiple-choice option letter.',
+      {
+        options: {
+          A: 'west route',
+          B: 'east route',
+        },
+      },
+      {
+        resultPreview: 'undefined',
+        stdout: 'west route and east route both appear in the notes',
+      },
+    ),
+    null,
+  );
+  assert.deepEqual(
+    __rlmRunnerTestables.matchOptionFromTranscriptEvidence(
+      'Return the option letter.',
+      {
+        options: {
+          A: 'bundle A',
+          B: 'bundle B',
+        },
+      },
+      [
+        {
+          executions: [
+            {
+              resultPreview: 'undefined',
+              stdout: 'matched bundle B in the appendix',
+            },
+          ],
+        },
+      ],
+    ),
+    {
+      label: 'B',
+      text: 'bundle B',
+    },
+  );
+  assert.equal(
+    __rlmRunnerTestables.matchOptionFromTranscriptEvidence(
+      'Return the option letter.',
+      null,
+      [{ executions: [{ resultPreview: 'undefined', stdout: 'bundle B' }] }],
+    ),
+    null,
+  );
+
+  assert.equal(
+    __rlmRunnerTestables.hasSelectedOptionEvidence(
+      'B',
+      'Return the option letter.',
+      null,
+      {
+        resultPreview: 'undefined',
+        stdout: 'B) selected after comparing the appendix',
+      },
+    ),
+    true,
+  );
+  assert.equal(
+    __rlmRunnerTestables.hasSelectedOptionEvidence(
+      'A',
+      'Return the multiple-choice option letter.',
+      null,
+      {
+        resultPreview: 'undefined',
+        stdout: 'question options were loaded and optionMatchCount=1',
+      },
+    ),
+    true,
+  );
+
+  assert.equal(
+    __rlmRunnerTestables.hasPositiveSurfacedCandidateEvidence({
+      execution: {
+        resultPreview: 'undefined',
+        stdout: 'candidateCount=2',
+      },
+      transcript: [],
+    }),
+    true,
+  );
+  assert.equal(
+    __rlmRunnerTestables.hasPositiveSurfacedCandidateEvidence({
+      execution: {
+        resultPreview: 'undefined',
+        stdout: '{"sample":["alpha"]}',
+      },
+      transcript: [],
+    }),
+    true,
+  );
+  assert.equal(
+    __rlmRunnerTestables.hasPositiveSurfacedCandidateEvidence({
+      execution: {
+        resultPreview: 'undefined',
+        stdout: 'rows: ["alpha", "beta"]',
+      },
+      transcript: [],
+    }),
+    true,
+  );
+  assert.equal(
+    __rlmRunnerTestables.hasPositiveSurfacedCandidateEvidence({
+      execution: {
+        resultPreview: 'undefined',
+        stdout: 'nothing surfaced',
+      },
+      transcript: [],
+    }),
+    false,
+  );
+
+  assert.equal(__rlmRunnerTestables.readLatestTranscriptFinalAnswer([]), null);
+  assert.equal(
+    __rlmRunnerTestables.readLatestTranscriptFinalAnswer([
+      { executions: [{ finalAnswer: null }, { finalAnswer: ' 42 ' }] },
+    ]),
+    '42',
+  );
+  assert.equal(
+    __rlmRunnerTestables.readLatestTranscriptFinalAnswer([
+      { executions: [{ finalAnswer: null }] },
+    ]),
+    null,
+  );
+
+  assert.equal(
+    __rlmRunnerTestables.readCompetingTargetCandidates({
+      context: { options: { A: 'alpha', B: 'beta' } },
+      execution: {
+        resultPreview: 'undefined',
+        stdout: 'alpha beta',
+      },
+      prompt: 'Return the multiple-choice option letter.',
+      transcript: [],
+    }),
+    null,
+  );
+  assert.equal(
+    __rlmRunnerTestables.readCompetingTargetCandidates({
+      context: { question: 'Which dossier is assigned to the moon garden initiative?' },
+      execution: {
+        resultPreview: 'undefined',
+        stdout: 'Project Selene moved into dossier Silver Fern.',
+      },
+      prompt: 'Return only the exact dossier name through FINAL_VAR.',
+      transcript: [],
+    }),
+    null,
+  );
+  assert.equal(__rlmRunnerTestables.readQuestionLikeText(null), null);
+  assert.equal(__rlmRunnerTestables.readQuestionLikeText([] as never), null);
+  assert.equal(
+    __rlmRunnerTestables.readQuestionLikeText({ retrievalQuestion: 'What is the exact code?' }),
+    'What is the exact code?',
+  );
+  assert.deepEqual(
+    __rlmRunnerTestables.extractTargetCandidatesFromEvidence('', 'stamp 14-B'),
+    [],
+  );
+  assert.deepEqual(
+    __rlmRunnerTestables.extractTargetCandidatesFromEvidence('stamp', ''),
+    [],
+  );
+  assert.deepEqual(
+    __rlmRunnerTestables.extractTargetCandidatesFromEvidence(
+      'stamp',
+      'The stamp is which option should we choose for the question?',
+    ),
+    [],
+  );
+  assert.deepEqual(
+    __rlmRunnerTestables.extractTargetCandidatesFromEvidence(
+      'stamp',
+      'The stamp is this phrase is definitely far too long to keep.',
+    ),
+    [],
+  );
+  assert.deepEqual(
+    __rlmRunnerTestables.extractTargetCandidatesFromEvidence(
+      'stamp',
+      'stamp = ""\nstamp = 14-B',
+    ),
+    ['14-B'],
+  );
+  assert.equal(
+    __rlmRunnerTestables.readAvailableOptions({
+      document: 'A=,\nB=,',
+    }),
+    null,
+  );
+  assert.equal(
+    __rlmRunnerTestables.matchOptionFromEvidence(
+      'Return the option letter.',
+      { options: { A: 'bundle A' } },
+      {
+        resultPreview: '',
+        stdout: '',
+      },
+    ),
+    null,
+  );
+  assert.equal(
+    __rlmRunnerTestables.matchOptionFromTranscriptEvidence(
+      'Return the option letter.',
+      { options: { A: 'bundle A' } },
+      [{ executions: [{ resultPreview: '', stdout: '' }] }],
+    ),
+    null,
+  );
+  assert.equal(
+    __rlmRunnerTestables.hasSelectedOptionEvidence(
+      'B',
+      'Return the option letter.',
+      { options: { A: 'bundle A', B: 'bundle B' } },
+      {
+        resultPreview: 'undefined',
+        stdout: 'matched bundle B in the appendix without printing the label',
+      },
+    ),
+    true,
+  );
+  assert.equal(
+    __rlmRunnerTestables.hasSelectedOptionEvidence(
+      'B',
+      'This is a multiple-choice question. Return the option letter only.',
+      { options: { A: 'bundle A', B: 'bundle B' } },
+      {
+        resultPreview: 'undefined',
+        stdout: 'question options mention bundle A and bundle B together',
+      },
+    ),
+    true,
+  );
+  assert.equal(
+    __rlmRunnerTestables.finalAnswerRepeatsTargetLabel('stamp: 14-B', ['stamp']),
+    true,
+  );
+  assert.equal(
+    __rlmRunnerTestables.finalAnswerRepeatsTargetLabel('14-B', ['stamp']),
+    false,
+  );
+  assert.equal(
+    __rlmRunnerTestables.isScalarLikeTask(
+      'Return only the exact identifier.',
+      { question: 'Which code applies?' },
+    ),
+    true,
+  );
+  assert.equal(
+    __rlmRunnerTestables.isScalarLikeTask(
+      'Explain the policy in detail.',
+      { question: 'Describe the document.' },
+    ),
+    false,
+  );
+  assert.equal(
+    __rlmRunnerTestables.isScalarLikeTask(
+      'Pick the correct option.',
+      { options: { A: 'first route', B: 'second route' } },
+    ),
+    true,
+  );
+  assert.equal(
+    __rlmRunnerTestables.readTruncatedScalarPrefixFromEvidence('ab', 'abcdef'),
+    null,
+  );
+  assert.equal(
+    __rlmRunnerTestables.readTruncatedScalarPrefixFromEvidence('abc def', 'abcdef'),
+    null,
+  );
+  assert.equal(
+    __rlmRunnerTestables.readCompetingTargetCandidates({
+      context: { note: 'irrelevant' } as never,
+      execution: {
+        resultPreview: 'undefined',
+        stdout: 'nothing useful here',
+      },
+      prompt: 'Summarize the ledger.',
+      transcript: [],
+    }),
+    null,
+  );
+  assert.equal(
+    __rlmRunnerTestables.usesFirstCandidateFinalWithoutUniquenessGuard(
+      'const answer = candidates[1]; FINAL_VAR(answer);',
+    ),
+    false,
+  );
+  assert.equal(
+    __rlmRunnerTestables.usesMergedWorkingSetProjectionWithoutUniquenessGuard(
+      'const joined = rows.join(", "); FINAL_VAR(joined);',
+    ),
+    false,
+  );
+  assert.equal(
+    __rlmRunnerTestables.clipEvaluatorFeedback('  concise feedback  ', 40),
+    'concise feedback',
+  );
+});
+
+Deno.test('runner evaluator helper returns undefined before calling the evaluator when disabled or empty', async () => {
+  let llmCalls = 0;
+  const llm: LLMCaller = {
+    complete: async () => {
+      llmCalls += 1;
+      return { outputText: 'unused' };
+    },
+  };
+
+  assert.equal(
+    await __rlmRunnerTestables.generateEvaluatorFeedback({
+      assistantText: 'plain answer',
+      depth: 0,
+      evaluator: { enabled: false, model: 'gpt-5-evaluator' },
+      executions: [{
+        code: 'FINAL_VAR("ok");',
+        finalAnswer: 'ok',
+        resultPreview: '"ok"',
+        status: 'success',
+        stderr: '',
+        stdout: '',
+      }],
+      llm,
+      onComplete: () => {},
+      prompt: 'Return ok.',
+      step: 1,
+      totalSteps: 3,
+    }),
+    undefined,
+  );
+  assert.equal(
+    await __rlmRunnerTestables.generateEvaluatorFeedback({
+      assistantText: 'plain answer',
+      depth: 0,
+      evaluator: { model: 'gpt-5-evaluator' },
+      executions: [],
+      llm,
+      onComplete: () => {},
+      prompt: 'Return ok.',
+      step: 1,
+      totalSteps: 3,
+    }),
+    undefined,
+  );
+  assert.equal(llmCalls, 0);
+});
+
+Deno.test('runner appends query trace entries when tracing is enabled', async () => {
+  const llm = new MockCaller([
+    {
+      outputText: '```repl\nconst value = await llm_query("Return ok.");\nFINAL_VAR(value);\n```',
+      turnState: { conversation: 'root-1' },
+    },
+    {
+      outputText: 'ok',
+      turnState: { conversation: 'sub-1' },
+    },
+  ]);
+
+  const journalPath = await createSessionPath('query-trace');
+  await runRLM({
+    llm,
+    clock: createClock(),
+    context: null,
+    idGenerator: createIdGenerator(),
+    journalPath,
+    maxSteps: 2,
+    maxSubcallDepth: 1,
+    outputCharLimit: 120,
+    prompt: 'Return ok.',
+    queryTrace: true,
+    rootModel: 'gpt-5-nano',
+    subModel: 'gpt-5-mini',
+  });
+
+  const journalText = await Deno.readTextFile(journalPath);
+  assert.match(journalText, /"type":"query_trace"/u);
+  assert.match(journalText, /"kind":"llm_query"/u);
+});
+
+Deno.test('runner preserves the original failure when runtime cleanup throws after an unsuccessful run', async () => {
+  const llm = new MockCaller([
+    {
+      outputText: '```repl\nconst subtotal = 40 + 2;\n```',
+      turnState: { conversation: 'root-1' },
+    },
+  ]);
+
+  class ThrowingCloseExecutionBackend implements ExecutionBackend {
+    createRuntime(): PersistentRuntimeLike {
+      return {
+        close: async () => {
+          throw new Error('runtime cleanup should be swallowed');
+        },
+        execute: async () => ({
+          error: null,
+          finalAnswer: null,
+          result: { kind: 'number', json: 42, preview: '42' },
+          status: 'success',
+          stderr: '',
+          stdout: '',
+        }),
+      };
+    }
+  }
+
+  await assert.rejects(
+    async () => {
+      await runRLM({
+        llm,
+        clock: createClock(),
+        context: null,
+        executionBackend: new ThrowingCloseExecutionBackend(),
+        idGenerator: createIdGenerator(),
+        maxSteps: 1,
+        maxSubcallDepth: 1,
+        outputCharLimit: 120,
+        prompt: 'Return ok.',
+        rootModel: 'gpt-5-nano',
+        subModel: 'gpt-5-mini',
+      });
+    },
+    RLMMaxStepsError,
+  );
+});
+
 Deno.test('OpenAI provider helper utilities cover provider-aware timeout and logger resolution', async () => {
   assert.equal(
     __openAIProviderTestables.resolveProviderAwareCellTimeoutMs(undefined, 30_000),
@@ -920,6 +1389,40 @@ Deno.test('runner routes rlm_query through the sub-model and records the nested 
   assert.match(childJournalText, /"task":"Compute 6 \* 7\."/u);
 });
 
+Deno.test('runner lets a nested rlm_query override the root step budget for the child run', async () => {
+  const adapter = new MockCaller([
+    {
+      outputText:
+        '```repl\nconst nested = await rlm_query("Compute 6 * 7.", { maxSteps: Number.POSITIVE_INFINITY });\nFINAL_VAR(nested);\n```',
+      turnState: 'resp_root_1',
+    },
+    {
+      outputText: '```repl\nconst scratch = 40 + 2;\n```',
+      turnState: 'resp_sub_1',
+    },
+    {
+      outputText: '```repl\nFINAL_VAR("42");\n```',
+      turnState: 'resp_sub_2',
+    },
+  ]);
+
+  const result = await runRLM({
+    adapter,
+    clock: createClock(),
+    context: { source: 'nested-unbounded-child-steps' },
+    idGenerator: createIdGenerator(),
+    maxSteps: 1,
+    maxSubcallDepth: 2,
+    outputCharLimit: 120,
+    prompt: 'Use rlm_query once and finish in the same root step.',
+    rootModel: 'gpt-5-nano',
+    subModel: 'gpt-5-mini',
+  });
+
+  assert.equal(result.answer, '42');
+  assert.equal(adapter.requests.length, 3);
+});
+
 Deno.test('runner keeps root step budget and metadata aligned after an internal rlm_query before the next root turn', async () => {
   const adapter = new MockCaller([
     {
@@ -1032,6 +1535,53 @@ Deno.test('runner closes nested child sessions after rlm_query returns so only t
   });
 
   assert.equal(result.answer, '42');
+  assert.equal(executionBackend.runtimes.length, 2);
+  assert.equal(executionBackend.runtimes[0]?.closeCalls, 0);
+  assert.equal(executionBackend.runtimes[1]?.closeCalls, 1);
+
+  await result.session.close();
+  assert.equal(executionBackend.runtimes[0]?.closeCalls, 1);
+  assert.equal(executionBackend.runtimes[1]?.closeCalls, 1);
+});
+
+Deno.test('runner closes failed nested child sessions and lets the root recover on the next turn', async () => {
+  const adapter = new MockCaller([
+    {
+      outputText: '```repl\nawait rlm_query("Compute 6 * 7.");\n```',
+      turnState: 'resp_root_1',
+    },
+    {
+      outputText: 'The child forgot to return a repl block.',
+      turnState: 'resp_sub_1',
+    },
+    {
+      outputText: '```repl\nFINAL_VAR("recovered");\n```',
+      turnState: 'resp_root_2',
+    },
+  ]);
+  const executionBackend = new TrackingExecutionBackend();
+
+  const result = await runRLM({
+    adapter,
+    clock: createClock(),
+    context: { source: 'nested-failure-recovery' },
+    executionBackend,
+    idGenerator: createIdGenerator(),
+    maxSteps: 4,
+    maxSubcallDepth: 2,
+    outputCharLimit: 160,
+    prompt: 'Recover if the delegated child fails.',
+    rootModel: 'gpt-5-nano',
+    subModel: 'gpt-5-mini',
+  });
+
+  assert.equal(result.answer, 'recovered');
+  assert.equal(result.session.history.length, 2);
+  assert.equal(result.session.history[0]?.status, 'error');
+  assert.match(
+    result.session.history[0]?.stderr ?? '',
+    /Assistant turn did not contain a ```repl``` block/u,
+  );
   assert.equal(executionBackend.runtimes.length, 2);
   assert.equal(executionBackend.runtimes[0]?.closeCalls, 0);
   assert.equal(executionBackend.runtimes[1]?.closeCalls, 1);

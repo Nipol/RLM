@@ -25,6 +25,14 @@ export {
   buildRLMTurnInput,
   loadDefaultRLMSystemPromptMarkdown,
 } from './rlm_prompt.ts';
+export {
+  assertRuntimeHelperDefinition,
+  assertRuntimeHelperName,
+  buildRuntimeHelperPromptBlock,
+  resolveRuntimeHelperPromptBlocks,
+  resolveRuntimeHelpers,
+  serializeRuntimeHelperSource,
+} from './plugin.ts';
 export { createRLM, RLMMaxStepsError, RLMProtocolError, runRLM } from './rlm_runner.ts';
 export type {
   RLMClient,
@@ -42,6 +50,7 @@ export type {
   PlainLLMQueryCompletion,
   RLMQueryBridgeOptions,
 } from './llm_query.ts';
+export type { RLMPlugin, RuntimeHelperSourceSerializationOptions } from './plugin.ts';
 export type {
   LLMAdapter,
   LLMCaller,
@@ -70,12 +79,16 @@ export type {
   LoadedJournal,
   ModelUsageSummary,
   PersistentRuntimeLike,
+  QueryTraceEntry,
   ReplSessionOptions,
   RLMDelegationRequest,
   RLMLogger,
   RLMQueryHandler,
   RLMQueryInput,
   RLMQueryResult,
+  RLMRuntimeHelper,
+  RLMRuntimeHelperGlobals,
+  RLMRuntimeHelperInputKind,
   RLMUsageSummary,
   SessionEntry,
   SubqueryEntry,

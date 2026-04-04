@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 
+import * as aotPlugin from '../plugin/aot/mod.ts';
+import * as pingPongPlugin from '../plugin/pingpong/mod.ts';
 import * as root from '../mod.ts';
 import * as codexOAuthProvider from '../codex-oauth.ts';
 import * as ollamaProvider from '../ollama.ts';
@@ -17,6 +19,7 @@ Deno.test('root mod entrypoint re-exports the library surface used by JSR consum
   assert.equal('runOpenAIRLM' in root, false);
   assert.equal('OpenAIResponsesProvider' in root, false);
   assert.equal('CodexOAuthProvider' in root, false);
+  assert.equal('runStandaloneCLI' in root, false);
   assert.equal('loadRLMConfig' in root, false);
   assert.equal('estimateOpenAIRunCostUsd' in root, false);
 });
@@ -32,12 +35,19 @@ Deno.test('provider subpath entrypoints expose provider-specific helpers without
   assert.equal(typeof codexOAuthProvider.CodexOAuthProvider, 'function');
 });
 
+Deno.test('plugin subpath entrypoints expose repository plugin helpers', () => {
+  assert.equal(typeof aotPlugin.createAoTPlugin, 'function');
+  assert.equal(typeof pingPongPlugin.createPingPongPlugin, 'function');
+});
+
 Deno.test('deno.json contains the metadata needed for JSR publishing', async () => {
   const configText = await Deno.readTextFile(new URL('../deno.json', import.meta.url));
   const config = JSON.parse(configText) as {
     exports?: {
       '.': string;
       './core': string;
+      './plugin/aot': string;
+      './plugin/pingpong': string;
       './providers/codex-oauth': string;
       './providers/ollama': string;
       './providers/openai': string;
@@ -63,6 +73,8 @@ Deno.test('deno.json contains the metadata needed for JSR publishing', async () 
   assert.deepEqual(config.exports, {
     '.': './mod.ts',
     './core': './core.ts',
+    './plugin/aot': './plugin/aot/mod.ts',
+    './plugin/pingpong': './plugin/pingpong/mod.ts',
     './providers/codex-oauth': './codex-oauth.ts',
     './providers/ollama': './ollama.ts',
     './providers/openai': './openai.ts',
@@ -75,6 +87,7 @@ Deno.test('deno.json contains the metadata needed for JSR publishing', async () 
     'mod.ts',
     'ollama.ts',
     'openai.ts',
+    'plugin/**/*.ts',
     'prompts/rlm_system.ts',
     'src/**/*.ts',
     '.env.example',
@@ -85,7 +98,7 @@ Deno.test('deno.json contains the metadata needed for JSR publishing', async () 
   );
   assert.equal(
     config.tasks?.standalone,
-    'deno run --allow-read --allow-write --allow-net=api.openai.com,auth.openai.com,chatgpt.com src/standalone/main.ts',
+    'deno run --allow-read --allow-write --allow-net=api.openai.com,auth.openai.com,chatgpt.com examples/standalone/main.ts',
   );
   assert.equal(
     config.tasks?.['smoke:build'],

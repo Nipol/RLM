@@ -92,6 +92,7 @@ export interface BuildRLMSystemPromptOptions {
   markdown?: string;
   maxSteps?: number;
   role?: RLMControllerRole;
+  runtimeHelperPromptBlocks?: string[];
 }
 
 function hasDelegatedTask(
@@ -149,6 +150,17 @@ function renderMarkdownTemplate(
     .trim();
 }
 
+function buildRuntimeHelperPromptBlocks(blocks: string[] | undefined): string {
+  if (blocks === undefined || blocks.length === 0) {
+    return '';
+  }
+
+  return blocks
+    .map((block) => block.trim())
+    .filter((block) => block.length > 0)
+    .join('\n\n');
+}
+
 function formatPromptTextBlock(text: string): string {
   return `\`\`\`text\n${text}\n\`\`\``;
 }
@@ -203,35 +215,6 @@ function buildExecutionFeedbackText(
         ? '(없음)'
         : clipInlineText(execution.finalAnswer, outputCharLimit)
     }`,
-  ].join('\n\n');
-}
-
-function buildLatestExecutionFeedback(
-  transcript: RLMTranscriptTurn[],
-  outputCharLimit: number,
-): string | null {
-  const latestTurn = transcript.at(-1);
-  if (latestTurn === undefined || latestTurn.executions.length === 0) {
-    return null;
-  }
-
-  const latestExecution =
-    [...latestTurn.executions].reverse().find((execution) => execution.status === 'success') ??
-      latestTurn.executions.at(-1);
-
-  if (latestExecution === undefined) {
-    return null;
-  }
-
-  return [
-    '## 최신 REPL 실행',
-    '가장 최근의 REPL 기록으로 보고 바로 이어서 작업하십시오.',
-    buildExecutionFeedbackText(
-      latestTurn.step,
-      latestTurn.executions.indexOf(latestExecution) + 1,
-      latestExecution,
-      outputCharLimit,
-    ),
   ].join('\n\n');
 }
 
@@ -484,6 +467,7 @@ export async function buildRLMSystemPrompt(
     : `사용할 수 있는 최대 단계 예산은 ${options.maxSteps}입니다.`;
   return renderMarkdownTemplate(markdown, {
     MAX_STEPS_SENTENCE: maxStepsSentence,
+    RUNTIME_HELPER_PROMPT_BLOCKS: buildRuntimeHelperPromptBlocks(options.runtimeHelperPromptBlocks),
   });
 }
 
@@ -566,53 +550,6 @@ export function buildRLMTurnInput(options: BuildRLMTurnInputOptions): string {
       sections.push(`질문형 문맥 필드:\n${questionHints}`);
     }
   }
-
-  // // transcript가 비어 있으면 첫 turn이므로 이전 REPL 기록 없이 바로 시작 안내를 반환합니다.
-  // if (options.transcript.length === 0) {
-  //   sections.push(
-  //     delegatedContext
-  //       ? '다음 행동:\n위임된 context를 살펴보고 작업을 진전시키는 ```repl 블록으로 시작하십시오.'
-  //       : '다음 행동:\ncontext를 살펴보고, 유용한 working set을 만든 뒤, 작업을 진전시키는 ```repl 블록으로 시작하십시오.',
-  //   );
-  //   return sections.join('\n\n');
-  // }
-
-  // const latestExecutionFeedback = buildLatestExecutionFeedback(
-  //   options.transcript,
-  //   options.outputCharLimit,
-  // );
-  // // 성공한 최신 실행이 있을 때만 별도 최신 실행 섹션을 붙입니다.
-  // if (latestExecutionFeedback !== null) {
-  //   sections.push(latestExecutionFeedback);
-  // }
-
-  // const transcript = options.transcript.map((turn) => {
-  //   const executions = turn.executions.map((execution, index) =>
-  //     [
-  //       `#### Execution ${index + 1}`,
-  //       buildExecutionFeedbackText(turn.step, index + 1, execution, options.outputCharLimit),
-  //     ].join('\n\n')
-  //   ).join('\n\n');
-
-  //   return [
-  //     `### 단계 ${turn.step}`,
-  //     '#### Assistant 텍스트',
-  //     formatPromptTextBlock(clipText(turn.assistantText, options.outputCharLimit)),
-  //     executions,
-  //     // evaluator가 켜져 있고 실제 피드백이 생성된 turn에서만 평가 피드백을 붙입니다.
-  //     turn.evaluatorFeedback === undefined
-  //       ? null
-  //       : [
-  //         '#### 평가 피드백',
-  //         formatPromptTextBlock(clipText(turn.evaluatorFeedback, options.outputCharLimit)),
-  //       ].join('\n\n'),
-  //   ].filter((section): section is string => section !== null).join('\n\n');
-  // }).join('\n\n');
-
-  // sections.push(`## 이전 REPL 기록\n\n${transcript}`);
-  // sections.push(
-  //   '다음 행동:\n다음 ```repl 블록으로 이어가십시오. surface된 기록을 작업 기록처럼 다루고, 작업을 가장 잘 진전시키는 가장 작은 구조를 재사용하십시오. 막힌 사실이 자체 루프를 가질 가치가 있으면 위임하고, 정확한 답이 검증되면 마무리하십시오.',
-  // );
   return sections.join('\n\n');
 }
 
@@ -620,7 +557,7 @@ export function buildRLMTurnInput(options: BuildRLMTurnInputOptions): string {
  * Exposes prompt-construction helpers for focused tests.
  */
 export const __rlmPromptTestables = {
-  buildLatestExecutionFeedback,
+  buildRuntimeHelperPromptBlocks,
   buildContextPreviews,
   buildContextSummary,
   buildExecutionFeedbackText,
@@ -628,6 +565,7 @@ export const __rlmPromptTestables = {
   clipInlineText,
   clipText,
   formatExecutionSignals,
+  formatPromptSections,
   isLargeContext,
   isLargeContextValue,
   slicePreviewTokens,

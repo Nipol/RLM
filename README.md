@@ -14,9 +14,8 @@ TypeScript로 작성된 Recursive Language Model 라이브러리입니다.
 - 선택적 evaluator model
 - 주입 가능한 logger
 - 주입 가능한 execution backend
-- standalone CLI 실행
+- `examples/` 아래의 예제
 - browser-safe core / provider ESM build
-- repository 예제로 포함된 브라우저 단일 페이지 앱
 
 기본 execution backend는 worker 기반 persistent runtime입니다.
 
@@ -89,6 +88,8 @@ deno task build:core
 - `dist/core/index.mjs`
 - `dist/providers/openai/index.mjs`
 - `dist/providers/ollama/index.mjs`
+- `dist/plugin/aot/index.mjs`
+- `dist/plugin/pingpong/index.mjs`
 
 이 산출물에는 browser-safe entrypoint만 포함됩니다.
 
@@ -105,7 +106,8 @@ deno task build:core
   - Codex OAuth provider
 
 즉 `dist/core/index.mjs`와 `dist/providers/*/index.mjs`는 browser-safe 배포물이고, standalone과
-Codex OAuth는 full package/source 경로에서 계속 사용합니다.
+`dist/plugin/*/index.mjs`도 browser-safe 배포물이며, standalone과 Codex OAuth는 full
+package/source 경로에서 계속 사용합니다.
 
 Node ESM에서는 다음처럼 직접 import할 수 있습니다.
 
@@ -113,6 +115,8 @@ Node ESM에서는 다음처럼 직접 import할 수 있습니다.
 import { createRLM } from './dist/core/index.mjs';
 import { createOpenAIRLM } from './dist/providers/openai/index.mjs';
 import { createOllamaRLM } from './dist/providers/ollama/index.mjs';
+import { createAoTPlugin } from './dist/plugin/aot/index.mjs';
+import { createPingPongPlugin } from './dist/plugin/pingpong/index.mjs';
 ```
 
 ## 라이브러리 구조
@@ -475,10 +479,173 @@ const client = createRLM({
 
 `systemPromptExtension`은 내부 RLM system prompt 뒤에 덧붙는 확장 프롬프트입니다.
 
-## standalone CLI
+## 플러그인
 
-standalone CLI는 저장소 안에서 직접 실행하는 편의 계층입니다. 입력 파일을 `context.document`로 넣어
-RLM 코어를 실행하고, 지정한 시스템 프롬프트 파일로 최종 사용자 응답을 다시 렌더링합니다.
+플러그인은 RLM runtime에 추가되는 helper와 system prompt 문구 묶음입니다. 현재 public surface에서는
+`RLMPlugin`을 `createRLM(...)`의 `plugins` 또는 `client.run(...)`의 `plugins`로 전달할 수 있습니다.
+
+- `RLMPlugin`
+  - `name`
+  - `runtimeHelpers?`
+  - `systemPromptBlocks?`
+- `RLMRuntimeHelper`
+  - `name`
+  - `description`
+  - `source`
+  - `inputKinds?`
+  - `promptBlock?`
+  - `signature?`
+  - `returns?`
+  - `examples?`
+  - `timeoutMs?`
+  - `rlmQueryMaxSteps?`
+  - `rlmQueryMaxSubcallDepth?`
+
+runtime helper는 REPL의 top-level binding으로 주입되고, helper 설명은 system prompt에 함께 합쳐집니다.
+
+```ts
+import {
+  createRLM,
+  serializeRuntimeHelperSource,
+  type RLMPlugin,
+  type RLMRuntimeHelperGlobals,
+} from 'jsr:@yoonsung/rlm';
+
+declare const llm_query: RLMRuntimeHelperGlobals['llm_query'];
+
+async function summarizeText(input: string) {
+  return await llm_query(`Summarize the following text:\n${input}`);
+}
+
+const summarizePlugin: RLMPlugin = {
+  name: 'summarize',
+  systemPromptBlocks: [
+    '필요하면 `summarize_text(input)`를 사용해 긴 텍스트를 먼저 줄인 뒤 답하십시오.',
+  ],
+  runtimeHelpers: [{
+    name: 'summarize_text',
+    description: '긴 텍스트를 한 번 요약합니다.',
+    inputKinds: ['text'],
+    source: serializeRuntimeHelperSource({
+      entrypoint: 'summarizeText',
+      functions: [summarizeText],
+    }),
+  }],
+};
+
+const client = createRLM({
+  llm,
+  models: {
+    root: 'demo-root',
+    sub: 'demo-sub',
+  },
+  plugins: [summarizePlugin],
+});
+```
+
+플러그인 개발 시 현재 런타임 제약은 다음과 같습니다.
+
+- helper `source`는 sandbox worker 안에서 실행되는 순수 JavaScript여야 합니다.
+- helper `source`에는 `import`와 `export`를 사용할 수 없습니다.
+- helper 본문 안에서는 `input`이 예약 바인딩이며, 기본 helper 이름과 충돌하는 이름은 사용할 수 없습니다.
+- helper 본문 안에서는 `llm_query(...)`, `rlm_query(...)`, `grep(...)`, `context`, `history`를 그대로 사용할 수 있습니다.
+- `inputKinds`를 지정하지 않으면 입력은 기본적으로 `['text']`입니다.
+- `object`와 `array` 입력은 helper가 해당 타입을 명시적으로 선언한 경우에만 허용됩니다.
+- 문자열 계열 입력은 비어 있지 않은 문자열이어야 합니다.
+- helper 내부 `rlm_query(...)`의 기본값은 `maxSteps = Number.POSITIVE_INFINITY`, `maxSubcallDepth = 1`입니다.
+- helper timeout이 지정되면 그 값은 outer cell timeout floor로도 반영됩니다.
+- 긴 helper는 raw string보다 `serializeRuntimeHelperSource(...)`로 named function 집합을 직렬화하는 방식이 유지보수에 유리합니다.
+- `promptBlock`과 `systemPromptBlocks`는 실제 helper 동작과 일치하게 유지해야 합니다.
+
+### 빌드된 core에서 플러그인 개발과 로드
+
+이미 `deno task build:core`를 실행해 `dist/` 산출물이 준비된 경우에도, custom 플러그인은 별도 모듈로
+작성해 `dist/core/index.mjs`에 바로 연결할 수 있습니다. 이 경우 저장소의 `plugin/` 디렉토리를 수정할
+필요는 없습니다.
+
+일반적인 흐름은 다음과 같습니다.
+
+1. 애플리케이션 쪽에 custom plugin 모듈을 하나 둡니다.
+2. `dist/core/index.mjs`에서 `serializeRuntimeHelperSource(...)`와 `createRLM(...)`를 import합니다.
+3. helper 본문은 named function으로 작성하고, `serializeRuntimeHelperSource(...)`로 `source` 문자열로 직렬화합니다.
+4. 생성한 `RLMPlugin`을 `createRLM({ plugins: [...] })` 또는 `client.run({ plugins: [...] })`에 전달합니다.
+
+`my_plugin.mjs` 예시:
+
+```js
+import { serializeRuntimeHelperSource } from './dist/core/index.mjs';
+
+async function toUppercase(input) {
+  return String(input).toUpperCase();
+}
+
+export function createUppercasePlugin() {
+  return {
+    name: 'uppercase',
+    systemPromptBlocks: [
+      '필요하면 `to_uppercase(text)`를 사용해 텍스트를 먼저 정규화하십시오.',
+    ],
+    runtimeHelpers: [{
+      name: 'to_uppercase',
+      description: '문자열을 대문자로 변환합니다.',
+      inputKinds: ['text'],
+      source: serializeRuntimeHelperSource({
+        entrypoint: 'toUppercase',
+        functions: [toUppercase],
+      }),
+    }],
+  };
+}
+```
+
+`app.mjs` 예시:
+
+```js
+import { createRLM } from './dist/core/index.mjs';
+import { createUppercasePlugin } from './my_plugin.mjs';
+
+const client = createRLM({
+  llm,
+  models: {
+    root: 'demo-root',
+    sub: 'demo-sub',
+  },
+  plugins: [createUppercasePlugin()],
+});
+```
+
+이 방식에서 helper 본문은 최종적으로 worker 안에서 실행되는 순수 JavaScript source로 직렬화됩니다.
+즉 plugin authoring 코드는 애플리케이션 모듈에 있어도 되지만, runtime helper 자체는 다음 제약을 그대로
+따릅니다.
+
+- helper 본문에는 `import` / `export`를 둘 수 없습니다.
+- helper 본문은 브라우저와 Node에서 동일하게 실행될 수 있는 순수 JavaScript여야 합니다.
+- helper가 사용하는 바깥 값은 closure로 캡처되지 않으며, 직렬화된 함수 본문 안에 직접 들어 있어야 합니다.
+- runtime에서 사용할 수 있는 값은 `input`, `context`, `history`, `llm_query(...)`, `rlm_query(...)`, `grep(...)` 등
+  RLM helper scope에 노출된 값뿐입니다.
+
+저장소에 포함된 `plugin/aot`와 `plugin/pingpong`은 같은 방식으로 작성된 reference implementation입니다.
+
+재사용 가능한 플러그인 구현은 `plugin/` 아래에 정리되어 있습니다.
+
+## 예제
+
+현재 저장소의 예제 코드는 `examples/` 아래에 있습니다.
+
+- `examples/standalone/`
+  - 문서 질의, query-only 실행, Codex OAuth login/list-models를 포함한 repository-local CLI 예제
+- `examples/web/`
+  - 브라우저 단일 페이지 앱 예제
+
+플러그인 구현 예제와 재사용 가능한 플러그인은 `plugin/` 아래에 별도로 정리되어 있습니다. 이 예제들은
+저장소 사용 예시이며, 패키지 root surface에 그대로 노출되는 public API와는 구분됩니다.
+
+### standalone CLI
+
+standalone CLI는 [examples/standalone](/Users/yoonsung/Development/RLM/examples/standalone) 아래에
+있는 저장소 예제용 실행 계층입니다. 입력 파일을 `context.document`로 넣어 RLM 코어를 실행하고,
+지정한 시스템 프롬프트 파일로 최종 사용자 응답을 다시 렌더링합니다. 입력 파일이 없으면 빈
+`context.document`로 실행할 수 있습니다.
 
 standalone provider는 다음 두 경로를 지원합니다.
 
@@ -492,9 +659,38 @@ standalone provider는 다음 두 경로를 지원합니다.
 ```bash
 deno task standalone -- \
   --provider openai \
+  --aot \
   --input ./book.md \
   --system-prompt ./prompts/rlm_user_answer_system.txt \
   --query "Chapter Three의 핵심 내용은 무엇입니까?"
+```
+
+`--aot`는 lite AoT 모드입니다. 단일 decomposition-contraction 경로를 따라가며, 기본적으로
+judge/refinement/frontier search를 사용하지 않습니다.
+
+#### 1-0. AoT-hard 실행
+
+```bash
+deno task standalone -- \
+  --provider openai \
+  --aot-hard \
+  --aot-debug \
+  --input ./book.md \
+  --system-prompt ./prompts/rlm_user_answer_system.txt \
+  --query "문서에 직접 없는 질문도 충분히 설명해줘"
+```
+
+`--aot-hard`는 judge, reflective refinement, frontier search를 포함하는 전체 AoT 탐색입니다.
+`--aot-debug`를 함께 쓰면 standalone 진행 로그에 AoT 내부 `llm_query(...)`/`rlm_query(...)`
+trace가 `[aot-debug] ...` 형식으로 출력됩니다.
+
+#### 1-1. 입력 파일 없이 질문만 실행
+
+```bash
+deno task standalone -- \
+  --provider openai \
+  --system-prompt ./prompts/rlm_user_answer_system.txt \
+  --query "르네상스가 왜 이탈리아에서 먼저 시작되었는지 설명해줘"
 ```
 
 #### 2. Codex OAuth 로그인
@@ -518,7 +714,11 @@ deno task standalone -- \
 ### 주요 옵션
 
 - `--provider <openai|codex-oauth>`: standalone 실행 provider 선택. 기본값은 `openai`
-- `--input <path>`: 분석할 입력 파일 경로
+- `--aot`: lite AoT 모드. AoT 플러그인을 붙이고, controller에도 경량 AoT-first 지침을 추가
+- `--aot-hard`: hard AoT 모드. judge/refinement/frontier search를 포함하는 전체 AoT 지침을 추가
+- `--aot-debug`: AoT 내부 query trace를 standalone 진행 로그에 출력. `--aot` 또는 `--aot-hard`
+  와 함께 사용
+- `--input <path>`: 분석할 입력 파일 경로. 생략하면 빈 `context.document`로 실행
 - `--system-prompt <path>`: 최종 사용자 응답 렌더링용 시스템 프롬프트 파일 경로
 - `--query <text>`: 사용자 질문
 - `--log <path>`: JSONL 로그 경로 override
@@ -579,7 +779,16 @@ standalone은 provider가 pricing helper를 제공하면 usage line에 비용을
 - 그 외 provider:
   - pricing helper가 없으면 비용 칸은 빈 값으로 남습니다
 
-## 브라우저 예제
+### 플러그인 디렉토리
+
+플러그인 구현은 [plugin](/Users/yoonsung/Development/RLM/plugin) 아래에 있습니다.
+
+- `plugin/pingpong/`
+  - `"PING"` 입력에 `"PONG"`을 반환하는 최소 runtime helper 플러그인
+- `plugin/aot/`
+  - AoT(Atom of Thoughts) helper를 작은 functional 조각들로 나누어 구현한 플러그인
+
+### 브라우저 예제
 
 저장소에는 `examples/web/` 디렉터리에 브라우저 단일 페이지 앱 예제가 포함되어 있습니다.
 
@@ -610,6 +819,14 @@ browser-safe bundle 빌드:
 deno task build:core
 ```
 
+Node/browser 환경 검증은 `smoke/compose.yml` 기반 컨테이너로 실행됩니다.
+
+- Node smoke 컨테이너: [smoke/node/Dockerfile](/Users/yoonsung/Development/RLM/smoke/node/Dockerfile)
+- Browser smoke 컨테이너: [smoke/browser/Dockerfile](/Users/yoonsung/Development/RLM/smoke/browser/Dockerfile)
+- 두 smoke 모두 먼저 `dist/` 번들을 만든 뒤, 공개 entrypoint가 실제 런타임에서 import 가능한지 확인합니다.
+- smoke는 core/provider bundle뿐 아니라 repository plugin bundle도 함께 확인합니다.
+- plugin smoke에서는 `ping_pong("PING")` helper 실행과 `createAoTPlugin()` import surface를 같이 검증합니다.
+
 Node smoke:
 
 ```bash
@@ -628,6 +845,16 @@ smoke task는 `deno.json`에 정의되어 있으며, bundle을 만든 뒤 다음
 - `dist/core/index.mjs`
 - `dist/providers/openai/index.mjs`
 - `dist/providers/ollama/index.mjs`
+- `dist/plugin/aot/index.mjs`
+- `dist/plugin/pingpong/index.mjs`
+
+동일한 검증은 직접 Docker Compose로도 실행할 수 있습니다.
+
+```bash
+docker compose -f smoke/compose.yml build node-smoke browser-smoke
+docker compose -f smoke/compose.yml run --rm node-smoke
+docker compose -f smoke/compose.yml run --rm browser-smoke
+```
 
 배포 전 검증용 묶음은 다음 순서로 사용할 수 있습니다.
 

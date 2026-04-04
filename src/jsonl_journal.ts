@@ -17,6 +17,21 @@ interface NodeFsPromisesLike {
   readFile(path: string, encoding: string): Promise<string>;
 }
 
+interface JournalDenoRuntimeLike {
+  mkdir?: (path: string, options?: { recursive?: boolean }) => Promise<void>;
+  readTextFile?: (path: string) => Promise<string>;
+  writeTextFile?: (
+    path: string,
+    data: string,
+    options?: { append?: boolean },
+  ) => Promise<void>;
+}
+
+interface JournalDependencies {
+  deno?: JournalDenoRuntimeLike;
+  importNodeBuiltin?: <Module>(name: string) => Promise<Module>;
+}
+
 /**
  * Narrows an arbitrary JSON value into the session header entry shape.
  */
@@ -33,19 +48,36 @@ function isCellEntry(value: unknown): value is CellEntry {
     (value as { type?: string }).type === 'cell';
 }
 
-/**
- * Appends one JSONL record to the journal, creating parent directories as needed.
- */
-export async function appendJournalEntry(path: string, entry: JournalEntry): Promise<void> {
-  const deno = (globalThis as typeof globalThis & {
-    Deno?: {
-      mkdir?: (path: string, options?: { recursive?: boolean }) => Promise<void>;
-      writeTextFile?: (
-        path: string,
-        data: string,
-        options?: { append?: boolean },
-      ) => Promise<void>;
-    };
+function parseJournalText(raw: string): LoadedJournal {
+  const cells: CellEntry[] = [];
+  let session: SessionEntry | null = null;
+
+  for (const line of raw.split('\n')) {
+    if (line.trim().length === 0) {
+      continue;
+    }
+
+    const parsed = JSON.parse(line) as unknown;
+    if (isSessionEntry(parsed)) {
+      session = parsed;
+      continue;
+    }
+
+    if (isCellEntry(parsed)) {
+      cells.push(parsed);
+    }
+  }
+
+  return { cells, session };
+}
+
+async function appendJournalEntryWithDependencies(
+  path: string,
+  entry: JournalEntry,
+  dependencies: JournalDependencies = {},
+): Promise<void> {
+  const deno = dependencies.deno ?? (globalThis as typeof globalThis & {
+    Deno?: JournalDenoRuntimeLike;
   }).Deno;
 
   if (typeof deno?.mkdir === 'function' && typeof deno?.writeTextFile === 'function') {
@@ -54,47 +86,30 @@ export async function appendJournalEntry(path: string, entry: JournalEntry): Pro
     return;
   }
 
-  const fs = await importNodeBuiltin<NodeFsPromisesLike>('fs/promises');
+  const fs = await (dependencies.importNodeBuiltin ?? importNodeBuiltin)<NodeFsPromisesLike>(
+    'fs/promises',
+  );
   await fs.mkdir(dirnameFilePath(path), { recursive: true });
   await fs.appendFile(path, `${JSON.stringify(entry)}\n`, 'utf8');
 }
 
-/**
- * Loads a journal from disk and separates the session header from executable cells.
- */
-export async function loadJournal(path: string): Promise<LoadedJournal> {
+async function loadJournalWithDependencies(
+  path: string,
+  dependencies: JournalDependencies = {},
+): Promise<LoadedJournal> {
   try {
-    const deno = (globalThis as typeof globalThis & {
-      Deno?: {
-        readTextFile?: (path: string) => Promise<string>;
-      };
+    const deno = dependencies.deno ?? (globalThis as typeof globalThis & {
+      Deno?: JournalDenoRuntimeLike;
     }).Deno;
     const raw = typeof deno?.readTextFile === 'function'
       ? await deno.readTextFile(path)
-      : await (await importNodeBuiltin<NodeFsPromisesLike>('fs/promises')).readFile(
+      : await (await (dependencies.importNodeBuiltin ?? importNodeBuiltin)<NodeFsPromisesLike>(
+        'fs/promises',
+      )).readFile(
         path,
         'utf8',
       );
-    const cells: CellEntry[] = [];
-    let session: SessionEntry | null = null;
-
-    for (const line of raw.split('\n')) {
-      if (line.trim().length === 0) {
-        continue;
-      }
-
-      const parsed = JSON.parse(line) as unknown;
-      if (isSessionEntry(parsed)) {
-        session = parsed;
-        continue;
-      }
-
-      if (isCellEntry(parsed)) {
-        cells.push(parsed);
-      }
-    }
-
-    return { cells, session };
+    return parseJournalText(raw);
   } catch (error) {
     if (isNotFoundError(error)) {
       return { cells: [], session: null };
@@ -103,3 +118,28 @@ export async function loadJournal(path: string): Promise<LoadedJournal> {
     throw error;
   }
 }
+
+/**
+ * Appends one JSONL record to the journal, creating parent directories as needed.
+ */
+export async function appendJournalEntry(path: string, entry: JournalEntry): Promise<void> {
+  await appendJournalEntryWithDependencies(path, entry);
+}
+
+/**
+ * Loads a journal from disk and separates the session header from executable cells.
+ */
+export async function loadJournal(path: string): Promise<LoadedJournal> {
+  return await loadJournalWithDependencies(path);
+}
+
+/**
+ * Exposes JSONL journal internals for focused tests.
+ */
+export const __jsonlJournalTestables = {
+  appendJournalEntryWithDependencies,
+  isCellEntry,
+  isSessionEntry,
+  loadJournalWithDependencies,
+  parseJournalText,
+};

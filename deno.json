@@ -1,10 +1,12 @@
 {
   "name": "@yoonsung/rlm",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "license": "LGPL-3.0-only",
   "exports": {
     ".": "./mod.ts",
     "./core": "./core.ts",
+    "./plugin/aot": "./plugin/aot/mod.ts",
+    "./plugin/pingpong": "./plugin/pingpong/mod.ts",
     "./providers/codex-oauth": "./codex-oauth.ts",
     "./providers/ollama": "./ollama.ts",
     "./providers/openai": "./openai.ts"
@@ -26,6 +28,7 @@
       "mod.ts",
       "ollama.ts",
       "openai.ts",
+      "plugin/**/*.ts",
       "prompts/rlm_system.ts",
       "src/**/*.ts",
       ".env.example"
@@ -33,7 +36,7 @@
   },
   "tasks": {
     "test": "deno test --allow-read --allow-write",
-    "standalone": "deno run --allow-read --allow-write --allow-net=api.openai.com,auth.openai.com,chatgpt.com src/standalone/main.ts",
+    "standalone": "deno run --allow-read --allow-write --allow-net=api.openai.com,auth.openai.com,chatgpt.com examples/standalone/main.ts",
     "coverage": "deno test --allow-read --allow-write --coverage=coverage/raw && deno coverage --lcov --output=coverage/lcov.info coverage/raw && deno coverage --html coverage/raw",
     "coverage:raw": "deno test --allow-read --allow-write --coverage=coverage/raw",
     "coverage:report": "deno coverage --lcov --output=coverage/lcov.info coverage/raw && deno coverage --html coverage/raw",

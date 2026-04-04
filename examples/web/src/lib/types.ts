@@ -36,7 +36,8 @@ export interface ProviderDraft {
   subReasoningEffort?: OpenAIReasoningEffort;
 }
 
-export interface ProviderSettings extends ProviderDraft {
+export interface ProviderSettings extends Omit<ProviderDraft, 'requestTimeoutMs'> {
+  requestTimeoutMs: number;
   updatedAt: string;
 }
 

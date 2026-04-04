@@ -23,6 +23,7 @@ import type {
   RLMQueryHandler,
   RLMQueryInput,
   RLMUsageSummary,
+  QueryTraceEntry,
 } from './types.ts';
 
 export { createSubqueryJournalPath } from './subquery_path.ts';
@@ -132,9 +133,11 @@ export interface PlainLLMQueryCompletion {
  * ```
  */
 export interface LLMQueryBridgeOptions {
+  clock?: () => Date;
   currentDepth?: number;
   llm: LLMCaller;
   onComplete?: (completion: PlainLLMQueryCompletion) => void | Promise<void>;
+  onTrace?: (entry: QueryTraceEntry) => void | Promise<void>;
   subModel: string;
 }
 
@@ -153,10 +156,12 @@ export interface LLMQueryBridgeOptions {
  * ```
  */
 export interface RLMQueryBridgeOptions {
+  clock?: () => Date;
   createChildLogger?: (depth: number, queryIndex: number) => RLMLogger;
   currentDepth?: number;
   maxSteps: number;
   maxSubcallDepth: number;
+  onTrace?: (entry: QueryTraceEntry) => void | Promise<void>;
   outputCharLimit: number;
   runNestedRLM: NestedRLMRunner;
   subModel: string;
@@ -172,6 +177,30 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted === true) {
     throw createAbortError();
   }
+}
+
+function buildQueryTracePromptPreview(prompt: string): string {
+  const trimmed = prompt.trim();
+  return trimmed.length <= 240 ? trimmed : `${trimmed.slice(0, 237)}...`;
+}
+
+function extractQueryTracePromptTag(prompt: string): string | undefined {
+  const firstNonEmptyLine = prompt.split(/\r?\n/u).find((line) => line.trim().length > 0)?.trim();
+  if (firstNonEmptyLine === undefined || !/^[A-Z][A-Z0-9_]+$/u.test(firstNonEmptyLine)) {
+    return undefined;
+  }
+
+  return firstNonEmptyLine;
+}
+
+function normalizeQueryTraceMaxSteps(
+  value: number | undefined,
+): number | 'unbounded' | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  return Number.isFinite(value) ? value : 'unbounded';
 }
 
 /**
@@ -214,6 +243,8 @@ export class RLMSubqueryResultError extends Error {
 
 interface DelegatedChildContext {
   expect?: RLMExpectContract;
+  maxSteps?: number;
+  maxSubcallDepth?: number;
   payload?: JsonValue;
   selectionHints?: {
     positiveSelectors: string[];
@@ -423,6 +454,36 @@ function normalizeExpectContract(
     requiredKeys: shorthandEntries.map(([key]) => key),
     type: 'object',
   };
+}
+
+function normalizeDelegatedMaxSubcallDepth(
+  value: number | undefined,
+): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (!Number.isInteger(value) || value < 1) {
+    throw new Error('rlm_query object requests require a positive integer maxSubcallDepth.');
+  }
+
+  return value;
+}
+
+function normalizeDelegatedMaxSteps(
+  value: number | undefined,
+): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (value !== Number.POSITIVE_INFINITY && (!Number.isInteger(value) || value < 1)) {
+    throw new Error(
+      'rlm_query object requests require a positive integer maxSteps or Number.POSITIVE_INFINITY.',
+    );
+  }
+
+  return value;
 }
 
 function describeJsonValueType(value: JsonValue): string {
@@ -766,11 +827,19 @@ export function buildDelegatedChildContext(prompt: RLMQueryInput): DelegatedChil
   }
 
   if (isDelegationRequest(rawDelegated)) {
-    const { expect, payload, task, ...rest } = rawDelegated;
+    const { expect, maxSteps, maxSubcallDepth, payload, task, ...rest } = rawDelegated;
     const delegated: DelegatedChildContext = {
       task,
       type: 'rlm_delegated_task',
     };
+    const normalizedMaxSteps = normalizeDelegatedMaxSteps(maxSteps);
+    if (normalizedMaxSteps !== undefined) {
+      delegated.maxSteps = normalizedMaxSteps;
+    }
+    const normalizedMaxSubcallDepth = normalizeDelegatedMaxSubcallDepth(maxSubcallDepth);
+    if (normalizedMaxSubcallDepth !== undefined) {
+      delegated.maxSubcallDepth = normalizedMaxSubcallDepth;
+    }
     const delegatedPayload = buildDelegatedChildPayload(payload, rest);
     if (delegatedPayload !== undefined) {
       delegated.payload = delegatedPayload;
@@ -828,30 +897,61 @@ export function buildLLMQuerySystemPrompt(): string {
  */
 export function createLLMQueryHandler(options: LLMQueryBridgeOptions): LLMQueryHandler {
   let queryCount = 0;
+  const clock = options.clock ?? (() => new Date());
 
   return async (prompt: string, invocationOptions = {}) => {
     throwIfAborted(invocationOptions.signal);
     const queryIndex = queryCount++;
-    const completion = await options.llm.complete({
-      input: String(prompt),
-      kind: 'plain_query' satisfies LLMCallKind,
-      metadata: {
+    const startedAt = clock();
+    const promptText = String(prompt);
+    try {
+      const completion = await options.llm.complete({
+        input: promptText,
+        kind: 'plain_query' satisfies LLMCallKind,
+        metadata: {
+          depth: options.currentDepth ?? 0,
+          queryIndex,
+        },
+        model: options.subModel,
+        signal: invocationOptions.signal,
+        systemPrompt: buildLLMQuerySystemPrompt(),
+      });
+      throwIfAborted(invocationOptions.signal);
+
+      await options.onComplete?.({
+        model: options.subModel,
+        turnState: completion.turnState,
+        usage: completion.usage,
+      });
+      await options.onTrace?.({
+        createdAt: startedAt.toISOString(),
         depth: options.currentDepth ?? 0,
+        durationMs: Math.max(0, clock().getTime() - startedAt.getTime()),
+        kind: 'llm_query',
+        model: options.subModel,
+        promptPreview: buildQueryTracePromptPreview(promptText),
+        promptTag: extractQueryTracePromptTag(promptText),
         queryIndex,
-      },
-      model: options.subModel,
-      signal: invocationOptions.signal,
-      systemPrompt: buildLLMQuerySystemPrompt(),
-    });
-    throwIfAborted(invocationOptions.signal);
+        status: 'success',
+        type: 'query_trace',
+      });
 
-    await options.onComplete?.({
-      model: options.subModel,
-      turnState: completion.turnState,
-      usage: completion.usage,
-    });
-
-    return completion.outputText;
+      return completion.outputText;
+    } catch (error) {
+      await options.onTrace?.({
+        createdAt: startedAt.toISOString(),
+        depth: options.currentDepth ?? 0,
+        durationMs: Math.max(0, clock().getTime() - startedAt.getTime()),
+        kind: 'llm_query',
+        model: options.subModel,
+        promptPreview: buildQueryTracePromptPreview(promptText),
+        promptTag: extractQueryTracePromptTag(promptText),
+        queryIndex,
+        status: 'error',
+        type: 'query_trace',
+      });
+      throw error;
+    }
   };
 }
 
@@ -878,46 +978,97 @@ export function createLLMQueryHandler(options: LLMQueryBridgeOptions): LLMQueryH
 export function createRLMQueryHandler(options: RLMQueryBridgeOptions): RLMQueryHandler {
   let queryCount = 0;
   let pendingRun = Promise.resolve();
+  const clock = options.clock ?? (() => new Date());
 
   return async (prompt: RLMQueryInput, invocationOptions = {}) => {
     const run = async () => {
       throwIfAborted(invocationOptions.signal);
 
+      const startedAt = clock();
+      const delegatedContext = buildDelegatedChildContext(prompt);
+      const invocationMaxSteps = normalizeDelegatedMaxSteps(invocationOptions.maxSteps);
+      const invocationMaxSubcallDepth = normalizeDelegatedMaxSubcallDepth(
+        invocationOptions.maxSubcallDepth,
+      );
+      const effectiveMaxSubcallDepth = Math.min(
+        options.maxSubcallDepth,
+        delegatedContext.maxSubcallDepth ??
+          invocationMaxSubcallDepth ??
+          options.maxSubcallDepth,
+      );
       const nextDepth = (options.currentDepth ?? 0) + 1;
-      if (nextDepth > options.maxSubcallDepth) {
-        throw new RLMSubqueryDepthError(nextDepth, options.maxSubcallDepth);
+      if (nextDepth > effectiveMaxSubcallDepth) {
+        throw new RLMSubqueryDepthError(nextDepth, effectiveMaxSubcallDepth);
       }
       const queryIndex = queryCount++;
+      const effectiveMaxSteps = delegatedContext.maxSteps ?? invocationMaxSteps ?? options.maxSteps;
+      const {
+        maxSteps: _ignoredMaxSteps,
+        maxSubcallDepth: _ignoredMaxSubcallDepth,
+        ...childContext
+      } = delegatedContext;
+      try {
+        const result = await options.runNestedRLM({
+          context: childContext as unknown as JsonValue,
+          depth: nextDepth,
+          logger: options.createChildLogger?.(nextDepth, queryIndex) ?? new NullRLMLogger(),
+          maxSteps: effectiveMaxSteps,
+          maxSubcallDepth: effectiveMaxSubcallDepth,
+          outputCharLimit: options.outputCharLimit,
+          prompt: delegatedContext.task,
+          rootModel: options.subModel,
+          signal: invocationOptions.signal,
+          subModel: options.subModel,
+        });
+        throwIfAborted(invocationOptions.signal);
 
-      const delegatedContext = buildDelegatedChildContext(prompt);
-      const result = await options.runNestedRLM({
-        context: delegatedContext as unknown as JsonValue,
-        depth: nextDepth,
-        logger: options.createChildLogger?.(nextDepth, queryIndex) ?? new NullRLMLogger(),
-        maxSteps: options.maxSteps,
-        maxSubcallDepth: options.maxSubcallDepth,
-        outputCharLimit: options.outputCharLimit,
-        prompt: delegatedContext.task,
-        rootModel: options.subModel,
-        signal: invocationOptions.signal,
-        subModel: options.subModel,
-      });
-      throwIfAborted(invocationOptions.signal);
+        if (result.value === null) {
+          throw new RLMSubqueryResultError(delegatedContext.task);
+        }
 
-      if (result.value === null) {
-        throw new RLMSubqueryResultError(delegatedContext.task);
+        await options.onTrace?.({
+          createdAt: startedAt.toISOString(),
+          depth: nextDepth,
+          durationMs: Math.max(0, clock().getTime() - startedAt.getTime()),
+          kind: 'rlm_query',
+          maxSteps: normalizeQueryTraceMaxSteps(effectiveMaxSteps),
+          maxSubcallDepth: effectiveMaxSubcallDepth,
+          model: options.subModel,
+          promptPreview: buildQueryTracePromptPreview(delegatedContext.task),
+          promptTag: extractQueryTracePromptTag(delegatedContext.task),
+          queryIndex,
+          status: 'success',
+          steps: result.steps,
+          type: 'query_trace',
+        });
+
+        return createInternalRLMQueryResultEnvelope(
+          normalizeDelegatedValue(
+            delegatedContext.task,
+            delegatedContext.payload,
+            delegatedContext.selectionHints,
+            delegatedContext.expect,
+            result.value,
+          ),
+          result.stdout,
+        ) as unknown as JsonValue;
+      } catch (error) {
+        await options.onTrace?.({
+          createdAt: startedAt.toISOString(),
+          depth: nextDepth,
+          durationMs: Math.max(0, clock().getTime() - startedAt.getTime()),
+          kind: 'rlm_query',
+          maxSteps: normalizeQueryTraceMaxSteps(effectiveMaxSteps),
+          maxSubcallDepth: effectiveMaxSubcallDepth,
+          model: options.subModel,
+          promptPreview: buildQueryTracePromptPreview(delegatedContext.task),
+          promptTag: extractQueryTracePromptTag(delegatedContext.task),
+          queryIndex,
+          status: 'error',
+          type: 'query_trace',
+        });
+        throw error;
       }
-
-      return createInternalRLMQueryResultEnvelope(
-        normalizeDelegatedValue(
-          delegatedContext.task,
-          delegatedContext.payload,
-          delegatedContext.selectionHints,
-          delegatedContext.expect,
-          result.value,
-        ),
-        result.stdout,
-      ) as unknown as JsonValue;
     };
 
     const previousRun = pendingRun;
@@ -931,19 +1082,24 @@ export function createRLMQueryHandler(options: RLMQueryBridgeOptions): RLMQueryH
  * Exposes query-construction helpers for isolated tests.
  */
 export const __llmQueryTestables = {
+  buildQueryTracePromptPreview,
   createInternalRLMQueryResultEnvelope,
   buildDelegatedChildContext,
   buildDelegatedChildPayload,
   createAbortError,
   describeJsonValueType,
+  extractQueryTracePromptTag,
   extractSelectionIdentifier,
   inferSelectionHints,
   isDelegationRequest,
   isExpectValueKind,
   isJsonObject,
   normalizeDelegatedValue,
+  normalizeDelegatedMaxSteps,
+  normalizeQueryTraceMaxSteps,
   normalizeExpectContract,
   parseDelegatedPayload,
+  normalizeDelegatedMaxSubcallDepth,
   throwIfAborted,
   validateScalarFieldValue,
   validateSelectionHints,

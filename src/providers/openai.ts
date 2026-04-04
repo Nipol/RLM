@@ -12,7 +12,8 @@ import type { RLMClient, RLMDefaults, RLMRunInput } from '../library_entrypoint.
 import { resolveRLMLogger } from '../logger.ts';
 import { createRLM } from '../rlm_runner.ts';
 import type { RLMRunResult } from '../rlm_runner.ts';
-import type { ExecutionBackend, RLMLogger } from '../types.ts';
+import type { RLMPlugin } from '../plugin.ts';
+import type { ExecutionBackend, RLMLogger, RLMRuntimeHelper } from '../types.ts';
 import { OpenAIResponsesProvider } from './openai_adapter.ts';
 import type { OpenAIProviderConfig, OpenAIReasoningEffort } from './openai_config.ts';
 import {
@@ -50,6 +51,9 @@ export interface OpenAIRLMClientOptions {
   idGenerator?: () => string;
   logger?: RLMLogger;
   openAI: OpenAIProviderConfig;
+  plugins?: RLMPlugin[];
+  runtimeHelpers?: RLMRuntimeHelper[];
+  runtimeHelperPromptBlocks?: string[];
   systemPromptExtension?: string;
 }
 
@@ -137,6 +141,9 @@ export function createOpenAIRLM(options: OpenAIRLMClientOptions): RLMClient {
       root: options.openAI.rootModel,
       sub: options.openAI.subModel,
     },
+    plugins: options.plugins,
+    runtimeHelpers: options.runtimeHelpers,
+    runtimeHelperPromptBlocks: options.runtimeHelperPromptBlocks,
     systemPromptExtension: options.systemPromptExtension,
   });
 
@@ -174,6 +181,9 @@ export async function runOpenAIRLM(options: RunOpenAIRLMOptions): Promise<RLMRun
     idGenerator: options.idGenerator,
     logger: resolveOpenAIRunLogger(options.logger, options.journalPath),
     openAI: options.openAI,
+    plugins: options.plugins,
+    runtimeHelpers: options.runtimeHelpers,
+    runtimeHelperPromptBlocks: options.runtimeHelperPromptBlocks,
   });
 
   return await client.run({
@@ -182,7 +192,11 @@ export async function runOpenAIRLM(options: RunOpenAIRLMOptions): Promise<RLMRun
     maxSteps: options.maxSteps,
     maxSubcallDepth: options.maxSubcallDepth,
     outputCharLimit: options.outputCharLimit,
+    plugins: options.plugins,
     prompt: options.prompt,
+    queryTrace: options.queryTrace,
+    runtimeHelpers: options.runtimeHelpers,
+    runtimeHelperPromptBlocks: options.runtimeHelperPromptBlocks,
     systemPromptExtension: options.systemPromptExtension,
   });
 }

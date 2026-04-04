@@ -13,6 +13,7 @@ const RESERVED_IDENTIFIERS = [
   'FINAL_VAR',
   'SHOW_VARS',
   'context',
+  'grep',
   'history',
   'llm_query',
   'llm_query_batched',
@@ -21,6 +22,15 @@ const RESERVED_IDENTIFIERS = [
 ] as const;
 
 const BLOCKED_IMPORT_PATTERNS = [/\bimport\s*\(/, /\bimport\s+/, /\bimport\.meta\b/, /\bexport\s+/];
+
+function buildReservedIdentifierList(
+  additionalReservedIdentifiers: string[] = [],
+): string[] {
+  return [
+    ...RESERVED_IDENTIFIERS,
+    ...additionalReservedIdentifiers,
+  ];
+}
 
 /**
  * Replaces the contents of strings and comments with whitespace so structural
@@ -121,7 +131,14 @@ function assertNoModuleSyntax(redactedSource: string): void {
  * Prevents user code from shadowing reserved bindings that the REPL injects.
  */
 function assertNoReservedIdentifierOverride(redactedSource: string): void {
-  const names = RESERVED_IDENTIFIERS.join('|');
+  assertNoReservedIdentifierOverrideWithIdentifiers(redactedSource, RESERVED_IDENTIFIERS);
+}
+
+function assertNoReservedIdentifierOverrideWithIdentifiers(
+  redactedSource: string,
+  reservedIdentifiers: ReadonlyArray<string>,
+): void {
+  const names = reservedIdentifiers.join('|');
   const declarationPattern = new RegExp(`\\b(?:const|let|var|function|class)\\s+(${names})\\b`);
   const assignmentPattern = new RegExp(`(^|[^.\\w$])(${names})\\s*=(?!=|>)`, 'm');
 
@@ -307,10 +324,18 @@ function stripLeadingTrivia(source: string): string {
 /**
  * Validates that a cell can run inside the v1 sandbox before any worker is created.
  */
-export function assertCodeIsRunnable(source: string): void {
+export function assertCodeIsRunnable(
+  source: string,
+  options: {
+    additionalReservedIdentifiers?: string[];
+  } = {},
+): void {
   const redactedSource = redactNonCode(source);
   assertNoModuleSyntax(redactedSource);
-  assertNoReservedIdentifierOverride(redactedSource);
+  assertNoReservedIdentifierOverrideWithIdentifiers(
+    redactedSource,
+    buildReservedIdentifierList(options.additionalReservedIdentifiers),
+  );
 }
 
 /**
@@ -351,8 +376,10 @@ export function splitTrailingExpression(
  * Exposes internal code-guard helpers for focused unit tests.
  */
 export const __codeGuardTestables = {
+  buildReservedIdentifierList,
   assertNoModuleSyntax,
   assertNoReservedIdentifierOverride,
+  assertNoReservedIdentifierOverrideWithIdentifiers,
   findTrailingExpressionBoundary,
   looksLikeBlockStatement,
   looksLikeExpression,

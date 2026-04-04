@@ -20,10 +20,7 @@ export function prepareLastUserPromptRerun(
   }
 
   const lastUserTurnIndex = snapshot.turns.length - 1 - promptIndex;
-  const promptTurn = snapshot.turns[lastUserTurnIndex];
-  if (promptTurn === undefined) {
-    return null;
-  }
+  const promptTurn = snapshot.turns[lastUserTurnIndex]!;
 
   const historyBeforePrompt = snapshot.turns.slice(0, lastUserTurnIndex);
   return {

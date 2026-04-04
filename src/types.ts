@@ -89,6 +89,17 @@ export type RLMExpectInput = RLMExpectContract | RLMExpectShorthand | string;
  */
 export interface RLMDelegationRequest {
   expect?: RLMExpectInput;
+  /**
+   * Overrides the child run step budget for this one delegated `rlm_query(...)`
+   * request. Finite values must be positive integers.
+   */
+  maxSteps?: number;
+  /**
+   * Narrows the maximum recursive `rlm_query(...)` depth allowed for this one
+   * delegated child run. The effective limit is still capped by the parent
+   * bridge's configured `maxSubcallDepth`.
+   */
+  maxSubcallDepth?: number;
   payload?: JsonValue;
   task: string;
 }
@@ -236,6 +247,25 @@ export interface SubqueryEntry {
 }
 
 /**
+ * Describes one debug trace emitted for `llm_query(...)` or `rlm_query(...)`.
+ */
+export interface QueryTraceEntry {
+  createdAt: string;
+  depth: number;
+  durationMs: number;
+  kind: 'llm_query' | 'rlm_query';
+  maxSteps?: number | 'unbounded';
+  maxSubcallDepth?: number;
+  model: string;
+  promptPreview: string;
+  promptTag?: string;
+  queryIndex: number;
+  status: 'error' | 'success';
+  steps?: number;
+  type: 'query_trace';
+}
+
+/**
  * Describes one standalone-stage failure persisted for later inspection.
  */
 export interface StandaloneErrorEntry {
@@ -252,6 +282,7 @@ export type JournalEntry =
   | AssistantTurnEntry
   | CellEntry
   | EvaluatorFeedbackEntry
+  | QueryTraceEntry
   | SessionEntry
   | StandaloneErrorEntry
   | SubqueryEntry;
@@ -288,7 +319,99 @@ export type LLMQueryResult = JsonValue;
  * Describes shared invocation options accepted by REPL query bridges.
  */
 export interface QueryInvocationOptions {
+  /**
+   * Overrides the delegated child run step budget for one `rlm_query(...)`
+   * call. Runtime-helper wrappers use `Number.POSITIVE_INFINITY` here so
+   * plugin-internal child runs are not forced to share the root step cap.
+   */
+  maxSteps?: number;
+  /**
+   * Optionally narrows the recursive `rlm_query(...)` depth limit for a single
+   * delegated call path. This is primarily used by runtime-helper wrappers.
+   */
+  maxSubcallDepth?: number;
   signal?: AbortSignal;
+}
+
+/**
+ * Describes one runtime helper injected into the REPL surface.
+ */
+export type RLMRuntimeHelperInputKind = 'array' | 'object' | 'repl_code' | 'source' | 'text';
+
+/**
+ * Describes one runtime helper injected into the REPL surface.
+ */
+export interface RLMRuntimeHelper {
+  description: string;
+  examples?: string[];
+  /**
+   * Declares which input kinds this helper accepts.
+   * Every helper input must be non-null and non-undefined.
+   * String-like kinds require a non-empty string. Object/array kinds are only
+   * accepted when declared explicitly here.
+   * Defaults to `['text']`.
+   */
+  inputKinds?: RLMRuntimeHelperInputKind[];
+  name: string;
+  promptBlock?: string;
+  /**
+   * Sets the default `maxSteps` applied to `rlm_query(...)` and
+   * `rlm_query_batched(...)` calls made from inside this helper body when the
+   * helper code does not pass one explicitly. Defaults to
+   * `Number.POSITIVE_INFINITY`, so plugin-internal child runs are not forced to
+   * share the root run's step budget unless the helper opts into a finite cap.
+   */
+  rlmQueryMaxSteps?: number;
+  /**
+   * Sets the default `maxSubcallDepth` applied to `rlm_query(...)` and
+   * `rlm_query_batched(...)` calls made from inside this helper body when the
+   * helper code does not pass one explicitly. Defaults to `1`.
+   */
+  rlmQueryMaxSubcallDepth?: number;
+  returns?: string;
+  signature?: string;
+  /**
+   * Pure JavaScript helper source executed inside the sandboxed REPL worker.
+   * The source must not use import/export syntax and receives its input through
+   * the reserved `input` binding. Built-in runtime helpers such as
+   * `llm_query(...)`, `rlm_query(...)`, `grep(...)`, `context`, and `history`
+   * remain available inside this helper body. Helper calls only accept inputs
+   * whose runtime type matches the declared `inputKinds`.
+   */
+  source: string;
+  timeoutMs?: number;
+}
+
+/**
+ * Describes the built-in bindings visible while authoring runtime-helper source.
+ * Plugin authors can use this as a type-only view over `globalThis` while still
+ * emitting pure JavaScript helper source into the sandbox.
+ */
+export interface RLMRuntimeHelperGlobals {
+  FINAL: (value: unknown) => unknown;
+  FINAL_VAR: (value: unknown) => unknown;
+  SHOW_VARS: () => string[];
+  context: JsonValue | null;
+  grep: (
+    input: string,
+    pattern: RegExp | string,
+    options?: {
+      after?: number;
+      before?: number;
+      limit?: number;
+    },
+  ) => string[];
+  history: readonly unknown[];
+  llm_query: (prompt: string) => Promise<LLMQueryResult>;
+  llm_query_batched: (prompts: string[]) => Promise<LLMQueryResult[]>;
+  rlm_query: (
+    prompt: RLMQueryInput,
+    options?: QueryInvocationOptions,
+  ) => Promise<RLMQueryResult>;
+  rlm_query_batched: (
+    prompts: RLMQueryInput[],
+    options?: QueryInvocationOptions,
+  ) => Promise<RLMQueryResult[]>;
 }
 
 /**
@@ -330,6 +453,7 @@ export interface ReplSessionOptions {
   llmQueryHandler?: LLMQueryHandler;
   rlmQueryHandler?: RLMQueryHandler;
   logger?: RLMLogger;
+  runtimeHelpers?: RLMRuntimeHelper[];
 }
 
 /**
@@ -368,5 +492,6 @@ export interface ExecutionBackend {
     context: JsonValue | null;
     llmQueryHandler?: LLMQueryHandler;
     rlmQueryHandler?: RLMQueryHandler;
+    runtimeHelpers?: RLMRuntimeHelper[];
   }): PersistentRuntimeLike;
 }

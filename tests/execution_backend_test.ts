@@ -30,6 +30,10 @@ Deno.test('execution backend helpers can decode generated worker URLs and wrap n
   const url = `data:text/javascript;charset=utf-8,${encodeURIComponent(source)}`;
 
   assert.equal(__executionBackendTestables.decodeWorkerDataUrl(url), source);
+  assert.throws(
+    () => __executionBackendTestables.decodeWorkerDataUrl('data:text/javascript;charset=utf-8'),
+    /data URL with encoded source text/u,
+  );
 
   const nodeSource = __executionBackendTestables.buildNodeWorkerSource(source);
   assert(nodeSource.includes("import { parentPort } from 'node:worker_threads';"));

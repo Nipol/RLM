@@ -23,6 +23,7 @@ Deno.test('Ollama adapter posts model system prompt and input to the generate en
   const adapter = new OllamaGenerateAdapter({
     config: {
       baseUrl: 'http://localhost:11434/api',
+      keepAlive: '5m',
       requestTimeoutMs: 30_000,
       rootModel: 'llama3.2',
       subModel: 'llama3.2',
@@ -54,6 +55,7 @@ Deno.test('Ollama adapter posts model system prompt and input to the generate en
 
   const payload = JSON.parse(String(capturedInit?.body)) as Record<string, unknown>;
   assert.equal(payload.model, 'llama3.2');
+  assert.equal(payload.keep_alive, '5m');
   assert.equal(payload.system, 'Use the REPL.');
   assert.equal(payload.prompt, 'Solve the task.');
   assert.equal(payload.stream, false);
@@ -162,4 +164,84 @@ Deno.test('Ollama provider builds a provider-neutral caller that reuses the shar
 
   assert.equal(capturedUrl, 'http://localhost:11434/api/generate');
   assert.equal(response.outputText, 'FINAL("provider")');
+});
+
+Deno.test('Ollama adapter rejects success payloads that omit generated text or report payload-level errors', async () => {
+  const baseConfig = {
+    baseUrl: 'http://localhost:11434/api',
+    requestTimeoutMs: 30_000,
+    rootModel: 'llama3.2',
+    subModel: 'llama3.2',
+  };
+
+  const missingText = new OllamaGenerateAdapter({
+    config: baseConfig,
+    fetcher: async () =>
+      new Response(
+        JSON.stringify({ done: true }),
+        {
+          headers: { 'Content-Type': 'application/json' },
+          status: 200,
+        },
+      ),
+  });
+  await assert.rejects(
+    () => missingText.complete(createRequest()),
+    /did not contain generated text/u,
+  );
+
+  const payloadError = new OllamaGenerateAdapter({
+    config: baseConfig,
+    fetcher: async () =>
+      new Response(
+        JSON.stringify({ done: true, error: 'runtime overloaded' }),
+        {
+          headers: { 'Content-Type': 'application/json' },
+          status: 200,
+        },
+      ),
+  });
+  await assert.rejects(
+    () => payloadError.complete(createRequest()),
+    /runtime overloaded/u,
+  );
+});
+
+Deno.test('Ollama adapter maps aborts and non-Error transport failures into stable provider errors', async () => {
+  const controller = new AbortController();
+  controller.abort();
+
+  const abortingAdapter = new OllamaGenerateAdapter({
+    config: {
+      baseUrl: 'http://localhost:11434/api',
+      requestTimeoutMs: 25,
+      rootModel: 'llama3.2',
+      subModel: 'llama3.2',
+    },
+    fetcher: async (_input, init) => {
+      const requestInit = init as RequestInit | undefined;
+      assert.equal((requestInit?.signal?.aborted ?? false), true);
+      throw new DOMException('Aborted', 'AbortError');
+    },
+  });
+  await assert.rejects(
+    () => abortingAdapter.complete(createRequest({ signal: controller.signal })),
+    /timed out after 25ms/u,
+  );
+
+  const unknownFailureAdapter = new OllamaGenerateAdapter({
+    config: {
+      baseUrl: 'http://localhost:11434/api',
+      requestTimeoutMs: 30_000,
+      rootModel: 'llama3.2',
+      subModel: 'llama3.2',
+    },
+    fetcher: async () => {
+      throw 'non-error failure';
+    },
+  });
+  await assert.rejects(
+    () => unknownFailureAdapter.complete(createRequest()),
+    /non-error failure/u,
+  );
 });

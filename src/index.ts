@@ -33,13 +33,13 @@ export {
   loadDefaultRLMSystemPromptMarkdown,
 } from './rlm_prompt.ts';
 export {
-  createStandaloneLogPath,
-  createStandaloneProgressLogger,
-  parseStandaloneCLIArgs,
-  renderStandaloneFinalAnswer,
-  resolveStandaloneCLIOptions,
-  runStandaloneCLI,
-} from './standalone/cli.ts';
+  assertRuntimeHelperDefinition,
+  assertRuntimeHelperName,
+  buildRuntimeHelperPromptBlock,
+  resolveRuntimeHelperPromptBlocks,
+  resolveRuntimeHelpers,
+  serializeRuntimeHelperSource,
+} from './plugin.ts';
 export { createRLM, RLMMaxStepsError, RLMProtocolError, runRLM } from './rlm_runner.ts';
 export type {
   RLMClient,
@@ -57,6 +57,7 @@ export type {
   PlainLLMQueryCompletion,
   RLMQueryBridgeOptions,
 } from './llm_query.ts';
+export type { RLMPlugin, RuntimeHelperSourceSerializationOptions } from './plugin.ts';
 export type {
   LLMAdapter,
   LLMCaller,
@@ -72,12 +73,6 @@ export type {
 export type { FinalSignal, ReplCodeBlock } from './repl_protocol.ts';
 export type { RLMRunOptions, RLMRunResult } from './rlm_runner.ts';
 export type {
-  ParsedStandaloneCLIArgs,
-  ResolvedStandaloneCLIOptions,
-  StandaloneCLIDependencies,
-  StandaloneFinalRenderInput,
-} from './standalone/cli.ts';
-export type {
   AssistantTurnEntry,
   CellEntry,
   CellStatus,
@@ -91,12 +86,16 @@ export type {
   LoadedJournal,
   ModelUsageSummary,
   PersistentRuntimeLike,
+  QueryTraceEntry,
   ReplSessionOptions,
   RLMDelegationRequest,
   RLMLogger,
   RLMQueryHandler,
   RLMQueryInput,
   RLMQueryResult,
+  RLMRuntimeHelper,
+  RLMRuntimeHelperGlobals,
+  RLMRuntimeHelperInputKind,
   RLMUsageSummary,
   SessionEntry,
   SubqueryEntry,

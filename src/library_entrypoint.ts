@@ -9,8 +9,9 @@
  * ```
  */
 import type { LLMAdapter, LLMCaller } from './llm_adapter.ts';
+import type { RLMPlugin } from './plugin.ts';
 import type { ExecutionBackend, RLMLogger } from './types.ts';
-import type { JsonValue } from './types.ts';
+import type { JsonValue, RLMRuntimeHelper } from './types.ts';
 import type { RLMRunResult } from './rlm_runner.ts';
 
 /**
@@ -103,6 +104,9 @@ export interface RLMClientOptions {
   llm?: LLMCaller;
   logger?: RLMLogger;
   models: RLMModels;
+  plugins?: RLMPlugin[];
+  runtimeHelpers?: RLMRuntimeHelper[];
+  runtimeHelperPromptBlocks?: string[];
   systemPromptExtension?: string;
   systemPromptMarkdown?: string;
 }
@@ -127,7 +131,11 @@ export interface RLMRunInput {
   maxSteps?: number;
   maxSubcallDepth?: number;
   outputCharLimit?: number;
+  plugins?: RLMPlugin[];
   prompt: string;
+  queryTrace?: boolean;
+  runtimeHelpers?: RLMRuntimeHelper[];
+  runtimeHelperPromptBlocks?: string[];
   systemPromptMarkdown?: string;
   systemPromptExtension?: string;
 }

@@ -20,6 +20,16 @@ const BUNDLE_TARGETS: BundleTarget[] = [
     outputDir: new URL('../dist/providers/ollama/', import.meta.url),
     outputFile: new URL('./index.mjs', new URL('../dist/providers/ollama/', import.meta.url)),
   },
+  {
+    entryFile: new URL('../plugin/aot/mod.ts', import.meta.url),
+    outputDir: new URL('../dist/plugin/aot/', import.meta.url),
+    outputFile: new URL('./index.mjs', new URL('../dist/plugin/aot/', import.meta.url)),
+  },
+  {
+    entryFile: new URL('../plugin/pingpong/mod.ts', import.meta.url),
+    outputDir: new URL('../dist/plugin/pingpong/', import.meta.url),
+    outputFile: new URL('./index.mjs', new URL('../dist/plugin/pingpong/', import.meta.url)),
+  },
 ];
 
 /**

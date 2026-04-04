@@ -35,6 +35,25 @@ export interface BrowserRunDebugScope {
   __RLM_LAST_RUN_INPUT__?: BrowserRunInput;
 }
 
+interface BrowserRunSessionHandle {
+  close(): Promise<void>;
+}
+
+interface BrowserRunClientHandle {
+  run(input: BrowserRunInput): Promise<{
+    answer: string;
+    session: BrowserRunSessionHandle;
+    steps: number;
+    usage: RLMUsageSummary;
+  }>;
+}
+
+interface BrowserRunDependencies {
+  createOllamaClient?: (options: Parameters<typeof createOllamaRLM>[0]) => BrowserRunClientHandle;
+  createOpenAIClient?: (options: Parameters<typeof createOpenAIRLM>[0]) => BrowserRunClientHandle;
+  emitDebugLog?: typeof emitBrowserRunDebugLog;
+}
+
 function toUsageSnapshot(usage: RLMUsageSummary): UsageSummarySnapshot {
   return {
     byModel: usage.byModel.map((entry) => ({
@@ -85,15 +104,18 @@ export function emitBrowserRunDebugLog(
   });
 }
 
-export async function runConversationTurn(
+async function runConversationTurnWithDependencies(
   settings: ProviderSettings,
   historyTurns: ChatTurn[],
   prompt: string,
+  dependencies: BrowserRunDependencies = {},
 ): Promise<BrowserRunResult> {
   const runInput = buildConversationRunInput(settings, historyTurns, prompt);
-  emitBrowserRunDebugLog(runInput);
+  (dependencies.emitDebugLog ?? emitBrowserRunDebugLog)(runInput);
+  const createOpenAIClient = dependencies.createOpenAIClient ?? createOpenAIRLM;
+  const createOllamaClient = dependencies.createOllamaClient ?? createOllamaRLM;
   const client = settings.kind === 'openai'
-    ? createOpenAIRLM({
+    ? createOpenAIClient({
       defaults: DEFAULT_RUN_LIMITS,
       openAI: {
         apiKey: settings.apiKey,
@@ -106,7 +128,7 @@ export async function runConversationTurn(
       },
       systemPromptExtension: WEB_SYSTEM_PROMPT_EXTENSION,
     })
-    : createOllamaRLM({
+    : createOllamaClient({
       defaults: DEFAULT_RUN_LIMITS,
       ollama: {
         baseUrl: settings.baseUrl,
@@ -129,3 +151,16 @@ export async function runConversationTurn(
     await result.session.close();
   }
 }
+
+export async function runConversationTurn(
+  settings: ProviderSettings,
+  historyTurns: ChatTurn[],
+  prompt: string,
+): Promise<BrowserRunResult> {
+  return await runConversationTurnWithDependencies(settings, historyTurns, prompt);
+}
+
+export const __browserRunTestables = {
+  runConversationTurnWithDependencies,
+  toUsageSnapshot,
+};

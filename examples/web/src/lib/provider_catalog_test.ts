@@ -151,3 +151,94 @@ Deno.test('listModelsForDraft applies the configured OpenAI request timeout', as
     /OpenAI 모델 목록 요청이 1ms 뒤에 시간 초과/u,
   );
 });
+
+Deno.test('listModelsForDraft covers provider validation, raw errors, and empty catalogs', async () => {
+  await assert.rejects(
+    () =>
+      listModelsForDraft({
+        apiKey: '',
+        availableModels: [],
+        baseUrl: '',
+        kind: 'ollama-cloud',
+        rootModel: '',
+        subModel: '',
+      }),
+    /Ollama Cloud API 키/u,
+  );
+
+  await assert.rejects(
+    () =>
+      listModelsForDraft({
+        apiKey: 'sk-openai',
+        availableModels: [],
+        baseUrl: '',
+        kind: 'openai',
+        rootModel: '',
+        subModel: '',
+      }, async () =>
+        new Response('', {
+          status: 500,
+        })),
+    /OpenAI 모델 목록을 불러오지 못했습니다/u,
+  );
+
+  await assert.rejects(
+    () =>
+      listModelsForDraft({
+        apiKey: 'sk-openai',
+        availableModels: [],
+        baseUrl: '',
+        kind: 'openai',
+        rootModel: '',
+        subModel: '',
+      }, async () =>
+        new Response('upstream broken', {
+          status: 502,
+        })),
+    /OpenAI 모델 목록을 불러오지 못했습니다/u,
+  );
+
+  await assert.rejects(
+    () =>
+      listModelsForDraft({
+        apiKey: 'sk-openai',
+        availableModels: [],
+        baseUrl: 'https://api.openai.com',
+        kind: 'openai',
+        rootModel: '',
+        subModel: '',
+      }, async () =>
+        new Response(
+          JSON.stringify({
+            data: [{ id: 'text-embedding-3-large' }],
+          }),
+          {
+            headers: { 'Content-Type': 'application/json' },
+            status: 200,
+          },
+        )),
+    /OpenAI에서 사용할 수 있는 모델을 찾지 못했습니다/u,
+  );
+
+  await assert.rejects(
+    () =>
+      listModelsForDraft({
+        apiKey: 'ollama-cloud-key',
+        availableModels: [],
+        baseUrl: '',
+        kind: 'ollama-cloud',
+        rootModel: '',
+        subModel: '',
+      }, async () =>
+        new Response(
+          JSON.stringify({
+            error: 'cloud denied',
+          }),
+          {
+            headers: { 'Content-Type': 'application/json' },
+            status: 403,
+          },
+        )),
+    /cloud denied/u,
+  );
+});

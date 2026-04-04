@@ -21,6 +21,7 @@ import type {
   PersistentRuntimeLike,
   ReplSessionOptions,
   RLMLogger,
+  RLMRuntimeHelper,
   SessionEntry,
   ValueSnapshot,
 } from './types.ts';
@@ -93,12 +94,49 @@ function normalizeTimeout(timeoutMs: number | undefined): number {
 }
 
 /**
+ * Finds the minimum outer cell budget required by the injected runtime helpers.
+ *
+ * Runtime helper timeouts are enforced inside the worker, but the outer REPL cell
+ * timeout must not expire sooner or the helper-specific timeout becomes ineffective.
+ */
+function resolveRuntimeHelperTimeoutFloor(
+  runtimeHelpers: ReadonlyArray<RLMRuntimeHelper> | undefined,
+): number | null {
+  let floor: number | null = null;
+
+  for (const helper of runtimeHelpers ?? []) {
+    if (!Number.isInteger(helper.timeoutMs) || helper.timeoutMs === undefined || helper.timeoutMs <= 0) {
+      continue;
+    }
+
+    if (floor === null || helper.timeoutMs > floor) {
+      floor = helper.timeoutMs;
+    }
+  }
+
+  return floor;
+}
+
+/**
+ * Ensures one execution timeout is never shorter than the declared helper timeout floor.
+ */
+function resolveExecutionTimeout(timeoutMs: number, runtimeHelperTimeoutFloor: number | null): number {
+  if (runtimeHelperTimeoutFloor === null) {
+    return timeoutMs;
+  }
+
+  return Math.max(timeoutMs, runtimeHelperTimeoutFloor);
+}
+
+/**
  * Exposes REPL session helpers for isolated tests.
  */
 export const __replSessionTestables = {
   appendErrorToStderr,
   createErrorSnapshot,
   normalizeTimeout,
+  resolveExecutionTimeout,
+  resolveRuntimeHelperTimeoutFloor,
 };
 
 /**
@@ -119,6 +157,8 @@ export class ReplSession {
   readonly #clock: () => Date;
   readonly #idGenerator: () => string;
   readonly #logger: RLMLogger;
+  readonly #runtimeHelperNames: string[];
+  readonly #runtimeHelperTimeoutFloor: number | null;
   readonly #runtime: PersistentRuntimeLike;
   readonly #session: SessionEntry;
   readonly #cells: CellEntry[];
@@ -134,6 +174,8 @@ export class ReplSession {
     cells: CellEntry[],
     clock: () => Date,
     idGenerator: () => string,
+    runtimeHelperNames: string[],
+    runtimeHelperTimeoutFloor: number | null,
     runtime: PersistentRuntimeLike,
   ) {
     this.#logger = logger;
@@ -141,6 +183,8 @@ export class ReplSession {
     this.#cells = cells;
     this.#clock = clock;
     this.#idGenerator = idGenerator;
+    this.#runtimeHelperNames = [...runtimeHelperNames];
+    this.#runtimeHelperTimeoutFloor = runtimeHelperTimeoutFloor;
     this.#runtime = runtime;
   }
 
@@ -166,6 +210,8 @@ export class ReplSession {
   static async open(options: ReplSessionOptions): Promise<ReplSession> {
     const clock = options.clock ?? (() => new Date());
     const idGenerator = options.idGenerator ?? (() => crypto.randomUUID());
+    const runtimeHelperNames = (options.runtimeHelpers ?? []).map((helper) => helper.name);
+    const runtimeHelperTimeoutFloor = resolveRuntimeHelperTimeoutFloor(options.runtimeHelpers);
     const logger = resolveRLMLogger({
       journalPath: options.journalPath,
       logger: options.logger,
@@ -191,10 +237,13 @@ export class ReplSession {
         cells,
         clock,
         idGenerator,
+        runtimeHelperNames,
+        runtimeHelperTimeoutFloor,
         backend.createRuntime({
           context: session.context,
           llmQueryHandler: options.llmQueryHandler,
           rlmQueryHandler: options.rlmQueryHandler,
+          runtimeHelpers: options.runtimeHelpers,
         }),
       );
     }
@@ -214,10 +263,13 @@ export class ReplSession {
       cells,
       clock,
       idGenerator,
+      runtimeHelperNames,
+      runtimeHelperTimeoutFloor,
       backend.createRuntime({
         context: newSession.context,
         llmQueryHandler: options.llmQueryHandler,
         rlmQueryHandler: options.rlmQueryHandler,
+        runtimeHelpers: options.runtimeHelpers,
       }),
     );
   }
@@ -300,7 +352,10 @@ export class ReplSession {
    * ```
    */
   async execute(code: string, options: ExecuteOptions = {}): Promise<ExecuteResult> {
-    const timeoutMs = options.timeoutMs ?? this.#session.defaultTimeoutMs;
+    const timeoutMs = resolveExecutionTimeout(
+      options.timeoutMs ?? this.#session.defaultTimeoutMs,
+      this.#runtimeHelperTimeoutFloor,
+    );
     const replayedCells = this.#cells.filter((cell) => cell.status === 'success');
     const startedAt = this.#clock().toISOString();
     const startedAtMs = performance.now();
@@ -314,7 +369,9 @@ export class ReplSession {
     let error: ExecutionErrorSnapshot | null = null;
 
     try {
-      assertCodeIsRunnable(code);
+      assertCodeIsRunnable(code, {
+        additionalReservedIdentifiers: this.#runtimeHelperNames,
+      });
       const execution = await this.#runtime.execute({
         code,
         history: this.#cells,

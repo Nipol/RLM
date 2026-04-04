@@ -3,6 +3,7 @@ import { join, relative } from 'node:path';
 
 const REPO_ROOT = Deno.cwd();
 const SRC_ROOT = join(REPO_ROOT, 'src');
+const PLUGIN_ROOT = join(REPO_ROOT, 'plugin');
 const PROMPTS_ROOT = join(REPO_ROOT, 'prompts');
 const ENTRYPOINTS = [
   'mod.ts',
@@ -40,6 +41,7 @@ async function collectPublishedTypeScriptFiles(): Promise<string[]> {
   };
 
   await visit(SRC_ROOT);
+  await visit(PLUGIN_ROOT);
   await visit(PROMPTS_ROOT);
 
   files.sort();
@@ -66,7 +68,7 @@ function findPrecedingJsdoc(source: string, declarationIndex: number): string | 
   return lastMatch[0];
 }
 
-Deno.test('published TypeScript files include module docs and standalone symbol docs on declarations', async () => {
+Deno.test('published TypeScript files include module docs and symbol docs on declarations', async () => {
   const files = await collectPublishedTypeScriptFiles();
   const failures: string[] = [];
 

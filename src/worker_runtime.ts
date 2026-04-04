@@ -9,6 +9,7 @@
  * ```
  */
 import { splitTrailingExpression } from './code_guard.ts';
+import { assertRuntimeHelperDefinition } from './plugin.ts';
 import type {
   CellEntry,
   ExecutionErrorSnapshot,
@@ -16,6 +17,7 @@ import type {
   LLMQueryHandler,
   RLMQueryHandler,
   RLMQueryInput,
+  RLMRuntimeHelper,
   ValueSnapshot,
 } from './types.ts';
 
@@ -53,6 +55,7 @@ interface PersistentRuntimeOptions {
   context: JsonValue | null;
   llmQueryHandler?: LLMQueryHandler;
   rlmQueryHandler?: RLMQueryHandler;
+  runtimeHelpers?: RLMRuntimeHelper[];
 }
 
 interface PersistentExecuteInput {
@@ -100,6 +103,8 @@ interface PersistentWorkerQueryRequestMessage {
 }
 
 interface PersistentWorkerRecursiveQueryRequestMessage {
+  maxSteps?: number;
+  maxSubcallDepth?: number;
   prompt: RLMQueryInput;
   queryId: number;
   type: 'rlm_query_request';
@@ -1458,10 +1463,263 @@ function buildPersistentCellCode(source: string): string {
   return `${bodyBlock}__setResult(${expression});`;
 }
 
+function buildRuntimeHelperReservedBindingsSource(runtimeHelpers: RLMRuntimeHelper[]): string {
+  return runtimeHelpers.map((helper) => `  ${JSON.stringify(helper.name)},`).join('\n');
+}
+
+function buildRuntimeHelperExecutionCode(source: string): string {
+  const { body, expression } = splitTrailingExpression(source);
+  const rewrittenBody = rewriteTopLevelBindings(body);
+  const bodyBlock = rewrittenBody.trim().length === 0 ? '' : `${rewrittenBody}\n`;
+
+  if (expression === null) {
+    return bodyBlock;
+  }
+
+  return `${bodyBlock}return (${expression});`;
+}
+
+function buildRuntimeHelperAllowedInputKinds(helper: RLMRuntimeHelper): ReadonlyArray<string> {
+  return helper.inputKinds ?? ['text'];
+}
+
+function buildRuntimeHelperInputKindsLabel(helper: RLMRuntimeHelper): string {
+  const inputKinds = buildRuntimeHelperAllowedInputKinds(helper);
+  if (inputKinds.length === 1) {
+    return inputKinds[0];
+  }
+
+  return inputKinds.join(' or ');
+}
+
+function buildRuntimeHelperDefinitionsSource(runtimeHelpers: RLMRuntimeHelper[]): string {
+  return runtimeHelpers.map((helper) => {
+    const executionCode = buildRuntimeHelperExecutionCode(helper.source);
+    const allowedKinds = buildRuntimeHelperAllowedInputKinds(helper);
+    const inputKindsLabel = buildRuntimeHelperInputKindsLabel(helper);
+    const helperRLMQueryMaxSteps = helper.rlmQueryMaxSteps ?? Number.POSITIVE_INFINITY;
+    const helperRLMQueryMaxSubcallDepth = helper.rlmQueryMaxSubcallDepth ?? 1;
+    const helperRLMQueryMaxStepsLiteral = helperRLMQueryMaxSteps === Number.POSITIVE_INFINITY
+      ? 'Number.POSITIVE_INFINITY'
+      : String(helperRLMQueryMaxSteps);
+    const acceptsString = allowedKinds.includes('text') ||
+      allowedKinds.includes('source') ||
+      allowedKinds.includes('repl_code');
+    const acceptsObject = allowedKinds.includes('object');
+    const acceptsArray = allowedKinds.includes('array');
+    const timeoutGuardSource = helper.timeoutMs === undefined ? 'return await __run();' : [
+      'let __timeoutId = null;',
+      'try {',
+      '  return await new Promise((resolve, reject) => {',
+      `    __timeoutId = setTimeout(() => reject(new Error(${
+        JSON.stringify(`Runtime helper ${helper.name} timed out after ${helper.timeoutMs}ms.`)
+      })), ${helper.timeoutMs});`,
+      '    Promise.resolve(__run()).then(',
+      '      (value) => {',
+      '        if (__timeoutId !== null) {',
+      '          clearTimeout(__timeoutId);',
+      '        }',
+      '        resolve(value);',
+      '      },',
+      '      (error) => {',
+      '        if (__timeoutId !== null) {',
+      '          clearTimeout(__timeoutId);',
+      '        }',
+      '        reject(error);',
+      '      },',
+      '    );',
+      '  });',
+      '} finally {',
+      '  if (__timeoutId !== null) {',
+      '    clearTimeout(__timeoutId);',
+      '  }',
+      '}',
+    ].join('\n');
+
+    return `const ${helper.name} = async (input) => {
+  if (input === undefined || input === null) {
+    throw new Error(${
+      JSON.stringify(`Runtime helper ${helper.name} requires a non-null ${inputKindsLabel} input.`)
+    });
+  }
+
+  let __matchesInputType = false;
+  if (${acceptsString}) {
+    if (typeof input === 'string') {
+      if (input.trim().length === 0) {
+        throw new Error(${
+      JSON.stringify(
+        `Runtime helper ${helper.name} expects ${inputKindsLabel} input, and string inputs must be non-empty.`,
+      )
+    });
+      }
+
+      __matchesInputType = true;
+    }
+  }
+
+  if (${acceptsObject} && typeof input === 'object' && input !== null && !Array.isArray(input)) {
+    __matchesInputType = true;
+  }
+
+  if (${acceptsArray} && Array.isArray(input)) {
+    __matchesInputType = true;
+  }
+
+  if (!__matchesInputType) {
+    throw new Error(${
+      JSON.stringify(`Runtime helper ${helper.name} expects ${inputKindsLabel} input.`)
+    });
+  }
+
+  const __helperHasExplicitRLMQueryDepth = (prompt) =>
+    typeof prompt === 'object' &&
+    prompt !== null &&
+    !Array.isArray(prompt) &&
+    Object.prototype.hasOwnProperty.call(prompt, 'maxSubcallDepth');
+  const __helperHasExplicitRLMQueryMaxSteps = (prompt) =>
+    typeof prompt === 'object' &&
+    prompt !== null &&
+    !Array.isArray(prompt) &&
+    Object.prototype.hasOwnProperty.call(prompt, 'maxSteps');
+  const __helperBuildRLMQueryOptions = (prompt, options) => {
+    if (options !== undefined && (typeof options !== 'object' || options === null || Array.isArray(options))) {
+      return options;
+    }
+
+    const __mergedOptions = options === undefined ? {} : { ...options };
+
+    if (
+      !__helperHasExplicitRLMQueryDepth(prompt) &&
+      !Object.prototype.hasOwnProperty.call(__mergedOptions, 'maxSubcallDepth')
+    ) {
+      __mergedOptions.maxSubcallDepth = ${helperRLMQueryMaxSubcallDepth};
+    }
+
+    if (
+      !__helperHasExplicitRLMQueryMaxSteps(prompt) &&
+      !Object.prototype.hasOwnProperty.call(__mergedOptions, 'maxSteps')
+    ) {
+      __mergedOptions.maxSteps = ${helperRLMQueryMaxStepsLiteral};
+    }
+
+    return Object.keys(__mergedOptions).length === 0 ? undefined : __mergedOptions;
+  };
+  const __helperRLMQuery = (prompt, options) => {
+    const __mergedOptions = __helperBuildRLMQueryOptions(prompt, options);
+    return __mergedOptions === undefined ? rlm_query(prompt) : rlm_query(prompt, __mergedOptions);
+  };
+  const __helperRLMQueryBatched = (prompts, options) => {
+    if (!Array.isArray(prompts) || prompts.length === 0) {
+      return rlm_query_batched(prompts);
+    }
+
+    return Promise.all(
+      prompts.map((prompt) => __helperRLMQuery(prompt, options)),
+    );
+  };
+
+  const __helperState = Object.create(null);
+  const __helperScope = new Proxy(__helperState, {
+    deleteProperty(target, key) {
+      if (typeof key === 'string' && (key === 'input' || __reservedBindings.has(key))) {
+        return false;
+      }
+
+      return Reflect.deleteProperty(target, key);
+    },
+    get(target, key) {
+      if (key === Symbol.unscopables) {
+        return undefined;
+      }
+
+      if (key === 'input') {
+        return input;
+      }
+
+      if (typeof key === 'string' && key in __runtimeHelpers) {
+        return __runtimeHelpers[key];
+      }
+
+      if (key === 'context') {
+        return __context;
+      }
+
+      if (key === 'history') {
+        return __history;
+      }
+
+      if (key === 'grep') {
+        return grep;
+      }
+
+      if (key === 'llm_query') {
+        return llm_query;
+      }
+
+      if (key === 'llm_query_batched') {
+        return llm_query_batched;
+      }
+
+      if (key === 'rlm_query') {
+        return __helperRLMQuery;
+      }
+
+      if (key === 'rlm_query_batched') {
+        return __helperRLMQueryBatched;
+      }
+
+      if (Reflect.has(target, key)) {
+        return Reflect.get(target, key);
+      }
+
+      return globalThis[key];
+    },
+    has(_target, key) {
+      if (key === Symbol.unscopables) {
+        return false;
+      }
+
+      return typeof key !== 'string' || !__excludedBindings.has(key);
+    },
+    set(target, key, value) {
+      if (typeof key === 'string' && (key === 'input' || __reservedBindings.has(key))) {
+        throw new Error('Reserved REPL identifiers cannot be reassigned or redeclared.');
+      }
+
+      Reflect.set(target, key, value);
+      return true;
+    },
+  });
+
+  const __AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  const __runner = new __AsyncFunction(
+    '__scope',
+    'input',
+    ${JSON.stringify(`with (__scope) {\n${executionCode}\n}`)},
+  );
+  const __run = () => __runner(__helperScope, input);
+  ${timeoutGuardSource ?? 'return await __run();'}
+};`;
+  }).join('\n\n');
+}
+
+function buildRuntimeHelperRegistrySource(runtimeHelpers: RLMRuntimeHelper[]): string {
+  if (runtimeHelpers.length === 0) {
+    return 'const __runtimeHelpers = Object.freeze({});';
+  }
+
+  return [
+    'const __runtimeHelpers = Object.freeze({',
+    ...runtimeHelpers.map((helper) => `  ${JSON.stringify(helper.name)}: ${helper.name},`),
+    '});',
+  ].join('\n');
+}
+
 /**
  * Builds the worker module used by the long-lived persistent interpreter.
  */
-function buildPersistentWorkerSource(): string {
+function buildPersistentWorkerSource(runtimeHelpers: RLMRuntimeHelper[] = []): string {
   return `
 // @ts-nocheck
 const __hostPost = globalThis.postMessage.bind(globalThis);
@@ -1481,6 +1739,7 @@ const __reservedBindings = new Set([
   'llm_query_batched',
   'rlm_query',
   'rlm_query_batched',
+${buildRuntimeHelperReservedBindingsSource(runtimeHelpers)}
 ]);
 const __excludedBindings = new Set(['__scope', '__setResult']);
 
@@ -1803,9 +2062,50 @@ const llm_query_batched = (prompts) => {
   return Promise.all(normalized.map((prompt) => llm_query(prompt)));
 };
 
-const rlm_query = (prompt) => new Promise((resolve, reject) => {
+const __normalizeRLMQueryInvocationOptions = (options) => {
+  if (options === undefined) {
+    return {};
+  }
+
+  if (typeof options !== 'object' || options === null || Array.isArray(options)) {
+    throw new Error('rlm_query invocation options must be an object.');
+  }
+
+  const normalized = {};
+  if (Object.prototype.hasOwnProperty.call(options, 'maxSubcallDepth')) {
+    const maxSubcallDepth = options.maxSubcallDepth;
+    if (!Number.isInteger(maxSubcallDepth) || maxSubcallDepth < 1) {
+      throw new Error('rlm_query maxSubcallDepth must be a positive integer.');
+    }
+
+    normalized.maxSubcallDepth = maxSubcallDepth;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(options, 'maxSteps')) {
+    const maxSteps = options.maxSteps;
+    if (maxSteps !== Number.POSITIVE_INFINITY && (!Number.isInteger(maxSteps) || maxSteps < 1)) {
+      throw new Error(
+        'rlm_query maxSteps must be a positive integer or Number.POSITIVE_INFINITY.',
+      );
+    }
+
+    normalized.maxSteps = maxSteps;
+  }
+
+  return normalized;
+};
+
+const rlm_query = (prompt, options) => new Promise((resolve, reject) => {
   if (prompt === undefined || prompt === null) {
     reject(new Error('rlm_query requires a concrete prompt.'));
+    return;
+  }
+
+  let queryOptions;
+  try {
+    queryOptions = __normalizeRLMQueryInvocationOptions(options);
+  } catch (error) {
+    reject(error);
     return;
   }
 
@@ -1836,6 +2136,8 @@ const rlm_query = (prompt) => new Promise((resolve, reject) => {
   const queryId = __nextQueryId++;
   __pendingQueries.set(queryId, { reject, resolve });
   __hostPost({
+    maxSteps: queryOptions.maxSteps,
+    maxSubcallDepth: queryOptions.maxSubcallDepth,
     prompt: delegatedRequest,
     queryId,
     type: 'rlm_query_request',
@@ -1876,6 +2178,10 @@ const rlm_query_batched = (prompts) => {
 
   return Promise.all(normalized.map((prompt) => rlm_query(prompt)));
 };
+
+${buildRuntimeHelperDefinitionsSource(runtimeHelpers)}
+
+${buildRuntimeHelperRegistrySource(runtimeHelpers)}
 
 const __scope = new Proxy(__stateStore, {
   deleteProperty(target, key) {
@@ -1928,6 +2234,10 @@ const __scope = new Proxy(__stateStore, {
 
     if (key === 'rlm_query_batched') {
       return rlm_query_batched;
+    }
+
+    if (typeof key === 'string' && key in __runtimeHelpers) {
+      return __runtimeHelpers[key];
     }
 
     if (Reflect.has(target, key)) {
@@ -2053,6 +2363,7 @@ export class PersistentSandboxRuntime {
   readonly #context: JsonValue | null;
   readonly #llmQueryHandler?: LLMQueryHandler;
   readonly #rlmQueryHandler?: RLMQueryHandler;
+  readonly #runtimeHelpers: ReadonlyArray<RLMRuntimeHelper>;
   readonly #workerFactory: PersistentWorkerFactory;
   #isExecuting = false;
   #nextRequestId = 0;
@@ -2073,6 +2384,22 @@ export class PersistentSandboxRuntime {
     this.#context = structuredClone(options.context ?? null);
     this.#llmQueryHandler = options.llmQueryHandler;
     this.#rlmQueryHandler = options.rlmQueryHandler;
+    const helperNames = (options.runtimeHelpers ?? []).map((helper) => helper.name);
+    const seenHelperNames = new Set<string>();
+    this.#runtimeHelpers = (options.runtimeHelpers ?? []).map((helper) => {
+      if (seenHelperNames.has(helper.name)) {
+        throw new Error(`Duplicate runtime helper name: ${helper.name}`);
+      }
+
+      seenHelperNames.add(helper.name);
+      assertRuntimeHelperDefinition(helper, {
+        additionalReservedIdentifiers: helperNames,
+      });
+      return {
+        ...helper,
+        source: helper.source.trim(),
+      };
+    });
     this.#workerFactory = workerFactory;
   }
 
@@ -2136,9 +2463,12 @@ export class PersistentSandboxRuntime {
 
     this.#syncedHistoryLength = 0;
     this.#startupFailure = null;
-    const worker = await this.#workerFactory(buildWorkerUrl(buildPersistentWorkerSource()), {
-      type: 'module',
-    });
+    const worker = await this.#workerFactory(
+      buildWorkerUrl(buildPersistentWorkerSource([...this.#runtimeHelpers])),
+      {
+        type: 'module',
+      },
+    );
     this.#worker = worker;
     this.#attachWorkerHandlers(worker);
     worker.postMessage({
@@ -2320,7 +2650,11 @@ export class PersistentSandboxRuntime {
       this.#pendingQueryControllers.set(message.queryId, { controller, worker });
 
       try {
-        const value = await handler(message.prompt, { signal: controller.signal });
+        const value = await handler(message.prompt, {
+          maxSteps: message.maxSteps,
+          maxSubcallDepth: message.maxSubcallDepth,
+          signal: controller.signal,
+        });
         if (isStalePersistentWorker(this.#worker, worker)) {
           return;
         }
@@ -2441,6 +2775,7 @@ export class PersistentSandboxRuntime {
  */
 export const __workerRuntimeTestables = {
   abortPendingQueryControllers,
+  buildRuntimeHelperAllowedInputKinds,
   buildCurrentCellCode,
   buildPersistentCellCode,
   buildReplayCode,
@@ -2449,5 +2784,6 @@ export const __workerRuntimeTestables = {
   executeCellInSandboxWithFactory,
   isStalePersistentWorker,
   rewriteTopLevelBindings,
+  startsRegexLiteral,
   shouldAbortPendingQueryController,
 };

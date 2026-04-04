@@ -5,6 +5,7 @@ import {
   createProviderSettings,
   extractOllamaModelIds,
   extractOpenAIModelIds,
+  getProviderLabel,
   normalizeCatalogModelIds,
   normalizeProviderBaseUrl,
   normalizeProviderRequestTimeoutMs,
@@ -121,8 +122,62 @@ Deno.test('normalizeProviderRequestTimeoutMs rejects non-positive values', () =>
   assert.throws(() => normalizeProviderRequestTimeoutMs(-1), /요청 제한 시간/u);
 });
 
+Deno.test('provider config helpers cover labels, invalid payloads, and empty selections', () => {
+  assert.equal(getProviderLabel('ollama-local'), 'Ollama Local');
+  assert.equal(getProviderLabel('ollama-cloud'), 'Ollama Cloud');
+  assert.throws(() => normalizeProviderRequestTimeoutMs(Number.NaN), /숫자/u);
+  assert.throws(() => normalizeProviderRequestTimeoutMs(Number.POSITIVE_INFINITY), /숫자/u);
+  assert.throws(() => normalizeProviderBaseUrl('ollama-local', ''), /Ollama Local 주소/u);
+  assert.equal(
+    normalizeProviderBaseUrl('ollama-local', 'http://127.0.0.1:11434/api'),
+    'http://127.0.0.1:11434/api',
+  );
+  assert.equal(
+    normalizeProviderBaseUrl('ollama-local', 'http://127.0.0.1:11434/custom'),
+    'http://127.0.0.1:11434/custom/api',
+  );
+  assert.deepEqual(extractOpenAIModelIds(null), []);
+  assert.deepEqual(extractOpenAIModelIds({ data: {} }), []);
+  assert.deepEqual(extractOllamaModelIds(null), []);
+  assert.deepEqual(extractOllamaModelIds({ models: {} }), []);
+  assert.deepEqual(extractOllamaModelIds({ models: [1, { broken: true }] }), []);
+  assert.deepEqual(resolveModelSelection([], 'gpt-5', 'gpt-5-mini'), {
+    rootModel: '',
+    subModel: '',
+  });
+});
+
 Deno.test('coerceStoredProviderRequestTimeoutMs restores the default for older snapshots', () => {
   assert.equal(coerceStoredProviderRequestTimeoutMs(undefined), 30_000);
   assert.equal(coerceStoredProviderRequestTimeoutMs('broken'), 30_000);
   assert.equal(coerceStoredProviderRequestTimeoutMs(45_000), 45_000);
+});
+
+Deno.test('createProviderSettings covers empty-model and local-provider branches', () => {
+  assert.throws(
+    () =>
+      createProviderSettings({
+        apiKey: 'sk-test',
+        availableModels: [],
+        baseUrl: 'https://api.openai.com/v1',
+        kind: 'openai',
+        rootModel: 'gpt-5',
+        subModel: 'gpt-5-mini',
+      }),
+    /사용 가능한 모델/u,
+  );
+
+  const localSettings = createProviderSettings({
+    apiKey: '',
+    availableModels: ['llama3.2:3b'],
+    baseUrl: 'localhost:11434',
+    kind: 'ollama-local',
+    rootModel: 'missing-root',
+    subModel: 'missing-sub',
+  }, new Date('2026-03-31T00:00:00.000Z'));
+
+  assert.equal(localSettings.apiKey, '');
+  assert.equal(localSettings.requestTimeoutMs, 30_000);
+  assert.equal(localSettings.rootModel, 'llama3.2:3b');
+  assert.equal(localSettings.subModel, 'llama3.2:3b');
 });

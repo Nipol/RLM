@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { dirname, join } from 'node:path';
 
+import { createAoTPlugin } from '../plugin/aot/mod.ts';
 import { assertCodeIsRunnable, splitTrailingExpression } from '../src/code_guard.ts';
 import { InMemoryRLMLogger, NullRLMLogger } from '../src/index.ts';
 import { ReplSession } from '../src/index.ts';
@@ -547,6 +548,1419 @@ function chooseStamp(value) {
   ]);
 });
 
+Deno.test('runtime helpers can be injected into the REPL and awaited like built-in helpers', async () => {
+  const journalPath = await createSessionPath('runtime-helper-ping');
+  const session = await ReplSession.open({
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    journalPath,
+    runtimeHelpers: [{
+      description: 'PING을 입력으로 받으면 PONG을 반환합니다.',
+      inputKinds: ['text'],
+      name: 'ping_pong',
+      source: 'input === "PING" ? "PONG" : "UNKNOWN"',
+    }],
+  });
+
+  const result = await session.execute('await ping_pong("PING")');
+
+  assert.equal(result.status, 'success');
+  assert.equal(result.result.preview, 'PONG');
+  assert.equal(result.result.json, 'PONG');
+});
+
+Deno.test('runtime helper names are treated as reserved identifiers once injected', async () => {
+  const journalPath = await createSessionPath('runtime-helper-reserved');
+  const session = await ReplSession.open({
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    journalPath,
+    runtimeHelpers: [{
+      description: 'PING을 입력으로 받으면 PONG을 반환합니다.',
+      inputKinds: ['text'],
+      name: 'ping_pong',
+      source: 'input',
+    }],
+  });
+
+  const result = await session.execute('const ping_pong = "shadow";');
+
+  assert.equal(result.status, 'error');
+  assert.match(result.stderr, /Reserved REPL identifiers/u);
+});
+
+Deno.test('runtime helper source can use built-in llm_query inside its sandbox', async () => {
+  const journalPath = await createSessionPath('runtime-helper-llm-query');
+  const seenPrompts: string[] = [];
+  const session = await ReplSession.open({
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    journalPath,
+    llmQueryHandler: async (prompt) => {
+      seenPrompts.push(prompt);
+      return `echo:${prompt}`;
+    },
+    runtimeHelpers: [{
+      description: '입력을 llm_query에 위임합니다.',
+      inputKinds: ['text'],
+      name: 'echo_with_llm',
+      source: [
+        'const reply = await llm_query(String(input));',
+        'reply',
+      ].join('\n'),
+    }],
+  });
+
+  const result = await session.execute('await echo_with_llm("PING")');
+
+  assert.equal(result.status, 'success');
+  assert.equal(result.result.preview, 'echo:PING');
+  assert.equal(result.result.json, 'echo:PING');
+  assert.deepEqual(seenPrompts, ['PING']);
+});
+
+Deno.test('runtime helper source injects a default rlm_query maxSubcallDepth of 1 and leaves maxSteps unbounded', async () => {
+  const journalPath = await createSessionPath('runtime-helper-rlm-query-default-depth');
+  const seenCalls: Array<{ maxSteps?: number; maxSubcallDepth?: number; prompt: string | object }> = [];
+  const session = await ReplSession.open({
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    journalPath,
+    rlmQueryHandler: async (prompt, options) => {
+      seenCalls.push({
+        maxSteps: options?.maxSteps,
+        maxSubcallDepth: options?.maxSubcallDepth,
+        prompt,
+      });
+      return 'delegated';
+    },
+    runtimeHelpers: [{
+      description: '입력을 child RLM에 위임합니다.',
+      inputKinds: ['text'],
+      name: 'delegate_once',
+      source: [
+        'await rlm_query(String(input));',
+        '"DONE"',
+      ].join('\n'),
+    }],
+  });
+
+  const result = await session.execute('await delegate_once("solve this")');
+
+  assert.equal(result.status, 'success');
+  assert.equal(result.result.json, 'DONE');
+  assert.deepEqual(seenCalls, [{
+    maxSteps: Number.POSITIVE_INFINITY,
+    maxSubcallDepth: 1,
+    prompt: 'solve this',
+  }]);
+});
+
+Deno.test('runtime helper source preserves an explicit rlm_query maxSubcallDepth override while keeping maxSteps unbounded', async () => {
+  const journalPath = await createSessionPath('runtime-helper-rlm-query-explicit-depth');
+  const seenCalls: Array<{ maxSteps?: number; maxSubcallDepth?: number; prompt: string | object }> = [];
+  const session = await ReplSession.open({
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    journalPath,
+    rlmQueryHandler: async (prompt, options) => {
+      seenCalls.push({
+        maxSteps: options?.maxSteps,
+        maxSubcallDepth: options?.maxSubcallDepth,
+        prompt,
+      });
+      return 'delegated';
+    },
+    runtimeHelpers: [{
+      description: '명시적으로 지정한 child depth를 사용합니다.',
+      inputKinds: ['text'],
+      name: 'delegate_with_depth',
+      rlmQueryMaxSubcallDepth: 1,
+      source: [
+        'await rlm_query({ task: String(input), maxSubcallDepth: 2 });',
+        '"DONE"',
+      ].join('\n'),
+    }],
+  });
+
+  const result = await session.execute('await delegate_with_depth("solve this")');
+
+  assert.equal(result.status, 'success');
+  assert.equal(result.result.json, 'DONE');
+  assert.deepEqual(seenCalls, [{
+    maxSteps: Number.POSITIVE_INFINITY,
+    maxSubcallDepth: undefined,
+    prompt: {
+      maxSubcallDepth: 2,
+      task: 'solve this',
+    },
+  }]);
+});
+
+Deno.test('runtime helper source can explicitly override nested rlm_query maxSteps with a second argument', async () => {
+  const journalPath = await createSessionPath('runtime-helper-rlm-query-explicit-steps');
+  const seenCalls: Array<{ maxSteps?: number; maxSubcallDepth?: number; prompt: string | object }> = [];
+  const session = await ReplSession.open({
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    journalPath,
+    rlmQueryHandler: async (prompt, options) => {
+      seenCalls.push({
+        maxSteps: options?.maxSteps,
+        maxSubcallDepth: options?.maxSubcallDepth,
+        prompt,
+      });
+      return 'delegated';
+    },
+    runtimeHelpers: [{
+      description: '명시적으로 지정한 child step budget을 사용합니다.',
+      inputKinds: ['text'],
+      name: 'delegate_with_steps',
+      source: [
+        'await rlm_query(String(input), { maxSteps: 5 });',
+        '"DONE"',
+      ].join('\n'),
+    }],
+  });
+
+  const result = await session.execute('await delegate_with_steps("solve this")');
+
+  assert.equal(result.status, 'success');
+  assert.equal(result.result.json, 'DONE');
+  assert.deepEqual(seenCalls, [{
+    maxSteps: 5,
+    maxSubcallDepth: 1,
+    prompt: 'solve this',
+  }]);
+});
+
+Deno.test('runtime helper input rejects nullish and non-string payloads', async () => {
+  const journalPath = await createSessionPath('runtime-helper-input-contract');
+  const session = await ReplSession.open({
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    journalPath,
+    runtimeHelpers: [{
+      description: '텍스트만 허용합니다.',
+      inputKinds: ['text'],
+      name: 'text_only',
+      source: 'input.toUpperCase()',
+    }],
+  });
+
+  const nullResult = await session.execute('await text_only(null)');
+  const undefinedResult = await session.execute('await text_only(undefined)');
+  const objectResult = await session.execute('await text_only({ task: "PING" })');
+
+  assert.equal(nullResult.status, 'error');
+  assert.match(nullResult.stderr, /requires a non-null text input/u);
+  assert.equal(undefinedResult.status, 'error');
+  assert.match(undefinedResult.stderr, /requires a non-null text input/u);
+  assert.equal(objectResult.status, 'error');
+  assert.match(objectResult.stderr, /expects text input/u);
+});
+
+Deno.test('runtime helper accepts object input when the helper declares object support', async () => {
+  const journalPath = await createSessionPath('runtime-helper-object-input');
+  const session = await ReplSession.open({
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    journalPath,
+    runtimeHelpers: [{
+      description: '객체 키 수를 셉니다.',
+      inputKinds: ['object'],
+      name: 'count_object_keys',
+      source: 'Object.keys(input).length',
+    }],
+  });
+
+  const result = await session.execute('await count_object_keys({ task: "PING", mode: "AOT" })');
+
+  assert.equal(result.status, 'success');
+  assert.equal(result.result.preview, '2');
+  assert.equal(result.result.json, 2);
+});
+
+Deno.test('runtime helper accepts array input when the helper declares array support', async () => {
+  const journalPath = await createSessionPath('runtime-helper-array-input');
+  const session = await ReplSession.open({
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    journalPath,
+    runtimeHelpers: [{
+      description: '배열 길이를 셉니다.',
+      inputKinds: ['array'],
+      name: 'count_array_items',
+      source: 'input.length',
+    }],
+  });
+
+  const result = await session.execute('await count_array_items(["PING", "PONG", "AOT"])');
+
+  assert.equal(result.status, 'success');
+  assert.equal(result.result.preview, '3');
+  assert.equal(result.result.json, 3);
+});
+
+Deno.test('runtime helper rejects undeclared object and array input types', async () => {
+  const journalPath = await createSessionPath('runtime-helper-typed-input-mismatch');
+  const session = await ReplSession.open({
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    journalPath,
+    runtimeHelpers: [{
+      description: '객체만 허용합니다.',
+      inputKinds: ['object'],
+      name: 'object_only',
+      source: 'Object.keys(input).length',
+    }, {
+      description: '배열만 허용합니다.',
+      inputKinds: ['array'],
+      name: 'array_only',
+      source: 'input.length',
+    }],
+  });
+
+  const textResult = await session.execute('await object_only("PING")');
+  const objectResult = await session.execute('await array_only({ task: "PING" })');
+
+  assert.equal(textResult.status, 'error');
+  assert.match(textResult.stderr, /expects object input/u);
+  assert.equal(objectResult.status, 'error');
+  assert.match(objectResult.stderr, /expects array input/u);
+});
+
+Deno.test('runtime helper timeout floors widen the outer cell timeout budget', async () => {
+  const journalPath = await createSessionPath('runtime-helper-timeout-floor');
+  const session = await ReplSession.open({
+    clock: createClock(),
+    defaultTimeoutMs: 20,
+    idGenerator: createIdGenerator(),
+    journalPath,
+    llmQueryHandler: async (prompt) => {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      return prompt;
+    },
+    runtimeHelpers: [{
+      description: '짧은 session timeout보다 오래 걸리는 계산을 수행합니다.',
+      inputKinds: ['text'],
+      name: 'slow_helper',
+      source: [
+        'await llm_query(input);',
+        'input.toUpperCase()',
+      ].join('\n'),
+      timeoutMs: 200,
+    }],
+  });
+
+  const result = await session.execute('await slow_helper("done")');
+
+  assert.equal(result.status, 'success');
+  assert.equal(result.result.json, 'DONE');
+});
+
+Deno.test('AoT plugin lite mode follows a single decomposition-contraction path without judge, graph solve, or frontier search', async () => {
+  const journalPath = await createSessionPath('aot-plugin-lite-flow');
+  const llmPrompts: string[] = [];
+  const rlmPrompts: string[] = [];
+  const plugin = createAoTPlugin();
+
+  const session = await ReplSession.open({
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    journalPath,
+    llmQueryHandler: async (prompt) => {
+      llmPrompts.push(prompt);
+
+      if (
+        prompt.includes('AOT_DECOMPOSE_JSON') &&
+        prompt.includes('Explain why the sky appears blue and summarize it briefly.')
+      ) {
+        return JSON.stringify({
+          atomic: false,
+          reason: 'cause and summary can be solved through one reduction',
+          subquestions: [
+            { id: 'q1', question: 'Why does the sky appear blue?', deps: [] },
+          ],
+        });
+      }
+
+      if (prompt.includes('AOT_ATOM_SOLVE') && prompt.includes('Why does the sky appear blue?')) {
+        return 'Rayleigh scattering makes shorter blue wavelengths scatter more strongly.';
+      }
+
+      if (prompt.includes('AOT_CONTRACT_JSON')) {
+        return JSON.stringify({
+          next_question:
+            'Explain briefly that the sky appears blue because Rayleigh scattering scatters shorter blue wavelengths more strongly.',
+          ready: true,
+          reason: 'the reduced state is already directly answerable',
+        });
+      }
+
+      if (
+        prompt.includes('AOT_SOLVE_STATE') &&
+        prompt.includes('Rayleigh scattering scatters shorter blue wavelengths more strongly')
+      ) {
+        return '하늘이 파랗게 보이는 이유는 레일리 산란으로 짧은 파란 파장이 더 강하게 산란되기 때문이다.';
+      }
+
+      throw new Error(`Unexpected llm_query prompt: ${prompt}`);
+    },
+    rlmQueryHandler: async (prompt) => {
+      const task = typeof prompt === 'string' ? prompt : prompt.task;
+      rlmPrompts.push(task);
+
+      throw new Error(`Unexpected rlm_query prompt: ${task}`);
+    },
+    runtimeHelpers: plugin.runtimeHelpers,
+  });
+
+  const result = await session.execute(`await aot({
+  question: "Explain why the sky appears blue and summarize it briefly.",
+  maxIterations: 1,
+  maxIndependentSubquestions: 2,
+  maxRefinements: 0,
+  includeTrace: true
+})`);
+
+  assert.equal(result.status, 'success');
+  const aotResult = result.result.json as Record<string, unknown>;
+  const iterations = aotResult.iterations as Array<Record<string, unknown>>;
+
+  assert.equal(
+    aotResult.answer,
+    '하늘이 파랗게 보이는 이유는 레일리 산란으로 짧은 파란 파장이 더 강하게 산란되기 때문이다.',
+  );
+  assert.equal(String(aotResult.finalQuestion).includes('Rayleigh scattering'), true);
+  assert.equal(aotResult.stoppedBecause, 'lite_ready');
+  assert.equal(iterations.length, 1);
+  assert.equal(llmPrompts.filter((prompt) => prompt.includes('AOT_DECOMPOSE_JSON')).length, 1);
+  assert.equal(llmPrompts.filter((prompt) => prompt.includes('AOT_CONTRACT_JSON')).length, 1);
+  assert.equal(llmPrompts.filter((prompt) => prompt.includes('AOT_JUDGE_JSON')).length, 0);
+  assert.equal(llmPrompts.filter((prompt) => prompt.includes('AOT_REFINE_JSON')).length, 0);
+  assert.equal(llmPrompts.filter((prompt) => prompt.includes('AOT_FRONTIER_JSON')).length, 0);
+  assert.equal(llmPrompts.filter((prompt) => prompt.includes('AOT_SOLVE_GRAPH')).length, 0);
+  assert.equal(llmPrompts.filter((prompt) => prompt.includes('AOT_SOLVE_STATE')).length, 1);
+  assert.equal(rlmPrompts.length, 0);
+});
+
+Deno.test('AoT plugin judges solve(Qi), solve(Gi), and solve(Qi+1) before accepting the next state', async () => {
+  const journalPath = await createSessionPath('aot-plugin-flow');
+  const llmPrompts: string[] = [];
+  const rlmPrompts: string[] = [];
+  const plugin = createAoTPlugin();
+
+  const session = await ReplSession.open({
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    journalPath,
+    llmQueryHandler: async (prompt) => {
+      llmPrompts.push(prompt);
+
+      if (
+        prompt.includes('AOT_DECOMPOSE_JSON') &&
+        prompt.includes('Who wrote Hamlet and what is its genre?')
+      ) {
+        return JSON.stringify({
+          atomic: false,
+          reason: 'author and genre can be solved independently',
+          subquestions: [
+            { id: 'q1', question: 'Who wrote Hamlet?', deps: [] },
+            { id: 'q2', question: 'What genre is Hamlet?', deps: [] },
+          ],
+        });
+      }
+
+      if (prompt.includes('AOT_ATOM_SOLVE') && prompt.includes('Who wrote Hamlet?')) {
+        return 'William Shakespeare';
+      }
+
+      if (prompt.includes('AOT_ATOM_SOLVE') && prompt.includes('What genre is Hamlet?')) {
+        return 'tragedy';
+      }
+
+      if (prompt.includes('AOT_CONTRACT_JSON')) {
+        return JSON.stringify({
+          next_question:
+            'Answer in one sentence: Hamlet was written by William Shakespeare and its genre is tragedy.',
+          ready: true,
+          reason: 'both independent atoms are solved',
+        });
+      }
+
+      if (prompt.includes('AOT_JUDGE_JSON')) {
+        return JSON.stringify({
+          accept_next_state: true,
+          answer: 'Hamlet was written by William Shakespeare, and it is a tragedy.',
+          reason: 'the contracted next state preserves the answer and reduces complexity',
+          refine_next_state: false,
+          selected: 'next',
+        });
+      }
+
+      if (
+        prompt.includes('AOT_SOLVE_STATE') &&
+        prompt.includes('Current Markov state:\nWho wrote Hamlet and what is its genre?')
+      ) {
+        return 'Hamlet is a well-known work in English literature.';
+      }
+
+      if (prompt.includes('AOT_SOLVE_GRAPH')) {
+        return 'Hamlet was written by Shakespeare and is usually categorized as a revenge tragedy.';
+      }
+
+      if (
+        prompt.includes('AOT_SOLVE_STATE') &&
+        prompt.includes(
+          'Current Markov state:\nAnswer in one sentence: Hamlet was written by William Shakespeare and its genre is tragedy.',
+        )
+      ) {
+        return 'Hamlet was written by William Shakespeare, and it is a tragedy.';
+      }
+
+      throw new Error(`Unexpected llm_query prompt: ${prompt}`);
+    },
+    rlmQueryHandler: async (prompt) => {
+      const task = typeof prompt === 'string' ? prompt : prompt.task;
+      rlmPrompts.push(task);
+
+      throw new Error(`Unexpected rlm_query prompt: ${task}`);
+    },
+    runtimeHelpers: plugin.runtimeHelpers,
+  });
+
+  const result = await session.execute(
+    'JSON.stringify(await aot("Who wrote Hamlet and what is its genre?"))',
+  );
+
+  assert.equal(result.status, 'success');
+  assert.deepEqual(JSON.parse(String(result.result.json)), {
+    answer: 'Hamlet was written by William Shakespeare, and it is a tragedy.',
+    finalQuestion:
+      'Answer in one sentence: Hamlet was written by William Shakespeare and its genre is tragedy.',
+    iterations: [{
+      contractedQuestion:
+        'Answer in one sentence: Hamlet was written by William Shakespeare and its genre is tragedy.',
+      contractedQuestionAnswer: 'Hamlet was written by William Shakespeare, and it is a tragedy.',
+      currentStateAnswer: 'Hamlet is a well-known work in English literature.',
+      decompositionReason: 'author and genre can be solved independently',
+      frontierRank: 1,
+      frontierScore: 1,
+      graphAnswer:
+        'Hamlet was written by Shakespeare and is usually categorized as a revenge tragedy.',
+      independentSubquestions: [
+        { answer: 'William Shakespeare', id: 'q1', question: 'Who wrote Hamlet?' },
+        { answer: 'tragedy', id: 'q2', question: 'What genre is Hamlet?' },
+      ],
+      iteration: 1,
+      judgeAcceptedNextState: true,
+      judgeReason: 'the contracted next state preserves the answer and reduces complexity',
+      judgeSelection: 'next',
+      question: 'Who wrote Hamlet and what is its genre?',
+      ready: true,
+      refinement: null,
+      reason: 'both independent atoms are solved',
+      subquestions: [
+        { deps: [], id: 'q1', question: 'Who wrote Hamlet?' },
+        { deps: [], id: 'q2', question: 'What genre is Hamlet?' },
+      ],
+    }],
+    maxIterations: 3,
+    originalQuestion: 'Who wrote Hamlet and what is its genre?',
+    stoppedBecause: 'judge_selected_next_state',
+  });
+  assert.equal(llmPrompts.filter((prompt) => prompt.includes('AOT_DECOMPOSE_JSON')).length, 1);
+  assert.equal(llmPrompts.filter((prompt) => prompt.includes('AOT_ATOM_SOLVE')).length, 2);
+  assert.equal(llmPrompts.filter((prompt) => prompt.includes('AOT_CONTRACT_JSON')).length, 1);
+  assert.equal(llmPrompts.filter((prompt) => prompt.includes('AOT_JUDGE_JSON')).length, 1);
+  assert.equal(llmPrompts.filter((prompt) => prompt.includes('AOT_SOLVE_STATE')).length, 2);
+  assert.equal(llmPrompts.filter((prompt) => prompt.includes('AOT_SOLVE_GRAPH')).length, 1);
+  assert.equal(rlmPrompts.length, 0);
+});
+
+Deno.test('AoT plugin can use reflective refinement when the first contracted state is rejected', async () => {
+  const journalPath = await createSessionPath('aot-plugin-object-input');
+  const llmPrompts: string[] = [];
+  const rlmPrompts: string[] = [];
+  const plugin = createAoTPlugin();
+
+  const session = await ReplSession.open({
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    journalPath,
+    llmQueryHandler: async (prompt) => {
+      llmPrompts.push(prompt);
+
+      if (
+        prompt.includes('AOT_DECOMPOSE_JSON') &&
+        prompt.includes('When did Atlas launches happen?')
+      ) {
+        return JSON.stringify({
+          atomic: false,
+          reason: 'date lookup and aggregation can be separated',
+          subquestions: [
+            { id: 'q1', question: 'What launch dates are listed for Atlas?', deps: [] },
+          ],
+        });
+      }
+
+      if (prompt.includes('AOT_ATOM_SOLVE') && prompt.includes('What launch dates are listed')) {
+        return '2025-01 and 2025-02';
+      }
+
+      if (prompt.includes('AOT_CONTRACT_JSON')) {
+        return JSON.stringify({
+          next_question: 'State the launch dates.',
+          ready: false,
+          reason: 'the dates have been surfaced but the question is too terse',
+        });
+      }
+
+      if (prompt.includes('AOT_JUDGE_JSON') && prompt.includes('State the launch dates.')) {
+        return JSON.stringify({
+          accept_next_state: false,
+          answer: 'Atlas launches happened in 2025-01 and 2025-02.',
+          reason: 'the proposed next state is too underspecified to be a reliable Markov state',
+          refine_next_state: true,
+          selected: 'graph',
+        });
+      }
+
+      if (prompt.includes('AOT_REFINE_JSON')) {
+        return JSON.stringify({
+          next_question:
+            'Using the listed launch dates 2025-01 and 2025-02, answer when Atlas launches happened in one sentence.',
+          ready: true,
+          reason: 'the refined state is self-contained and answer-equivalent',
+        });
+      }
+
+      if (
+        prompt.includes('AOT_JUDGE_JSON') &&
+        prompt.includes('Using the listed launch dates 2025-01 and 2025-02')
+      ) {
+        return JSON.stringify({
+          accept_next_state: true,
+          answer: 'Atlas launches happened in 2025-01 and 2025-02.',
+          reason: 'the refined state is self-contained and lower-complexity',
+          refine_next_state: false,
+          selected: 'next',
+        });
+      }
+
+      if (
+        prompt.includes('AOT_SOLVE_STATE') &&
+        prompt.includes('Current Markov state:\nWhen did Atlas launches happen?')
+      ) {
+        return 'Atlas launches were mentioned in a schedule.';
+      }
+
+      if (prompt.includes('AOT_SOLVE_GRAPH')) {
+        return 'Atlas launches happened in 2025-01 and 2025-02.';
+      }
+
+      if (
+        prompt.includes('AOT_SOLVE_STATE') &&
+        prompt.includes('Current Markov state:\nState the launch dates.')
+      ) {
+        return 'The launch dates are 2025-01 and 2025-02.';
+      }
+
+      if (
+        prompt.includes('AOT_SOLVE_STATE') &&
+        prompt.includes('Current Markov state:\nUsing the listed launch dates 2025-01 and 2025-02')
+      ) {
+        return 'Atlas launches happened in 2025-01 and 2025-02.';
+      }
+
+      throw new Error(`Unexpected llm_query prompt: ${prompt}`);
+    },
+    rlmQueryHandler: async (prompt) => {
+      const task = typeof prompt === 'string' ? prompt : prompt.task;
+      rlmPrompts.push(task);
+
+      throw new Error(`Unexpected rlm_query prompt: ${task}`);
+    },
+    runtimeHelpers: plugin.runtimeHelpers,
+  });
+
+  const result = await session.execute(`await aot({
+  question: "When did Atlas launches happen?",
+  context: { launches: ["2025-01", "2025-02"] },
+  maxIterations: 2,
+  maxRefinements: 1,
+  includeTrace: false,
+})`);
+
+  assert.equal(result.status, 'success');
+  assert.deepEqual(result.result.json, {
+    answer: 'Atlas launches happened in 2025-01 and 2025-02.',
+    finalQuestion:
+      'Using the listed launch dates 2025-01 and 2025-02, answer when Atlas launches happened in one sentence.',
+    iterations: [],
+    maxIterations: 2,
+    originalQuestion: 'When did Atlas launches happen?',
+    stoppedBecause: 'judge_selected_next_state',
+  });
+  assert.match(llmPrompts[0] ?? '', /Shared context:/u);
+  assert.match(llmPrompts[0] ?? '', /"launches"/u);
+  assert.equal(llmPrompts.filter((prompt) => prompt.includes('AOT_REFINE_JSON')).length, 1);
+  assert.match(
+    llmPrompts.find((prompt) => prompt.includes('AOT_SOLVE_STATE') && prompt.includes('Using the listed launch dates 2025-01 and 2025-02')) ?? '',
+    /Using the listed launch dates 2025-01 and 2025-02/u,
+  );
+  assert.equal(rlmPrompts.length, 0);
+});
+
+Deno.test('AoT plugin can rank multiple accepted next states at the same depth and continue with the best branch', async () => {
+  const journalPath = await createSessionPath('aot-plugin-frontier-search');
+  const llmPrompts: string[] = [];
+  const rlmPrompts: string[] = [];
+  const plugin = createAoTPlugin();
+
+  const session = await ReplSession.open({
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    journalPath,
+    llmQueryHandler: async (prompt) => {
+      llmPrompts.push(prompt);
+
+      if (
+        prompt.includes('AOT_DECOMPOSE_JSON') &&
+        prompt.includes('Summarize the signal using both clues.')
+      ) {
+        return JSON.stringify({
+          atomic: false,
+          reason: 'the two clues can be extracted independently',
+          subquestions: [
+            { id: 'q1', question: 'What is clue alpha?', deps: [] },
+            { id: 'q2', question: 'What is clue beta?', deps: [] },
+          ],
+        });
+      }
+
+      if (prompt.includes('AOT_ATOM_SOLVE') && prompt.includes('What is clue alpha?')) {
+        return 'alpha=7';
+      }
+
+      if (prompt.includes('AOT_ATOM_SOLVE') && prompt.includes('What is clue beta?')) {
+        return 'beta=11';
+      }
+
+      if (prompt.includes('AOT_CONTRACT_JSON') && prompt.includes('Candidate sample: 1 / 2')) {
+        return JSON.stringify({
+          next_question: 'Answer using only alpha.',
+          ready: false,
+          reason: 'this branch keeps only the first clue',
+        });
+      }
+
+      if (prompt.includes('AOT_CONTRACT_JSON') && prompt.includes('Candidate sample: 2 / 2')) {
+        return JSON.stringify({
+          next_question: 'Answer using both alpha and beta.',
+          ready: false,
+          reason: 'this branch preserves both clues in a self-contained state',
+        });
+      }
+
+      if (
+        prompt.includes('AOT_JUDGE_JSON') &&
+        prompt.includes('Proposed next Markov state:\nAnswer using only alpha.')
+      ) {
+        return JSON.stringify({
+          accept_next_state: true,
+          answer: 'The signal mentions alpha but misses beta.',
+          reason: 'the state is answer-equivalent but weak',
+          refine_next_state: false,
+          selected: 'next',
+        });
+      }
+
+      if (
+        prompt.includes('AOT_JUDGE_JSON') &&
+        prompt.includes('Proposed next Markov state:\nAnswer using both alpha and beta.')
+      ) {
+        return JSON.stringify({
+          accept_next_state: true,
+          answer: 'The signal combines alpha=7 and beta=11.',
+          reason: 'the state is answer-equivalent and clearly lower complexity',
+          refine_next_state: false,
+          selected: 'next',
+        });
+      }
+
+      if (prompt.includes('AOT_FRONTIER_JSON')) {
+        return JSON.stringify({
+          reason: 'the branch preserving both clues is stronger and more complete',
+          selected_ids: ['c2'],
+        });
+      }
+
+      if (
+        prompt.includes('AOT_DECOMPOSE_JSON') &&
+        prompt.includes('Answer using both alpha and beta.')
+      ) {
+        return JSON.stringify({
+          atomic: true,
+          reason: 'the selected state is already atomic',
+          subquestions: [],
+        });
+      }
+
+      if (
+        prompt.includes('AOT_SOLVE_STATE') &&
+        prompt.includes('Current Markov state:\nSummarize the signal using both clues.')
+      ) {
+        return 'The signal contains some clues.';
+      }
+
+      if (prompt.includes('AOT_SOLVE_GRAPH')) {
+        return 'The signal combines alpha=7 and beta=11.';
+      }
+
+      if (
+        prompt.includes('AOT_SOLVE_STATE') &&
+        prompt.includes('Current Markov state:\nAnswer using only alpha.')
+      ) {
+        return 'The signal mentions only alpha=7.';
+      }
+
+      if (
+        prompt.includes('AOT_SOLVE_STATE') &&
+        prompt.includes('Current Markov state:\nAnswer using both alpha and beta.')
+      ) {
+        return 'The signal combines alpha=7 and beta=11.';
+      }
+
+      throw new Error(`Unexpected llm_query prompt: ${prompt}`);
+    },
+    rlmQueryHandler: async (prompt) => {
+      const task = typeof prompt === 'string' ? prompt : prompt.task;
+      rlmPrompts.push(task);
+
+      throw new Error(`Unexpected rlm_query prompt: ${task}`);
+    },
+    runtimeHelpers: plugin.runtimeHelpers,
+  });
+
+  const result = await session.execute(`await aot({
+  question: "Summarize the signal using both clues.",
+  transitionSamples: 2,
+  beamWidth: 1,
+})`);
+
+  assert.equal(result.status, 'success');
+  const aotResult = result.result.json as Record<string, unknown>;
+  const iterations = aotResult.iterations as Array<Record<string, unknown>>;
+
+  assert.equal(aotResult.answer, 'The signal combines alpha=7 and beta=11.');
+  assert.equal(aotResult.finalQuestion, 'Answer using both alpha and beta.');
+  assert.equal(aotResult.originalQuestion, 'Summarize the signal using both clues.');
+  assert.equal(aotResult.stoppedBecause, 'atomic');
+  assert.equal(iterations.length, 2);
+  assert.equal(
+    iterations[0]?.contractedQuestion,
+    'Answer using both alpha and beta.',
+  );
+  assert.equal(
+    iterations[0]?.judgeReason,
+    'the state is answer-equivalent and clearly lower complexity',
+  );
+  assert.equal(iterations[1]?.judgeSelection, 'current');
+  assert.equal(llmPrompts.filter((prompt) => prompt.includes('AOT_FRONTIER_JSON')).length, 1);
+  assert.match(
+    llmPrompts.find((prompt) => prompt.includes('AOT_FRONTIER_JSON')) ?? '',
+    /selected_ids/u,
+  );
+  assert.match(
+    llmPrompts.find((prompt) => prompt.includes('AOT_SOLVE_STATE') && prompt.includes('Answer using both alpha and beta.')) ?? '',
+    /Answer using both alpha and beta\./u,
+  );
+  assert.equal(rlmPrompts.length, 0);
+});
+
+Deno.test('AoT plugin can rank accepted candidates globally across multiple frontier parents', async () => {
+  const journalPath = await createSessionPath('aot-plugin-global-frontier-search');
+  const llmPrompts: string[] = [];
+  const rlmPrompts: string[] = [];
+  const plugin = createAoTPlugin();
+
+  const session = await ReplSession.open({
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    journalPath,
+    llmQueryHandler: async (prompt) => {
+      llmPrompts.push(prompt);
+
+      if (
+        prompt.includes('AOT_DECOMPOSE_JSON') &&
+        prompt.includes('Assemble the final brief.')
+      ) {
+        return JSON.stringify({
+          atomic: false,
+          reason: 'red and blue threads can be separated',
+          subquestions: [
+            { id: 'q1', question: 'What is thread red?', deps: [] },
+            { id: 'q2', question: 'What is thread blue?', deps: [] },
+          ],
+        });
+      }
+
+      if (prompt.includes('AOT_ATOM_SOLVE') && prompt.includes('What is thread red?')) {
+        return 'red';
+      }
+
+      if (prompt.includes('AOT_ATOM_SOLVE') && prompt.includes('What is thread blue?')) {
+        return 'blue';
+      }
+
+      if (prompt.includes('AOT_CONTRACT_JSON') && prompt.includes('Candidate sample: 1 / 2') &&
+        prompt.includes('Current question:\nAssemble the final brief.')) {
+        return JSON.stringify({
+          next_question: 'Track red branch.',
+          ready: false,
+          reason: 'follow the red thread first',
+        });
+      }
+
+      if (prompt.includes('AOT_CONTRACT_JSON') && prompt.includes('Candidate sample: 2 / 2') &&
+        prompt.includes('Current question:\nAssemble the final brief.')) {
+        return JSON.stringify({
+          next_question: 'Track blue branch.',
+          ready: false,
+          reason: 'follow the blue thread first',
+        });
+      }
+
+      if (
+        prompt.includes('AOT_JUDGE_JSON') &&
+        prompt.includes('Proposed next Markov state:\nTrack red branch.')
+      ) {
+        return JSON.stringify({
+          accept_next_state: true,
+          answer: 'The brief can be followed through the red thread.',
+          reason: 'red is acceptable',
+          refine_next_state: false,
+          selected: 'next',
+        });
+      }
+
+      if (
+        prompt.includes('AOT_JUDGE_JSON') &&
+        prompt.includes('Proposed next Markov state:\nTrack blue branch.')
+      ) {
+        return JSON.stringify({
+          accept_next_state: true,
+          answer: 'The brief can be followed through the blue thread.',
+          reason: 'blue is acceptable',
+          refine_next_state: false,
+          selected: 'next',
+        });
+      }
+
+      if (
+        prompt.includes('AOT_DECOMPOSE_JSON') &&
+        prompt.includes('Track red branch.')
+      ) {
+        return JSON.stringify({
+          atomic: false,
+          reason: 'red can branch into weak or medium paths',
+          subquestions: [
+            { id: 'q1', question: 'What detail strengthens red?', deps: [] },
+          ],
+        });
+      }
+
+      if (
+        prompt.includes('AOT_DECOMPOSE_JSON') &&
+        prompt.includes('Track blue branch.')
+      ) {
+        return JSON.stringify({
+          atomic: false,
+          reason: 'blue can branch into medium or best paths',
+          subquestions: [
+            { id: 'q1', question: 'What detail strengthens blue?', deps: [] },
+          ],
+        });
+      }
+
+      if (prompt.includes('AOT_ATOM_SOLVE') && prompt.includes('What detail strengthens red?')) {
+        return 'red-strong';
+      }
+
+      if (prompt.includes('AOT_ATOM_SOLVE') && prompt.includes('What detail strengthens blue?')) {
+        return 'blue-strong';
+      }
+
+      if (prompt.includes('AOT_CONTRACT_JSON') && prompt.includes('Candidate sample: 1 / 2') &&
+        prompt.includes('Current question:\nTrack red branch.')) {
+        return JSON.stringify({
+          next_question: 'Red child weak.',
+          ready: false,
+          reason: 'a weaker red branch',
+        });
+      }
+
+      if (prompt.includes('AOT_CONTRACT_JSON') && prompt.includes('Candidate sample: 2 / 2') &&
+        prompt.includes('Current question:\nTrack red branch.')) {
+        return JSON.stringify({
+          next_question: 'Red child medium.',
+          ready: false,
+          reason: 'a medium red branch',
+        });
+      }
+
+      if (prompt.includes('AOT_CONTRACT_JSON') && prompt.includes('Candidate sample: 1 / 2') &&
+        prompt.includes('Current question:\nTrack blue branch.')) {
+        return JSON.stringify({
+          next_question: 'Blue child medium.',
+          ready: false,
+          reason: 'a medium blue branch',
+        });
+      }
+
+      if (prompt.includes('AOT_CONTRACT_JSON') && prompt.includes('Candidate sample: 2 / 2') &&
+        prompt.includes('Current question:\nTrack blue branch.')) {
+        return JSON.stringify({
+          next_question: 'Blue child best.',
+          ready: true,
+          reason: 'the strongest blue branch',
+        });
+      }
+
+      if (
+        prompt.includes('AOT_JUDGE_JSON') &&
+        prompt.includes('Proposed next Markov state:\nRed child weak.')
+      ) {
+        return JSON.stringify({
+          accept_next_state: true,
+          answer: 'Red weak path is incomplete.',
+          reason: 'weak red branch',
+          refine_next_state: false,
+          selected: 'next',
+        });
+      }
+
+      if (
+        prompt.includes('AOT_JUDGE_JSON') &&
+        prompt.includes('Proposed next Markov state:\nRed child medium.')
+      ) {
+        return JSON.stringify({
+          accept_next_state: true,
+          answer: 'Red medium path is usable.',
+          reason: 'medium red branch',
+          refine_next_state: false,
+          selected: 'next',
+        });
+      }
+
+      if (
+        prompt.includes('AOT_JUDGE_JSON') &&
+        prompt.includes('Proposed next Markov state:\nBlue child medium.')
+      ) {
+        return JSON.stringify({
+          accept_next_state: true,
+          answer: 'Blue medium path is usable.',
+          reason: 'medium blue branch',
+          refine_next_state: false,
+          selected: 'next',
+        });
+      }
+
+      if (
+        prompt.includes('AOT_JUDGE_JSON') &&
+        prompt.includes('Proposed next Markov state:\nBlue child best.')
+      ) {
+        return JSON.stringify({
+          accept_next_state: true,
+          answer: 'Blue best path resolves the full brief.',
+          reason: 'best blue branch',
+          refine_next_state: false,
+          selected: 'next',
+        });
+      }
+
+      if (prompt.includes('AOT_FRONTIER_JSON') && prompt.includes('Track red branch.')) {
+        return JSON.stringify({
+          reason: 'all accepted candidates fit within the beam at this depth',
+          selected_ids: ['c1', 'c2'],
+        });
+      }
+
+      if (prompt.includes('AOT_FRONTIER_JSON') && prompt.includes('Red child weak.')) {
+        return JSON.stringify({
+          reason: 'the blue best and red medium branches dominate the other options',
+          selected_ids: ['c4', 'c2'],
+        });
+      }
+
+      if (
+        prompt.includes('AOT_DECOMPOSE_JSON') &&
+        prompt.includes('Red child medium.')
+      ) {
+        return JSON.stringify({
+          atomic: true,
+          reason: 'red medium is already atomic',
+          subquestions: [],
+        });
+      }
+
+      if (
+        prompt.includes('AOT_SOLVE_STATE') &&
+        prompt.includes('Current Markov state:\nAssemble the final brief.')
+      ) {
+        return 'The brief starts unresolved.';
+      }
+
+      if (
+        prompt.includes('AOT_SOLVE_GRAPH') &&
+        prompt.includes('Current Markov state:\nAssemble the final brief.')
+      ) {
+        return 'The brief contains both red and blue threads.';
+      }
+
+      if (
+        prompt.includes('AOT_SOLVE_STATE') &&
+        prompt.includes('Current Markov state:\nTrack red branch.')
+      ) {
+        return 'The brief follows the red thread.';
+      }
+
+      if (
+        prompt.includes('AOT_SOLVE_STATE') &&
+        prompt.includes('Current Markov state:\nTrack blue branch.')
+      ) {
+        return 'The brief follows the blue thread.';
+      }
+
+      if (
+        prompt.includes('AOT_SOLVE_GRAPH') &&
+        prompt.includes('Current Markov state:\nTrack red branch.')
+      ) {
+        return 'Red graph resolves to medium quality.';
+      }
+
+      if (
+        prompt.includes('AOT_SOLVE_GRAPH') &&
+        prompt.includes('Current Markov state:\nTrack blue branch.')
+      ) {
+        return 'Blue graph resolves to the strongest answer.';
+      }
+
+      if (
+        prompt.includes('AOT_SOLVE_STATE') &&
+        prompt.includes('Current Markov state:\nRed child weak.')
+      ) {
+        return 'Red weak path is incomplete.';
+      }
+
+      if (
+        prompt.includes('AOT_SOLVE_STATE') &&
+        prompt.includes('Current Markov state:\nRed child medium.')
+      ) {
+        return 'Red medium path is usable.';
+      }
+
+      if (
+        prompt.includes('AOT_SOLVE_STATE') &&
+        prompt.includes('Current Markov state:\nBlue child medium.')
+      ) {
+        return 'Blue medium path is usable.';
+      }
+
+      if (
+        prompt.includes('AOT_SOLVE_STATE') &&
+        prompt.includes('Current Markov state:\nBlue child best.')
+      ) {
+        return 'Blue best path resolves the full brief.';
+      }
+
+      throw new Error(`Unexpected llm_query prompt: ${prompt}`);
+    },
+    rlmQueryHandler: async (prompt) => {
+      const task = typeof prompt === 'string' ? prompt : prompt.task;
+      rlmPrompts.push(task);
+
+      throw new Error(`Unexpected rlm_query prompt: ${task}`);
+    },
+    runtimeHelpers: plugin.runtimeHelpers,
+  });
+
+  const result = await session.execute(`await aot({
+  question: "Assemble the final brief.",
+  transitionSamples: 2,
+  beamWidth: 2,
+})`);
+
+  assert.equal(result.status, 'success');
+  const aotResult = result.result.json as Record<string, unknown>;
+  const iterations = aotResult.iterations as Array<Record<string, unknown>>;
+
+  assert.equal(aotResult.answer, 'Blue best path resolves the full brief.');
+  assert.equal(aotResult.finalQuestion, 'Blue child best.');
+  assert.equal(aotResult.stoppedBecause, 'judge_selected_next_state');
+  assert.equal(iterations.length, 2);
+  assert.equal(iterations[0]?.contractedQuestion, 'Track blue branch.');
+  assert.equal(iterations[1]?.contractedQuestion, 'Blue child best.');
+  assert.equal(
+    iterations[1]?.judgeReason,
+    'best blue branch',
+  );
+  assert.equal(llmPrompts.filter((prompt) => prompt.includes('AOT_FRONTIER_JSON')).length, 1);
+  assert.match(
+    llmPrompts.find((prompt) => prompt.includes('AOT_FRONTIER_JSON') && prompt.includes('Red child weak.')) ?? '',
+    /"selected_ids": \[/u,
+  );
+  assert.equal(rlmPrompts.length, 0);
+});
+
+Deno.test('AoT plugin keeps exploring the beam when a ready candidate is selected but a deeper branch can surpass it', async () => {
+  const journalPath = await createSessionPath('aot-plugin-ready-beam-continuation');
+  const llmPrompts: string[] = [];
+  const rlmPrompts: string[] = [];
+  const plugin = createAoTPlugin();
+
+  const session = await ReplSession.open({
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    journalPath,
+    llmQueryHandler: async (prompt) => {
+      llmPrompts.push(prompt);
+
+      if (
+        prompt.includes('AOT_DECOMPOSE_JSON') &&
+        prompt.includes('Pick the best final brief.')
+      ) {
+        return JSON.stringify({
+          atomic: false,
+          reason: 'the brief can be drafted quickly or investigated further',
+          subquestions: [
+            { id: 'q1', question: 'What evidence is already available?', deps: [] },
+          ],
+        });
+      }
+
+      if (prompt.includes('AOT_ATOM_SOLVE') && prompt.includes('What evidence is already available?')) {
+        return 'core-evidence';
+      }
+
+      if (
+        prompt.includes('AOT_CONTRACT_JSON') &&
+        prompt.includes('Candidate sample: 1 / 3') &&
+        prompt.includes('Current question:\nPick the best final brief.')
+      ) {
+        return JSON.stringify({
+          next_question: 'Quick draft.',
+          ready: true,
+          reason: 'a serviceable answer is already available',
+        });
+      }
+
+      if (
+        prompt.includes('AOT_CONTRACT_JSON') &&
+        prompt.includes('Candidate sample: 2 / 3') &&
+        prompt.includes('Current question:\nPick the best final brief.')
+      ) {
+        return JSON.stringify({
+          next_question: 'Investigate deeply.',
+          ready: false,
+          reason: 'one more reasoning step could improve the answer',
+        });
+      }
+
+      if (
+        prompt.includes('AOT_CONTRACT_JSON') &&
+        prompt.includes('Candidate sample: 3 / 3') &&
+        prompt.includes('Current question:\nPick the best final brief.')
+      ) {
+        return JSON.stringify({
+          next_question: 'Discard the secondary clue.',
+          ready: false,
+          reason: 'this branch drops important evidence',
+        });
+      }
+
+      if (
+        prompt.includes('AOT_JUDGE_JSON') &&
+        prompt.includes('Proposed next Markov state:\nQuick draft.')
+      ) {
+        return JSON.stringify({
+          accept_next_state: true,
+          answer: 'Quick draft answer.',
+          reason: 'good enough ready branch',
+          refine_next_state: false,
+          selected: 'next',
+        });
+      }
+
+      if (
+        prompt.includes('AOT_JUDGE_JSON') &&
+        prompt.includes('Proposed next Markov state:\nInvestigate deeply.')
+      ) {
+        return JSON.stringify({
+          accept_next_state: true,
+          answer: 'Investigating could produce the strongest answer.',
+          reason: 'promising deeper branch',
+          refine_next_state: false,
+          selected: 'next',
+        });
+      }
+
+      if (
+        prompt.includes('AOT_JUDGE_JSON') &&
+        prompt.includes('Proposed next Markov state:\nDiscard the secondary clue.')
+      ) {
+        return JSON.stringify({
+          accept_next_state: true,
+          answer: 'This branch is weak.',
+          reason: 'weak branch',
+          refine_next_state: false,
+          selected: 'next',
+        });
+      }
+
+      if (prompt.includes('AOT_FRONTIER_JSON') && prompt.includes('Quick draft.')) {
+        return JSON.stringify({
+          reason: 'keep the ready draft and the strongest unfinished branch in the beam',
+          selected_ids: ['c1', 'c2'],
+        });
+      }
+
+      if (
+        prompt.includes('AOT_DECOMPOSE_JSON') &&
+        prompt.includes('Investigate deeply.')
+      ) {
+        return JSON.stringify({
+          atomic: false,
+          reason: 'one final reduction yields the strongest brief',
+          subquestions: [
+            { id: 'q1', question: 'What final detail completes the investigation?', deps: [] },
+          ],
+        });
+      }
+
+      if (
+        prompt.includes('AOT_ATOM_SOLVE') &&
+        prompt.includes('What final detail completes the investigation?')
+      ) {
+        return 'final-detail';
+      }
+
+      if (
+        prompt.includes('AOT_CONTRACT_JSON') &&
+        prompt.includes('Current question:\nInvestigate deeply.')
+      ) {
+        return JSON.stringify({
+          next_question: 'Best final answer.',
+          ready: true,
+          reason: 'the investigation now yields the strongest self-contained answer',
+        });
+      }
+
+      if (
+        prompt.includes('AOT_JUDGE_JSON') &&
+        prompt.includes('Proposed next Markov state:\nBest final answer.')
+      ) {
+        return JSON.stringify({
+          accept_next_state: true,
+          answer: 'Best investigated answer.',
+          reason: 'strongest branch after one extra reasoning step',
+          refine_next_state: false,
+          selected: 'next',
+        });
+      }
+
+      if (
+        prompt.includes('AOT_SOLVE_STATE') &&
+        prompt.includes('Current Markov state:\nPick the best final brief.')
+      ) {
+        return 'The brief starts incomplete.';
+      }
+
+      if (
+        prompt.includes('AOT_SOLVE_GRAPH') &&
+        prompt.includes('Current Markov state:\nPick the best final brief.')
+      ) {
+        return 'The brief can be drafted now or improved by one more step.';
+      }
+
+      if (
+        prompt.includes('AOT_SOLVE_STATE') &&
+        prompt.includes('Current Markov state:\nQuick draft.')
+      ) {
+        return 'Quick draft answer.';
+      }
+
+      if (
+        prompt.includes('AOT_SOLVE_STATE') &&
+        prompt.includes('Current Markov state:\nInvestigate deeply.')
+      ) {
+        return 'The investigation is not finished yet.';
+      }
+
+      if (
+        prompt.includes('AOT_SOLVE_STATE') &&
+        prompt.includes('Current Markov state:\nDiscard the secondary clue.')
+      ) {
+        return 'This branch is weak.';
+      }
+
+      if (
+        prompt.includes('AOT_SOLVE_GRAPH') &&
+        prompt.includes('Current Markov state:\nInvestigate deeply.')
+      ) {
+        return 'The investigation can produce the strongest answer.';
+      }
+
+      if (
+        prompt.includes('AOT_SOLVE_STATE') &&
+        prompt.includes('Current Markov state:\nBest final answer.')
+      ) {
+        return 'Best investigated answer.';
+      }
+
+      throw new Error(`Unexpected llm_query prompt: ${prompt}`);
+    },
+    rlmQueryHandler: async (prompt) => {
+      const task = typeof prompt === 'string' ? prompt : prompt.task;
+      rlmPrompts.push(task);
+
+      throw new Error(`Unexpected rlm_query prompt: ${task}`);
+    },
+    runtimeHelpers: plugin.runtimeHelpers,
+  });
+
+  const result = await session.execute(`JSON.stringify(await aot({
+  question: "Pick the best final brief.",
+  transitionSamples: 3,
+  beamWidth: 2,
+}))`);
+
+  assert.equal(result.status, 'success');
+  const aotResult = JSON.parse(String(result.result.json)) as Record<string, unknown>;
+  const iterations = aotResult.iterations as Array<Record<string, unknown>>;
+
+  assert.equal(aotResult.answer, 'Best investigated answer.');
+  assert.equal(aotResult.finalQuestion, 'Best final answer.');
+  assert.equal(aotResult.stoppedBecause, 'judge_selected_next_state');
+  assert.equal(iterations.length, 2);
+  assert.equal(iterations[0]?.contractedQuestion, 'Investigate deeply.');
+  assert.equal(iterations[1]?.contractedQuestion, 'Best final answer.');
+  assert.equal(iterations[0]?.frontierScore, 1);
+  assert.equal(iterations[1]?.frontierScore, 3);
+  assert.equal(llmPrompts.filter((prompt) => prompt.includes('AOT_FRONTIER_JSON')).length, 1);
+  assert.match(
+    llmPrompts.find((prompt) => prompt.includes('AOT_FRONTIER_JSON')) ?? '',
+    /"pathScore": 0/u,
+  );
+  assert.match(
+    llmPrompts.find((prompt) => prompt.includes('Best final answer.') && prompt.includes('AOT_SOLVE_STATE')) ?? '',
+    /Best final answer\./u,
+  );
+  assert.equal(rlmPrompts.length, 0);
+});
+
 Deno.test('llm_query_batched resolves plain subcalls in input order', async () => {
   const journalPath = await createSessionPath('llm-query-batched');
   const seenPrompts: string[] = [];
@@ -582,9 +1996,7 @@ Deno.test('rlm_query_batched resolves delegated subcalls in input order', async 
     journalPath,
     rlmQueryHandler: async (prompt) => {
       seenPrompts.push(typeof prompt === 'string' ? prompt : { task: prompt.task });
-      return typeof prompt === 'string'
-        ? `delegated:${prompt}`
-        : { task: prompt.task, ok: true };
+      return typeof prompt === 'string' ? `delegated:${prompt}` : { task: prompt.task, ok: true };
     },
   });
 
@@ -1042,7 +2454,9 @@ Deno.test('code guard allows normalizeTarget and findAnchoredValue to be reused 
     assertCodeIsRunnable('const normalizeTarget = "linen";\nconst value = normalizeTarget;\nvalue')
   );
   assert.doesNotThrow(() =>
-    assertCodeIsRunnable('const findAnchoredValue = "A: 1.";\nconst value = findAnchoredValue;\nvalue')
+    assertCodeIsRunnable(
+      'const findAnchoredValue = "A: 1.";\nconst value = findAnchoredValue;\nvalue',
+    )
   );
 });
 
@@ -1191,6 +2605,21 @@ Deno.test('repl session helpers cover non-error snapshots and stderr joining', (
     'existing\nOops: bad',
   );
   assert.equal(__replSessionTestables.normalizeTimeout(undefined), 5_000);
+  assert.equal(
+    __replSessionTestables.resolveRuntimeHelperTimeoutFloor([
+      { description: 'slow', name: 'slow', source: 'input', timeoutMs: 200 },
+      { description: 'fast', name: 'fast', source: 'input', timeoutMs: 50 },
+    ]),
+    200,
+  );
+  assert.equal(
+    __replSessionTestables.resolveExecutionTimeout(30, 200),
+    200,
+  );
+  assert.equal(
+    __replSessionTestables.resolveExecutionTimeout(300, 200),
+    300,
+  );
 });
 
 Deno.test('worker runtime test helpers expose transformed source for expression and statement cells', () => {
@@ -1324,6 +2753,36 @@ Deno.test('direct sandbox helper executes a cell in the default worker runtime',
 
   assert.equal(result.status, 'success');
   assert.equal(result.result.preview, '2');
+});
+
+Deno.test('direct sandbox helper fails clearly when the runtime has no global Worker constructor', async () => {
+  const originalWorker = globalThis.Worker;
+
+  try {
+    Object.defineProperty(globalThis, 'Worker', {
+      configurable: true,
+      value: undefined,
+      writable: true,
+    });
+
+    await assert.rejects(
+      () =>
+        executeCellInSandbox({
+          context: null,
+          currentCode: '1 + 1',
+          history: [],
+          replayCells: [],
+          timeoutMs: 100,
+        }),
+      /No global Worker constructor is available in this runtime/u,
+    );
+  } finally {
+    Object.defineProperty(globalThis, 'Worker', {
+      configurable: true,
+      value: originalWorker,
+      writable: true,
+    });
+  }
 });
 
 Deno.test('persistent runtime rejects inconsistent successful history during restore', async () => {
@@ -2021,6 +3480,23 @@ Deno.test('worker runtime helper accepts async worker factories before it starts
 
   assert.equal(output.status, 'success');
   assert.equal(output.finalAnswer, '2');
+});
+
+Deno.test('persistent runtime rejects duplicate runtime helper names before worker startup', () => {
+  assert.throws(
+    () =>
+      new PersistentSandboxRuntime(
+        {
+          context: null,
+          runtimeHelpers: [
+            { description: 'first', name: 'repeat', source: 'input' },
+            { description: 'second', name: 'repeat', source: 'input' },
+          ],
+        },
+        () => createPersistentWorker(() => {}) as unknown as Worker,
+      ),
+    /Duplicate runtime helper name: repeat/u,
+  );
 });
 
 Deno.test('worker runtime helper rejects when the worker never replies', async () => {

@@ -87,3 +87,88 @@ Deno.test('buildConversationContext serializes turns and provider metadata for t
     storedTurnCount: 2,
   });
 });
+
+Deno.test('buildConversationContext covers usage snapshots and ollama provider labels', () => {
+  const localSettings = createProviderSettings({
+    apiKey: '',
+    availableModels: ['llama3.2:3b'],
+    baseUrl: 'localhost:11434',
+    kind: 'ollama-local',
+    rootModel: 'llama3.2:3b',
+    subModel: 'llama3.2:3b',
+  }, new Date('2026-03-31T00:00:00.000Z'));
+
+  const context = buildConversationContext([
+    {
+      content: '로컬 질문',
+      createdAt: '2026-03-31T10:05:00.000Z',
+      id: 'u2',
+      role: 'user',
+      usage: {
+        byModel: [{
+          inputTokens: 10,
+          model: 'llama3.2:3b',
+          outputTokens: 4,
+          totalTokens: 14,
+        }],
+        inputTokens: 10,
+        outputTokens: 4,
+        totalTokens: 14,
+      },
+    },
+  ], localSettings);
+
+  assert.deepEqual(context, {
+    app: 'examples/web',
+    conversation: [
+      {
+        content: '로컬 질문',
+        createdAt: '2026-03-31T10:05:00.000Z',
+        error: null,
+        id: 'u2',
+        role: 'user',
+        steps: null,
+        usage: {
+          byModel: [{
+            inputTokens: 10,
+            model: 'llama3.2:3b',
+            outputTokens: 4,
+            totalTokens: 14,
+          }],
+          inputTokens: 10,
+          outputTokens: 4,
+          totalTokens: 14,
+        },
+      },
+    ],
+    conversationTranscript: '1. 사용자: 로컬 질문',
+    document: '1. 사용자: 로컬 질문',
+    provider: {
+      kind: 'ollama-local',
+      label: 'Ollama Local',
+      requestTimeoutMs: 30000,
+      rootModel: 'llama3.2:3b',
+      rootReasoningEffort: null,
+      subModel: 'llama3.2:3b',
+      subReasoningEffort: null,
+    },
+    storedTurnCount: 1,
+  });
+});
+
+Deno.test('buildConversationContext covers the Ollama Cloud provider label', () => {
+  const cloudSettings = createProviderSettings({
+    apiKey: 'ollama-cloud-key',
+    availableModels: ['gpt-oss:20b'],
+    baseUrl: '',
+    kind: 'ollama-cloud',
+    rootModel: 'gpt-oss:20b',
+    subModel: 'gpt-oss:20b',
+  }, new Date('2026-03-31T00:00:00.000Z'));
+
+  const context = buildConversationContext([], cloudSettings) as {
+    provider: { label: string };
+  };
+
+  assert.equal(context.provider.label, 'Ollama Cloud');
+});

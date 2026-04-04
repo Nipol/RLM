@@ -16,3 +16,39 @@ Deno.test('OpenAI provider smoke scenario completes through the public provider 
     'https://api.openai.com/v1/responses',
   ]);
 });
+
+Deno.test('OpenAI provider smoke scenario fetcher rejects unexpected model ids', async () => {
+  let capturedFetcher:
+    | ((input: RequestInfo | URL, init?: RequestInit) => Promise<Response>)
+    | undefined;
+
+  await runOpenAIProviderSmokeScenario((
+    options: Parameters<typeof createOpenAIRLM>[0],
+  ) => {
+    capturedFetcher = options.fetcher;
+
+    return {
+      async run() {
+        return {
+          answer: 'stub',
+          finalValue: 'stub',
+          session: { close: async () => undefined },
+          steps: 0,
+        };
+      },
+    };
+  });
+
+  assert.ok(capturedFetcher);
+  await assert.rejects(
+    () =>
+      capturedFetcher!(
+        'https://api.openai.com/v1/responses',
+        {
+          body: JSON.stringify({ model: 'unknown-model' }),
+          method: 'POST',
+        },
+      ),
+    /Unexpected smoke provider model: unknown-model/u,
+  );
+});

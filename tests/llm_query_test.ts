@@ -165,6 +165,81 @@ Deno.test('llm_query can report parent depth and monotonically increasing query 
   );
 });
 
+Deno.test('llm_query can emit debug query traces with AoT prompt markers and durations', async () => {
+  const llm = new MockCaller([
+    {
+      outputText: '{"atomic": true, "reason": "done", "subquestions": []}',
+      usage: {
+        inputTokens: 10,
+        outputTokens: 5,
+        totalTokens: 15,
+      },
+    },
+  ]);
+  const traces: Array<Record<string, unknown>> = [];
+  const clock = (() => {
+    const times = [
+      Date.parse('2026-03-26T00:00:00.000Z'),
+      Date.parse('2026-03-26T00:00:00.025Z'),
+    ];
+    return () => new Date(times.shift() ?? Date.parse('2026-03-26T00:00:00.025Z'));
+  })();
+  const handler = createLLMQueryHandler({
+    clock,
+    llm,
+    onTrace: async (entry) => {
+      traces.push(entry as unknown as Record<string, unknown>);
+    },
+    subModel: 'gpt-5-mini',
+  });
+
+  await handler('AOT_DECOMPOSE_JSON\nCurrent question:\nExplain gravity.');
+
+  assert.equal(traces.length, 1);
+  assert.equal(traces[0]?.kind, 'llm_query');
+  assert.equal(traces[0]?.promptTag, 'AOT_DECOMPOSE_JSON');
+  assert.equal(traces[0]?.durationMs, 25);
+  assert.equal(traces[0]?.status, 'success');
+  assert.equal(traces[0]?.model, 'gpt-5-mini');
+});
+
+Deno.test('llm_query emits an error trace when the provider completion fails', async () => {
+  const traces: Array<Record<string, unknown>> = [];
+  const clock = (() => {
+    const times = [
+      Date.parse('2026-03-26T00:00:00.000Z'),
+      Date.parse('2026-03-26T00:00:00.015Z'),
+    ];
+    return () => new Date(times.shift() ?? Date.parse('2026-03-26T00:00:00.015Z'));
+  })();
+  const handler = createLLMQueryHandler({
+    clock,
+    llm: {
+      async complete() {
+        throw new Error('provider exploded');
+      },
+    },
+    onTrace: async (entry) => {
+      traces.push(entry as unknown as Record<string, unknown>);
+    },
+    subModel: 'gpt-5-mini',
+  });
+
+  await assert.rejects(
+    async () => {
+      await handler('AOT_SOLVE_STATE\nCurrent Markov state:\nExplain gravity.');
+    },
+    /provider exploded/u,
+  );
+
+  assert.equal(traces.length, 1);
+  assert.equal(traces[0]?.kind, 'llm_query');
+  assert.equal(traces[0]?.promptTag, 'AOT_SOLVE_STATE');
+  assert.equal(traces[0]?.durationMs, 15);
+  assert.equal(traces[0]?.status, 'error');
+  assert.equal(traces[0]?.model, 'gpt-5-mini');
+});
+
 Deno.test('rlm_query forwards delegated prompts into nested RLM runs with narrowed child context', async () => {
   const childLogger = new InMemoryRLMLogger();
   const calls: Array<Record<string, JsonValue | number | string | null | unknown>> = [];
@@ -274,6 +349,192 @@ Deno.test('rlm_query uses an explicit delegated task field when the narrowed pro
     task: 'Return only the vaultKey for the active primary dispatch dossier.',
     type: 'rlm_delegated_task',
   });
+});
+
+Deno.test('rlm_query keeps delegated maxSubcallDepth out of the child payload and forwards it to the nested run', async () => {
+  const calls: Array<Record<string, JsonValue | number | string | null | unknown>> = [];
+  const handler = createRLMQueryHandler({
+    currentDepth: 0,
+    maxSteps: 9,
+    maxSubcallDepth: 3,
+    outputCharLimit: 2048,
+    runNestedRLM: async (request) => {
+      calls.push({
+        context: request.context,
+        depth: request.depth,
+        maxSubcallDepth: request.maxSubcallDepth,
+        prompt: request.prompt,
+      });
+
+      return { answer: '42', steps: 2, usage: createUsageSummary(), value: 42 };
+    },
+    subModel: 'gpt-5-nano',
+  });
+
+  const answer = await handler({
+    maxSubcallDepth: 1,
+    payload: { candidate: 41 },
+    task: 'Return only the resolved number.',
+  });
+
+  assertRLMQueryResultEnvelope(answer, 42);
+  assert.deepEqual(calls, [{
+    context: {
+      payload: { candidate: 41 },
+      task: 'Return only the resolved number.',
+      type: 'rlm_delegated_task',
+    },
+    depth: 1,
+    maxSubcallDepth: 1,
+    prompt: 'Return only the resolved number.',
+  }]);
+});
+
+Deno.test('rlm_query keeps delegated maxSteps out of the child payload and forwards it to the nested run', async () => {
+  const calls: Array<Record<string, JsonValue | number | string | null | unknown>> = [];
+  const handler = createRLMQueryHandler({
+    currentDepth: 0,
+    maxSteps: 9,
+    maxSubcallDepth: 3,
+    outputCharLimit: 2048,
+    runNestedRLM: async (request) => {
+      calls.push({
+        context: request.context,
+        depth: request.depth,
+        maxSteps: request.maxSteps,
+        maxSubcallDepth: request.maxSubcallDepth,
+        prompt: request.prompt,
+      });
+
+      return { answer: '42', steps: 2, usage: createUsageSummary(), value: 42 };
+    },
+    subModel: 'gpt-5-nano',
+  });
+
+  const answer = await handler({
+    maxSteps: 6,
+    payload: { candidate: 41 },
+    task: 'Return only the resolved number.',
+  });
+
+  assertRLMQueryResultEnvelope(answer, 42);
+  assert.deepEqual(calls, [{
+    context: {
+      payload: { candidate: 41 },
+      task: 'Return only the resolved number.',
+      type: 'rlm_delegated_task',
+    },
+    depth: 1,
+    maxSteps: 6,
+    maxSubcallDepth: 3,
+    prompt: 'Return only the resolved number.',
+  }]);
+});
+
+Deno.test('rlm_query caps delegated maxSubcallDepth against the bridge maximum', async () => {
+  const seenMaxDepths: number[] = [];
+  const handler = createRLMQueryHandler({
+    currentDepth: 0,
+    maxSteps: 9,
+    maxSubcallDepth: 3,
+    outputCharLimit: 2048,
+    runNestedRLM: async (request) => {
+      seenMaxDepths.push(request.maxSubcallDepth);
+      return { answer: 'ok', steps: 1, usage: createUsageSummary(), value: 'ok' };
+    },
+    subModel: 'gpt-5-nano',
+  });
+
+  const answer = await handler({
+    maxSubcallDepth: 99,
+    task: 'Return the same answer.',
+  });
+
+  assertRLMQueryResultEnvelope(answer, 'ok');
+  assert.deepEqual(seenMaxDepths, [3]);
+});
+
+Deno.test('rlm_query respects invocation maxSubcallDepth when the prompt does not override it', async () => {
+  const seenMaxDepths: number[] = [];
+  const handler = createRLMQueryHandler({
+    currentDepth: 0,
+    maxSteps: 9,
+    maxSubcallDepth: 3,
+    outputCharLimit: 2048,
+    runNestedRLM: async (request) => {
+      seenMaxDepths.push(request.maxSubcallDepth);
+      return { answer: 'ok', steps: 1, usage: createUsageSummary(), value: 'ok' };
+    },
+    subModel: 'gpt-5-nano',
+  });
+
+  const answer = await handler('Return the same answer.', { maxSubcallDepth: 1 });
+
+  assertRLMQueryResultEnvelope(answer, 'ok');
+  assert.deepEqual(seenMaxDepths, [1]);
+});
+
+Deno.test('rlm_query respects invocation maxSteps when the prompt does not override it', async () => {
+  const seenMaxSteps: number[] = [];
+  const handler = createRLMQueryHandler({
+    currentDepth: 0,
+    maxSteps: 9,
+    maxSubcallDepth: 3,
+    outputCharLimit: 2048,
+    runNestedRLM: async (request) => {
+      seenMaxSteps.push(request.maxSteps);
+      return { answer: 'ok', steps: 1, usage: createUsageSummary(), value: 'ok' };
+    },
+    subModel: 'gpt-5-nano',
+  });
+
+  const answer = await handler('Return the same answer.', { maxSteps: Number.POSITIVE_INFINITY });
+
+  assertRLMQueryResultEnvelope(answer, 'ok');
+  assert.deepEqual(seenMaxSteps, [Number.POSITIVE_INFINITY]);
+});
+
+Deno.test('rlm_query can emit debug query traces with AoT prompt markers, durations, and serializable step budgets', async () => {
+  const traces: Array<Record<string, unknown>> = [];
+  const clock = (() => {
+    const times = [
+      Date.parse('2026-03-26T00:00:00.000Z'),
+      Date.parse('2026-03-26T00:00:00.040Z'),
+    ];
+    return () => new Date(times.shift() ?? Date.parse('2026-03-26T00:00:00.040Z'));
+  })();
+  const handler = createRLMQueryHandler({
+    clock,
+    currentDepth: 0,
+    maxSteps: 9,
+    maxSubcallDepth: 3,
+    onTrace: async (entry) => {
+      traces.push(entry as unknown as Record<string, unknown>);
+    },
+    outputCharLimit: 2048,
+    runNestedRLM: async () => ({
+      answer: 'ok',
+      steps: 2,
+      usage: createUsageSummary(),
+      value: 'ok',
+    }),
+    subModel: 'gpt-5-nano',
+  });
+
+  await handler({
+    maxSteps: Number.POSITIVE_INFINITY,
+    maxSubcallDepth: 1,
+    task: 'AOT_SOLVE_STATE\nCurrent Markov state:\nExplain gravity.',
+  });
+
+  assert.equal(traces.length, 1);
+  assert.equal(traces[0]?.kind, 'rlm_query');
+  assert.equal(traces[0]?.promptTag, 'AOT_SOLVE_STATE');
+  assert.equal(traces[0]?.durationMs, 40);
+  assert.equal(traces[0]?.maxSteps, 'unbounded');
+  assert.equal(traces[0]?.maxSubcallDepth, 1);
+  assert.equal(traces[0]?.steps, 2);
+  assert.equal(traces[0]?.status, 'success');
 });
 
 Deno.test('rlm_query flattens extra top-level delegated keys into the child payload', async () => {
@@ -762,6 +1023,46 @@ Deno.test('rlm_query stops recursive expansion before it crosses the configured 
 
   await assert.rejects(
     async () => await handler('too deep'),
+    RLMSubqueryDepthError,
+  );
+});
+
+Deno.test('rlm_query respects a lower delegated maxSubcallDepth than the bridge maximum', async () => {
+  const handler = createRLMQueryHandler({
+    currentDepth: 1,
+    maxSteps: 9,
+    maxSubcallDepth: 3,
+    outputCharLimit: 2048,
+    runNestedRLM: async () => {
+      throw new Error('should not run');
+    },
+    subModel: 'gpt-5-nano',
+  });
+
+  await assert.rejects(
+    async () =>
+      await handler({
+        maxSubcallDepth: 1,
+        task: 'too deep for the delegated cap',
+      }),
+    RLMSubqueryDepthError,
+  );
+});
+
+Deno.test('rlm_query respects a lower invocation maxSubcallDepth than the bridge maximum', async () => {
+  const handler = createRLMQueryHandler({
+    currentDepth: 1,
+    maxSteps: 9,
+    maxSubcallDepth: 3,
+    outputCharLimit: 2048,
+    runNestedRLM: async () => {
+      throw new Error('should not run');
+    },
+    subModel: 'gpt-5-nano',
+  });
+
+  await assert.rejects(
+    async () => await handler('too deep for the invocation cap', { maxSubcallDepth: 1 }),
     RLMSubqueryDepthError,
   );
 });

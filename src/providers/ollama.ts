@@ -10,11 +10,12 @@
  */
 import type { RLMClient, RLMDefaults, RLMRunInput } from '../library_entrypoint.ts';
 import { resolveRLMLogger } from '../logger.ts';
+import type { RLMPlugin } from '../plugin.ts';
 import { OllamaGenerateProvider } from './ollama_adapter.ts';
 import type { OllamaProviderConfig } from './ollama_adapter.ts';
 import { createRLM } from '../rlm_runner.ts';
 import type { RLMRunResult } from '../rlm_runner.ts';
-import type { ExecutionBackend, RLMLogger } from '../types.ts';
+import type { ExecutionBackend, RLMLogger, RLMRuntimeHelper } from '../types.ts';
 
 const DEFAULT_CELL_TIMEOUT_MS = 5_000;
 
@@ -29,6 +30,9 @@ export interface OllamaRLMClientOptions {
   idGenerator?: () => string;
   logger?: RLMLogger;
   ollama: OllamaProviderConfig;
+  plugins?: RLMPlugin[];
+  runtimeHelpers?: RLMRuntimeHelper[];
+  runtimeHelperPromptBlocks?: string[];
   systemPromptExtension?: string;
 }
 
@@ -90,6 +94,9 @@ export function createOllamaRLM(options: OllamaRLMClientOptions): RLMClient {
       root: options.ollama.rootModel,
       sub: options.ollama.subModel,
     },
+    plugins: options.plugins,
+    runtimeHelpers: options.runtimeHelpers,
+    runtimeHelperPromptBlocks: options.runtimeHelperPromptBlocks,
     systemPromptExtension: options.systemPromptExtension,
   });
 
@@ -125,6 +132,9 @@ export async function runOllamaRLM(options: RunOllamaRLMOptions): Promise<RLMRun
     idGenerator: options.idGenerator,
     logger: resolveOllamaRunLogger(options.logger, options.journalPath),
     ollama: options.ollama,
+    plugins: options.plugins,
+    runtimeHelpers: options.runtimeHelpers,
+    runtimeHelperPromptBlocks: options.runtimeHelperPromptBlocks,
   });
 
   return await client.run({
@@ -133,7 +143,11 @@ export async function runOllamaRLM(options: RunOllamaRLMOptions): Promise<RLMRun
     maxSteps: options.maxSteps,
     maxSubcallDepth: options.maxSubcallDepth,
     outputCharLimit: options.outputCharLimit,
+    plugins: options.plugins,
     prompt: options.prompt,
+    queryTrace: options.queryTrace,
+    runtimeHelpers: options.runtimeHelpers,
+    runtimeHelperPromptBlocks: options.runtimeHelperPromptBlocks,
     systemPromptExtension: options.systemPromptExtension,
   });
 }

@@ -19,6 +19,7 @@ import { createDefaultExecutionBackend } from './execution_backend.ts';
 import { createSubqueryLogger, getLoggerJournalPath, resolveRLMLogger } from './logger.ts';
 import { createLLMQueryHandler, createRLMQueryHandler } from './llm_query.ts';
 import type { LLMAdapter, LLMCaller, LLMCallerResponse } from './llm_adapter.ts';
+import { resolveRuntimeHelperPromptBlocks, resolveRuntimeHelpers } from './plugin.ts';
 import { buildRLMSystemPrompt, buildRLMTurnInput } from './rlm_prompt.ts';
 import { extractFinalSignal, extractReplCodeBlocks } from './repl_protocol.ts';
 import type { FinalSignal, ReplCodeBlock } from './repl_protocol.ts';
@@ -34,6 +35,7 @@ import type {
   EvaluatorFeedbackEntry,
   ExecutionBackend,
   JsonValue,
+  QueryTraceEntry,
   RLMLogger,
   RLMUsageSummary,
   SubqueryEntry,
@@ -400,12 +402,7 @@ function extractTargetCandidatesFromEvidence(targetLabel: string, evidence: stri
   );
   const values = new Map<string, string>();
   for (const match of evidence.matchAll(pattern)) {
-    const raw = match[1];
-    if (raw === undefined) {
-      continue;
-    }
-
-    const normalized = normalizeCandidateValue(raw);
+    const normalized = normalizeCandidateValue(match[1]!);
     if (normalized.length === 0) {
       continue;
     }
@@ -510,9 +507,9 @@ function readEmbeddedDocumentOptions(context: JsonValue | null): Record<string, 
 
   const options = new Map<string, string>();
   for (const match of matches) {
-    const label = match[1]?.trim();
-    const text = match[2]?.replace(/[,\s]+$/gu, '').trim();
-    if (label === undefined || text === undefined || label.length !== 1 || text.length === 0) {
+    const label = match[1]!.trim();
+    const text = match[2]!.replace(/[,\s]+$/gu, '').trim();
+    if (text.length === 0) {
       continue;
     }
 
@@ -1071,8 +1068,21 @@ export function createRLM(options: RLMClientOptions): RLMClient {
         maxSteps: resolveRunLimit(input.maxSteps, defaults.maxSteps!),
         maxSubcallDepth: resolveRunLimit(input.maxSubcallDepth, defaults.maxSubcallDepth!),
         outputCharLimit: resolveRunLimit(input.outputCharLimit, defaults.outputCharLimit!),
+        plugins: [
+          ...(options.plugins ?? []),
+          ...(input.plugins ?? []),
+        ],
         prompt: input.prompt,
+        queryTrace: input.queryTrace,
         rootModel: options.models.root,
+        runtimeHelpers: [
+          ...(options.runtimeHelpers ?? []),
+          ...(input.runtimeHelpers ?? []),
+        ],
+        runtimeHelperPromptBlocks: [
+          ...(options.runtimeHelperPromptBlocks ?? []),
+          ...(input.runtimeHelperPromptBlocks ?? []),
+        ],
         subModel: options.models.sub,
         systemPromptExtension: input.systemPromptExtension ?? options.systemPromptExtension,
         systemPromptMarkdown: input.systemPromptMarkdown ?? options.systemPromptMarkdown,
@@ -1130,227 +1140,206 @@ async function runRLMInternal(options: InternalRLMRunOptions): Promise<RLMRunRes
   const clock = options.clock ?? (() => new Date());
   const transcript: Parameters<typeof buildRLMTurnInput>[0]['transcript'] = [];
   const role = resolveControllerRole(options.depth);
+  const runtimeHelpers = resolveRuntimeHelpers({
+    plugins: options.plugins,
+    runtimeHelpers: options.runtimeHelpers,
+  });
+  const runtimeHelperPromptBlocks = resolveRuntimeHelperPromptBlocks({
+    plugins: options.plugins,
+    resolvedRuntimeHelpers: runtimeHelpers,
+    runtimeHelperPromptBlocks: options.runtimeHelperPromptBlocks,
+  });
   const baseSystemPrompt = await buildRLMSystemPrompt({
     markdown: options.systemPromptMarkdown,
     maxSteps: options.maxSteps,
     role,
+    runtimeHelperPromptBlocks,
   });
   const systemPrompt = options.systemPromptExtension === undefined ||
       options.systemPromptExtension.trim().length === 0
     ? baseSystemPrompt
     : `${baseSystemPrompt}\n\n${options.systemPromptExtension.trim()}`;
   const usageSummary = createUsageSummary();
+  let session: ReplSession | null = null;
+  let completed = false;
+  const appendQueryTraceEntry = async (entry: QueryTraceEntry) => {
+    if (options.queryTrace !== true) {
+      return;
+    }
 
-  const session = await ReplSession.open({
-    clock,
-    context: options.context,
-    defaultTimeoutMs: options.cellTimeoutMs,
-    executionBackend: options.executionBackend,
-    idGenerator: options.idGenerator,
-    logger: options.logger,
-    llmQueryHandler: createLLMQueryHandler({
-      currentDepth: options.depth,
-      llm,
-      onComplete: ({ usage }) => {
-        recordUsage(usageSummary, options.subModel, usage);
-      },
-      subModel: options.subModel,
-    }),
-    rlmQueryHandler: createRLMQueryHandler({
-      createChildLogger: (depth, queryIndex) =>
-        createSubqueryLogger(options.logger, depth, queryIndex),
-      currentDepth: options.depth,
-      maxSteps: options.maxSteps,
-      maxSubcallDepth: options.maxSubcallDepth,
-      outputCharLimit: options.outputCharLimit,
-      runNestedRLM: async (request) => {
-        const nested = await runRLMInternal({
-          ...options,
-          context: request.context,
-          depth: request.depth,
-          logger: request.logger,
-          prompt: request.prompt,
-          rootModel: request.rootModel,
-          signal: request.signal,
-          subModel: request.subModel,
-        });
-        try {
-          mergeUsageSummaries(usageSummary, nested.usage);
-          const nestedStdout = readLatestAcceptedFinalStdout(nested.session.history);
+    await options.logger.append(entry);
+  };
 
-          await appendSubqueryEntry(options.logger, {
-            answer: resolveSubqueryAnswerValue(nested),
-            createdAt: clock().toISOString(),
-            depth: request.depth,
-            journalPath: getLoggerJournalPath(request.logger),
-            model: request.rootModel,
-            prompt: request.prompt,
-            steps: nested.steps,
-            type: 'subquery',
-          });
-
-          return {
-            answer: nested.answer,
-            steps: nested.steps,
-            stdout: nestedStdout,
-            usage: nested.usage,
-            value: nested.finalValue,
-          };
-        } finally {
-          await nested.session.close();
-        }
-      },
-      subModel: options.subModel,
-    }),
-  });
-  let turnState: unknown = undefined;
-
-  for (let index = 0; index < options.maxSteps; index += 1) {
-    throwIfAborted(options.signal);
-    const step = index + 1;
-    const baseInput = buildRLMTurnInput({
+  try {
+    session = await ReplSession.open({
+      clock,
       context: options.context,
-      currentStep: step,
-      outputCharLimit: options.outputCharLimit,
-      prompt: options.prompt,
-      role,
-      totalSteps: options.maxSteps,
-      transcript,
+      defaultTimeoutMs: options.cellTimeoutMs,
+      executionBackend: options.executionBackend,
+      idGenerator: options.idGenerator,
+      logger: options.logger,
+      llmQueryHandler: createLLMQueryHandler({
+        clock,
+        currentDepth: options.depth,
+        llm,
+        onComplete: ({ usage }) => {
+          recordUsage(usageSummary, options.subModel, usage);
+        },
+        onTrace: appendQueryTraceEntry,
+        subModel: options.subModel,
+      }),
+      rlmQueryHandler: createRLMQueryHandler({
+        clock,
+        createChildLogger: (depth, queryIndex) =>
+          createSubqueryLogger(options.logger, depth, queryIndex),
+        currentDepth: options.depth,
+        maxSteps: options.maxSteps,
+        maxSubcallDepth: options.maxSubcallDepth,
+        onTrace: appendQueryTraceEntry,
+        outputCharLimit: options.outputCharLimit,
+        runNestedRLM: async (request) => {
+          const nested = await runRLMInternal({
+            ...options,
+            context: request.context,
+            depth: request.depth,
+            logger: request.logger,
+            maxSteps: request.maxSteps,
+            maxSubcallDepth: request.maxSubcallDepth,
+            outputCharLimit: request.outputCharLimit,
+            prompt: request.prompt,
+            rootModel: request.rootModel,
+            signal: request.signal,
+            subModel: request.subModel,
+          });
+          try {
+            mergeUsageSummaries(usageSummary, nested.usage);
+            const nestedStdout = readLatestAcceptedFinalStdout(nested.session.history);
+
+            await appendSubqueryEntry(options.logger, {
+              answer: resolveSubqueryAnswerValue(nested),
+              createdAt: clock().toISOString(),
+              depth: request.depth,
+              journalPath: getLoggerJournalPath(request.logger),
+              model: request.rootModel,
+              prompt: request.prompt,
+              steps: nested.steps,
+              type: 'subquery',
+            });
+
+            return {
+              answer: nested.answer,
+              steps: nested.steps,
+              stdout: nestedStdout,
+              usage: nested.usage,
+              value: nested.finalValue,
+            };
+          } finally {
+            await nested.session.close();
+          }
+        },
+        subModel: options.subModel,
+      }),
+      runtimeHelpers,
     });
-    let completion: LLMCallerResponse | null = null;
-    let codeBlocks: ReplCodeBlock[] = [];
-    let finalSignal: FinalSignal | null = null;
-    let appendedTranscriptTurn = false;
+    let turnState: unknown = undefined;
 
-    completion = await llm.complete({
-      input: baseInput,
-      kind: role === 'root' ? 'root_turn' : 'child_turn',
-      metadata: {
-        depth: options.depth,
-        step,
-      },
-      model: options.rootModel,
-      signal: options.signal,
-      systemPrompt,
-      turnState,
-    });
-    throwIfAborted(options.signal);
-    recordUsage(usageSummary, options.rootModel, completion.usage);
-    turnState = completion.turnState;
-
-    await appendAssistantTurnEntry(options.logger, {
-      assistantText: completion.outputText,
-      createdAt: clock().toISOString(),
-      model: options.rootModel,
-      step,
-      type: 'assistant_turn',
-    });
-
-    codeBlocks = extractReplCodeBlocks(completion.outputText);
-    if (codeBlocks.length === 0) {
-      finalSignal = extractFinalSignal(completion.outputText);
-      if (finalSignal !== null && shouldAcceptExplicitFinalSignalValue(finalSignal.value)) {
-        return {
-          answer: finalSignal.value,
-          finalValue: finalSignal.value,
-          session,
-          steps: step,
-          usage: cloneUsageSummary(usageSummary),
-        };
-      }
-    }
-
-    if (completion === null || codeBlocks.length === 0) {
-      throw new RLMProtocolError(
-        'Assistant turn did not contain a ```repl``` block or an explicit FINAL signal.',
-      );
-    }
-
-    const executions = [];
-    for (const block of codeBlocks) {
+    for (let index = 0; index < options.maxSteps; index += 1) {
       throwIfAborted(options.signal);
-      const execution = await session.execute(block.code);
-      executions.push({
-        code: block.code,
-        finalAnswer: execution.finalAnswer,
-        resultPreview: execution.result.preview,
-        resultSignals: execution.result.signals,
-        status: execution.status,
-        stderr: execution.stderr,
-        stdout: execution.stdout,
+      const step = index + 1;
+      const baseInput = buildRLMTurnInput({
+        context: options.context,
+        currentStep: step,
+        outputCharLimit: options.outputCharLimit,
+        prompt: options.prompt,
+        role,
+        totalSteps: options.maxSteps,
+        transcript,
+      });
+      let completion: LLMCallerResponse | null = null;
+      let codeBlocks: ReplCodeBlock[] = [];
+      let finalSignal: FinalSignal | null = null;
+
+      completion = await llm.complete({
+        input: baseInput,
+        kind: role === 'root' ? 'root_turn' : 'child_turn',
+        metadata: {
+          depth: options.depth,
+          step,
+        },
+        model: options.rootModel,
+        signal: options.signal,
+        systemPrompt,
+        turnState,
+      });
+      throwIfAborted(options.signal);
+      recordUsage(usageSummary, options.rootModel, completion.usage);
+      turnState = completion.turnState;
+
+      await appendAssistantTurnEntry(options.logger, {
+        assistantText: completion.outputText,
+        createdAt: clock().toISOString(),
+        model: options.rootModel,
+        step,
+        type: 'assistant_turn',
       });
 
-      if (execution.finalAnswer !== null) {
-        if (
-          !shouldAcceptExecutionFinalAnswer(
-            execution.status,
-            execution.finalAnswer,
-            execution.finalResult,
-          )
-        ) {
-          continue;
+      codeBlocks = extractReplCodeBlocks(completion.outputText);
+      if (codeBlocks.length === 0) {
+        finalSignal = extractFinalSignal(completion.outputText);
+        if (finalSignal !== null && shouldAcceptExplicitFinalSignalValue(finalSignal.value)) {
+          completed = true;
+          return {
+            answer: finalSignal.value,
+            finalValue: finalSignal.value,
+            session,
+            steps: step,
+            usage: cloneUsageSummary(usageSummary),
+          };
         }
+      }
 
-        const weakFinalization = summarizeWeakFinalization({
-          context: options.context,
-          execution: {
-            code: block.code,
-            finalAnswer: execution.finalAnswer,
-            resultPreview: execution.result.preview,
-            resultSignals: execution.result.signals,
-            stdout: execution.stdout,
-          },
-          prompt: options.prompt,
-          role,
-          transcript,
+      if (completion === null || codeBlocks.length === 0) {
+        throw new RLMProtocolError(
+          'Assistant turn did not contain a ```repl``` block or an explicit FINAL signal.',
+        );
+      }
+
+      const executions = [];
+      for (const block of codeBlocks) {
+        throwIfAborted(options.signal);
+        const execution = await session.execute(block.code);
+        executions.push({
+          code: block.code,
+          finalAnswer: execution.finalAnswer,
+          resultPreview: execution.result.preview,
+          resultSignals: execution.result.signals,
+          status: execution.status,
+          stderr: execution.stderr,
+          stdout: execution.stdout,
         });
 
-        if (weakFinalization !== null) {
-          const evaluatorFeedback = await generateEvaluatorFeedback({
-            assistantText: completion.outputText,
-            depth: options.depth,
-            evaluator: options.evaluator,
-            executions,
-            llm,
-            onComplete: (response, model) => {
-              recordUsage(usageSummary, model, response.usage);
-            },
-            prompt: options.prompt,
-            signal: options.signal,
-            step,
-            totalSteps: options.maxSteps,
-          });
-          if (evaluatorFeedback !== undefined && shouldRunEvaluator(options.evaluator)) {
-            await appendEvaluatorFeedbackEntry(options.logger, {
-              createdAt: clock().toISOString(),
-              feedback: evaluatorFeedback,
-              model: options.evaluator.model,
-              step,
-              type: 'evaluator_feedback',
-            });
+        if (execution.finalAnswer !== null) {
+          if (
+            !shouldAcceptExecutionFinalAnswer(
+              execution.status,
+              execution.finalAnswer,
+              execution.finalResult,
+            )
+          ) {
+            continue;
           }
 
-          transcript.push({
-            assistantText: completion.outputText,
-            evaluatorFeedback,
-            executions,
-            step,
-          });
-          appendedTranscriptTurn = true;
-          break;
+          completed = true;
+          return {
+            answer: execution.finalAnswer,
+            finalValue: extractFinalJsonValue(execution.finalResult),
+            session,
+            steps: step,
+            usage: cloneUsageSummary(usageSummary),
+          };
         }
-
-        return {
-          answer: execution.finalAnswer,
-          finalValue: extractFinalJsonValue(execution.finalResult),
-          session,
-          steps: step,
-          usage: cloneUsageSummary(usageSummary),
-        };
       }
-    }
 
-    if (!appendedTranscriptTurn) {
       const evaluatorFeedback = await generateEvaluatorFeedback({
         assistantText: completion.outputText,
         depth: options.depth,
@@ -1382,9 +1371,17 @@ async function runRLMInternal(options: InternalRLMRunOptions): Promise<RLMRunRes
         step,
       });
     }
-  }
 
-  throw new RLMMaxStepsError(options.maxSteps);
+    throw new RLMMaxStepsError(options.maxSteps);
+  } finally {
+    if (!completed && session !== null) {
+      try {
+        await session.close();
+      } catch {
+        // Preserve the original run failure and avoid surfacing cleanup noise.
+      }
+    }
+  }
 }
 
 /**
@@ -1392,10 +1389,14 @@ async function runRLMInternal(options: InternalRLMRunOptions): Promise<RLMRunRes
  */
 export const __rlmRunnerTestables = {
   buildEvaluatorInput,
+  clipEvaluatorFeedback,
   collectRequestedEntityLabels,
   extractFinalJsonValue,
   extractTargetCandidatesFromEvidence,
+  finalAnswerRepeatsTargetLabel,
+  generateEvaluatorFeedback,
   hasSelectedOptionEvidence,
+  isScalarLikeTask,
   isLikelyMultipleChoiceAnswer,
   isLikelyMultipleChoiceTask,
   matchOptionFromEvidence,
@@ -1403,6 +1404,7 @@ export const __rlmRunnerTestables = {
   readLatestAcceptedFinalStdout,
   readAvailableOptions,
   readContextOptions,
+  readQuestionLikeText,
   resolveControllerRole,
   resolveRLMCaller,
   resolveRunLimit,

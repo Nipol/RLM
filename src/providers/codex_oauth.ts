@@ -551,6 +551,7 @@ function resolveClock(clock: CodexOAuthProviderOptions['clock']): () => Date {
 
 function resolveReadTextFile(
   readTextFile: CodexOAuthProviderOptions['readTextFile'],
+  importBuiltin: typeof importNodeBuiltin = importNodeBuiltin,
 ): NonNullable<CodexOAuthProviderOptions['readTextFile']> {
   const defaultReadTextFile = (globalThis as typeof globalThis & {
     Deno?: {
@@ -567,13 +568,14 @@ function resolveReadTextFile(
   }
 
   return async (path) => {
-    const fs = await importNodeBuiltin<NodeFsPromisesLike>('fs/promises');
+    const fs = await importBuiltin<NodeFsPromisesLike>('fs/promises');
     return await fs.readFile(path, 'utf8');
   };
 }
 
 function resolveWriteTextFile(
   writeTextFile: CodexOAuthProviderOptions['writeTextFile'],
+  importBuiltin: typeof importNodeBuiltin = importNodeBuiltin,
 ): NonNullable<CodexOAuthProviderOptions['writeTextFile']> {
   const defaultWriteTextFile = (globalThis as typeof globalThis & {
     Deno?: {
@@ -590,13 +592,14 @@ function resolveWriteTextFile(
   }
 
   return async (path, data) => {
-    const fs = await importNodeBuiltin<NodeFsPromisesLike>('fs/promises');
+    const fs = await importBuiltin<NodeFsPromisesLike>('fs/promises');
     await fs.writeFile(path, data, 'utf8');
   };
 }
 
 function resolveMkdir(
   mkdir: CodexOAuthProviderOptions['mkdir'],
+  importBuiltin: typeof importNodeBuiltin = importNodeBuiltin,
 ): NonNullable<CodexOAuthProviderOptions['mkdir']> {
   const defaultMkdir = (globalThis as typeof globalThis & {
     Deno?: {
@@ -613,7 +616,7 @@ function resolveMkdir(
   }
 
   return async (path, options?: DirectoryCreateOptions) => {
-    const fs = await importNodeBuiltin<NodeFsPromisesLike>('fs/promises');
+    const fs = await importBuiltin<NodeFsPromisesLike>('fs/promises');
     await fs.mkdir(path, options);
   };
 }
@@ -1006,8 +1009,17 @@ export function extractAuthorizationCodeFromCallbackUrl(
 
 async function defaultReceiveAuthorizationCode(
   session: CodexOAuthAuthorizationSession,
-): Promise<CodexOAuthAuthorizationCodeResult> {
-  const denoServe = (globalThis as typeof globalThis & {
+  importBuiltin: typeof importNodeBuiltin = importNodeBuiltin,
+  denoServeOverride: false | ((
+    options: {
+      hostname: string;
+      port: number;
+      signal: AbortSignal;
+    },
+    handler: (request: Request) => Response | Promise<Response>,
+  ) => {
+    finished: Promise<void>;
+  }) | undefined = (globalThis as typeof globalThis & {
     Deno?: {
       serve?: (
         options: {
@@ -1020,7 +1032,9 @@ async function defaultReceiveAuthorizationCode(
         finished: Promise<void>;
       };
     };
-  }).Deno?.serve;
+  }).Deno?.serve,
+): Promise<CodexOAuthAuthorizationCodeResult> {
+  const denoServe = denoServeOverride === false ? undefined : denoServeOverride;
 
   if (typeof denoServe === 'function') {
     const controller = new AbortController();
@@ -1069,7 +1083,7 @@ async function defaultReceiveAuthorizationCode(
     resolveResult = resolve;
     rejectResult = reject;
   });
-  const nodeHttp = await importNodeBuiltin<NodeHttpModuleLike>('http');
+  const nodeHttp = await importBuiltin<NodeHttpModuleLike>('http');
   const sockets = new Set<{
     destroy(): void;
     once(event: 'close', listener: () => void): void;
@@ -1627,8 +1641,11 @@ export const __codexOAuthProviderTestables = {
   formatInvalidModelListPayloadMessage,
   parseCodexResponseBody,
   parseServerSentEventPayload,
+  resolveMkdir,
   resolveCodexModelId,
+  resolveReadTextFile,
   resolveStoragePath,
+  resolveWriteTextFile,
   serializeRawResponsePayload,
   tryParseJson,
 };

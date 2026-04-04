@@ -211,10 +211,6 @@ export function createProviderSettings(
     throw new Error('사용 가능한 모델을 먼저 불러오세요.');
   }
 
-  if (rootModel.length === 0 || subModel.length === 0) {
-    throw new Error('root와 sub 모델을 모두 선택하세요.');
-  }
-
   return {
     apiKey: draft.apiKey.trim(),
     availableModels,

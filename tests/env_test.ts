@@ -3,11 +3,38 @@ import assert from 'node:assert/strict';
 import {
   loadDotEnvFile,
   loadOpenAIProviderConfig,
+  loadPreferredStandaloneModelConfig,
   loadProviderRequestTimeoutMs,
   loadRLMConfig,
   loadRLMRuntimeConfig,
   parseDotEnv,
-} from '../src/standalone/env.ts';
+} from '../examples/standalone/env.ts';
+
+async function withTemporaryDenoReadTextFileSync<Result>(
+  readTextFileSync: ((path: string) => string) | undefined,
+  run: () => Result | Promise<Result>,
+): Promise<Result> {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'Deno');
+  const currentDeno = (globalThis as typeof globalThis & {
+    Deno?: typeof Deno;
+  }).Deno;
+  Object.defineProperty(globalThis, 'Deno', {
+    configurable: true,
+    enumerable: descriptor?.enumerable ?? true,
+    value: currentDeno === undefined ? undefined : { ...currentDeno, readTextFileSync },
+    writable: false,
+  });
+
+  try {
+    return await run();
+  } finally {
+    if (descriptor === undefined) {
+      delete (globalThis as Record<PropertyKey, unknown>).Deno;
+    } else {
+      Object.defineProperty(globalThis, 'Deno', descriptor);
+    }
+  }
+}
 
 function createMissingEnvFileOptions() {
   return {
@@ -91,6 +118,12 @@ Deno.test('dotenv file loader treats a missing file as an empty local override',
   assert.deepEqual(parsed, {});
 });
 
+Deno.test('dotenv file loader returns an empty object when the runtime does not expose readTextFileSync', async () => {
+  await withTemporaryDenoReadTextFileSync(undefined, () => {
+    assert.deepEqual(loadDotEnvFile({ path: '.env' }), {});
+  });
+});
+
 Deno.test('dotenv file loader rethrows unexpected filesystem failures', () => {
   assert.throws(
     () =>
@@ -158,6 +191,43 @@ RLM_OPENAI_SUB_MODEL=gpt-5-nano
 
   assert.equal(config.rootModel, 'gpt-5-mini');
   assert.equal(config.subModel, 'gpt-5.2');
+});
+
+Deno.test('standalone preferred model loader can read optional model ids without requiring provider credentials', () => {
+  const models = loadPreferredStandaloneModelConfig({
+    path: '.env',
+    readTextFileSync() {
+      return `
+RLM_OPENAI_ROOT_MODEL=gpt-5-4-t-mini
+RLM_OPENAI_SUB_MODEL=gpt-5-3-instant
+`;
+    },
+  });
+
+  assert.deepEqual(models, {
+    rootModel: 'gpt-5-4-t-mini',
+    subModel: 'gpt-5-3-instant',
+  });
+});
+
+Deno.test('standalone preferred model loader lets explicit overrides win over .env defaults', () => {
+  const models = loadPreferredStandaloneModelConfig({
+    env: {
+      RLM_OPENAI_SUB_MODEL: 'gpt-5-mini',
+    },
+    path: '.env',
+    readTextFileSync() {
+      return `
+RLM_OPENAI_ROOT_MODEL=gpt-5-4-t-mini
+RLM_OPENAI_SUB_MODEL=gpt-5-3-instant
+`;
+    },
+  });
+
+  assert.deepEqual(models, {
+    rootModel: 'gpt-5-4-t-mini',
+    subModel: 'gpt-5-mini',
+  });
 });
 
 Deno.test('provider request timeout loader can read standalone request limits without provider credentials', () => {
@@ -246,7 +316,7 @@ Deno.test('runtime-only config can load standalone limits without requiring prov
 
   assert.equal(runtime.cellTimeoutMs, 6_500);
   assert.equal(runtime.maxSteps, 10);
-  assert.equal(runtime.maxSubcallDepth, 3);
+  assert.equal(runtime.maxSubcallDepth, 1);
   assert.equal(runtime.outputCharLimit, 4_000);
 });
 

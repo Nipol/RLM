@@ -516,6 +516,242 @@ Deno.test('Codex OAuth helpers cover organization fallbacks, auth expiry, model 
   }
 });
 
+Deno.test('Codex OAuth filesystem and model-list helpers cover explicit, Deno-default, and node-fallback branches', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'rlm-codex-oauth-fs-' });
+  const nestedDir = join(root, 'nested');
+  const filePath = join(nestedDir, 'state.txt');
+  const originalMkdir = Deno.mkdir;
+  const originalReadTextFile = Deno.readTextFile;
+  const originalWriteTextFile = Deno.writeTextFile;
+
+  const customRead = async () => 'custom-read';
+  const customWrite = async () => {};
+  const customMkdir = async () => {};
+  assert.equal(__codexOAuthProviderTestables.resolveReadTextFile(customRead), customRead);
+  assert.equal(__codexOAuthProviderTestables.resolveWriteTextFile(customWrite), customWrite);
+  assert.equal(__codexOAuthProviderTestables.resolveMkdir(customMkdir), customMkdir);
+
+  const resolvedMkdir = __codexOAuthProviderTestables.resolveMkdir(undefined);
+  await resolvedMkdir(nestedDir, { recursive: true });
+
+  const resolvedWrite = __codexOAuthProviderTestables.resolveWriteTextFile(undefined);
+  await resolvedWrite(filePath, 'persisted');
+
+  const resolvedRead = __codexOAuthProviderTestables.resolveReadTextFile(undefined);
+  assert.equal(await resolvedRead(filePath), 'persisted');
+
+  try {
+    Object.defineProperty(Deno, 'readTextFile', {
+      configurable: true,
+      value: undefined,
+      writable: true,
+    });
+    Object.defineProperty(Deno, 'writeTextFile', {
+      configurable: true,
+      value: undefined,
+      writable: true,
+    });
+    Object.defineProperty(Deno, 'mkdir', {
+      configurable: true,
+      value: undefined,
+      writable: true,
+    });
+    const nodeFsCalls: string[] = [];
+    const importBuiltin = (async (specifier: string) => {
+      assert.equal(specifier, 'fs/promises');
+      return {
+        mkdir: async (path: string) => {
+          nodeFsCalls.push(`mkdir:${path}`);
+        },
+        readFile: async (path: string) => {
+          nodeFsCalls.push(`read:${path}`);
+          return 'node-read';
+        },
+        writeFile: async (path: string, data: string) => {
+          nodeFsCalls.push(`write:${path}:${data}`);
+        },
+      };
+    }) as typeof __codexOAuthProviderTestables.resolveReadTextFile extends (
+      file: unknown,
+      importer: infer T,
+    ) => unknown ? T : never;
+    const injectedMkdir = __codexOAuthProviderTestables.resolveMkdir(undefined, importBuiltin);
+    await injectedMkdir(join(root, 'injected-dir'), { recursive: true });
+    const injectedWrite = __codexOAuthProviderTestables.resolveWriteTextFile(undefined, importBuiltin);
+    await injectedWrite(join(root, 'injected.txt'), 'node-write');
+    const injectedRead = __codexOAuthProviderTestables.resolveReadTextFile(undefined, importBuiltin);
+    assert.equal(await injectedRead(join(root, 'injected.txt')), 'node-read');
+    assert.deepEqual(nodeFsCalls, [
+      `mkdir:${join(root, 'injected-dir')}`,
+      `write:${join(root, 'injected.txt')}:node-write`,
+      `read:${join(root, 'injected.txt')}`,
+    ]);
+    Object.defineProperty(Deno, 'mkdir', {
+      configurable: true,
+      value: originalMkdir,
+      writable: true,
+    });
+
+    const nodeFallbackDir = join(root, 'node-fallback');
+    const nodeFallbackFile = join(nodeFallbackDir, 'state.txt');
+    const fallbackMkdir = __codexOAuthProviderTestables.resolveMkdir(undefined);
+    await fallbackMkdir(nodeFallbackDir, { recursive: true });
+
+    const fallbackWrite = __codexOAuthProviderTestables.resolveWriteTextFile(undefined);
+    await fallbackWrite(nodeFallbackFile, 'node-persisted');
+
+    const fallbackRead = __codexOAuthProviderTestables.resolveReadTextFile(undefined);
+    assert.equal(await fallbackRead(nodeFallbackFile), 'node-persisted');
+  } finally {
+    Object.defineProperty(Deno, 'mkdir', {
+      configurable: true,
+      value: originalMkdir,
+      writable: true,
+    });
+    Object.defineProperty(Deno, 'readTextFile', {
+      configurable: true,
+      value: originalReadTextFile,
+      writable: true,
+    });
+    Object.defineProperty(Deno, 'writeTextFile', {
+      configurable: true,
+      value: originalWriteTextFile,
+      writable: true,
+    });
+  }
+
+  assert.equal(
+    __codexOAuthProviderTestables.parseModelListPayload('   '),
+    null,
+  );
+  assert.equal(
+    __codexOAuthProviderTestables.parseModelListPayload('[]'),
+    null,
+  );
+  assert.equal(
+    __codexOAuthProviderTestables.formatInvalidModelListPayloadMessage('   '),
+    'Codex OAuth model listing returned an invalid response payload.',
+  );
+  assert.match(
+    __codexOAuthProviderTestables.formatInvalidModelListPayloadMessage(' <html>bad</html> '),
+    /raw=<html>bad<\/html>/u,
+  );
+});
+
+Deno.test('Codex OAuth default authorization receiver covers the node-http callback path without Deno.serve', async () => {
+  const responseStatusCodes: number[] = [];
+  const responseBodies: string[] = [];
+  let capturedHandler:
+    | ((request: { headers: { host?: string }; url?: string }, response: {
+      end(text?: string, callback?: () => void): void;
+      writeHead(statusCode: number, headers: Record<string, string>): void;
+    }) => void)
+    | undefined;
+  let connectionListener: ((socket: { destroy(): void; once(event: 'close', listener: () => void): void }) => void)
+    | undefined;
+  let closeCalls = 0;
+  let destroyedSockets = 0;
+  const receiverPromise = __codexOAuthProviderTestables.defaultReceiveAuthorizationCode(
+    {
+      authUrl: 'https://auth.example.test/login',
+      callbackPort: 1456,
+      redirectUri: 'http://localhost:1456/auth/callback',
+      state: 'state-test',
+    },
+    (async (specifier: string) => {
+      assert.equal(specifier, 'http');
+      return {
+        createServer: (handler: typeof capturedHandler extends undefined ? never : NonNullable<typeof capturedHandler>) => {
+          capturedHandler = handler;
+          return {
+            close: () => {
+              closeCalls += 1;
+            },
+            listen: () => {},
+            on: (event: 'connection' | 'error', listener: ((socket: {
+              destroy(): void;
+              once(event: 'close', listener: () => void): void;
+            }) => void) | ((error: Error) => void)) => {
+              if (event === 'connection') {
+                connectionListener = listener as typeof connectionListener;
+              }
+            },
+          };
+        },
+      };
+    }) as typeof __codexOAuthProviderTestables.defaultReceiveAuthorizationCode extends (
+      session: unknown,
+      importer: infer T,
+      denoServe: infer _U,
+    ) => unknown ? T : never,
+    false,
+  );
+
+  await Promise.resolve();
+  assert.ok(capturedHandler !== undefined);
+
+  let closedSocketListener: (() => void) | undefined;
+  const closedSocket = {
+    destroy: () => {
+      destroyedSockets += 1;
+    },
+    once: (_event: 'close', listener: () => void) => {
+      closedSocketListener = listener;
+    },
+  };
+  connectionListener?.(closedSocket);
+  closedSocketListener?.();
+
+  const openSocket = {
+    destroy: () => {
+      destroyedSockets += 1;
+    },
+    once: (_event: 'close', _listener: () => void) => {},
+  };
+  connectionListener?.(openSocket);
+
+  capturedHandler(
+    {
+      headers: { host: '127.0.0.1:1456' },
+      url: '/auth/callback?state=state-test',
+    },
+    {
+      end: (text?: string) => {
+        responseBodies.push(text ?? '');
+      },
+      writeHead: (statusCode) => {
+        responseStatusCodes.push(statusCode);
+      },
+    },
+  );
+
+  capturedHandler(
+    {
+      headers: { host: '127.0.0.1:1456' },
+      url: '/auth/callback?code=code-test&state=state-test',
+    },
+    {
+      end: (text?: string, callback?: () => void) => {
+        responseBodies.push(text ?? '');
+        callback?.();
+      },
+      writeHead: (statusCode) => {
+        responseStatusCodes.push(statusCode);
+      },
+    },
+  );
+
+  assert.deepEqual(await receiverPromise, {
+    code: 'code-test',
+    state: 'state-test',
+  });
+
+  assert.deepEqual(responseStatusCodes, [202, 200]);
+  assert.equal(responseBodies.length, 2);
+  assert.equal(closeCalls >= 1, true);
+  assert.equal(destroyedSockets, 1);
+});
+
 Deno.test('Codex OAuth callback helpers can extract code and state from pasted callback URLs and ignore incomplete callback probes', () => {
   assert.deepEqual(
     __codexOAuthProviderTestables.extractAuthorizationCodeFromCallbackUrl(
@@ -2148,6 +2384,39 @@ Deno.test('Codex OAuth provider clears a rejected cached model-list promise and 
 
   assert.equal(completion.outputText, '```repl\nFINAL_VAR("done")\n```');
   assert.equal(modelListCalls, 3);
+});
+
+Deno.test('Codex OAuth provider retries one invalid successful model-list payload before surfacing the payload error', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'rlm-codex-oauth-model-invalid-ok-' });
+  const storagePath = join(root, '.rlm/codex-oauth.json');
+  await Deno.mkdir(join(root, '.rlm'));
+  await Deno.writeTextFile(storagePath, JSON.stringify(createStoredAuth(), null, 2));
+
+  let modelListCalls = 0;
+  const provider = new CodexOAuthProvider({
+    clock: createClock(),
+    fetcher: async (input) => {
+      const url = String(input);
+      if (url.includes('/codex/models')) {
+        modelListCalls += 1;
+        return new Response('<html>still invalid</html>', {
+          headers: { 'Content-Type': 'text/html' },
+          status: 200,
+        });
+      }
+
+      throw new Error(`Unexpected request: ${url}`);
+    },
+    storagePath,
+  });
+
+  await assert.rejects(
+    async () => {
+      await provider.listModels();
+    },
+    /invalid response payload.*raw=<html>still invalid<\/html>/u,
+  );
+  assert.equal(modelListCalls, 2);
 });
 
 Deno.test('Codex OAuth provider rejects non-catalog model aliases before calling the Codex responses endpoint', async () => {

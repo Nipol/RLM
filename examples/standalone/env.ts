@@ -8,8 +8,8 @@
  * import { loadRLMConfig } from './env.ts';
  * ```
  */
-import type { OpenAIProviderConfig, OpenAIReasoningEffort } from '../providers/openai_config.ts';
-import { isNotFoundError, type ReadTextFileSync } from '../platform.ts';
+import type { OpenAIProviderConfig, OpenAIReasoningEffort } from '../../src/providers/openai_config.ts';
+import { isNotFoundError, type ReadTextFileSync } from '../../src/platform.ts';
 
 /**
  * Describes the local `.env` file reader used by the configuration loader.
@@ -84,13 +84,18 @@ export interface LoadRLMConfigOptions extends DotEnvFileOptions {
   env?: Record<string, string | undefined>;
 }
 
+export interface PreferredStandaloneModelConfig {
+  rootModel?: string;
+  subModel?: string;
+}
+
 const DEFAULT_BASE_URL = 'https://api.openai.com/v1';
 const DEFAULT_ENV_PATH = '.env';
 const DEFAULT_MAX_OUTPUT_CHARS = 4_000;
 const DEFAULT_MAX_STEPS = 12;
 const DEFAULT_CELL_TIMEOUT_MS = 5_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
-const DEFAULT_SUBCALL_DEPTH = 3;
+const DEFAULT_SUBCALL_DEPTH = 1;
 
 /**
  * Removes an inline comment from an unquoted dotenv value.
@@ -352,6 +357,32 @@ export function loadProviderRequestTimeoutMs(
     'RLM_REQUEST_TIMEOUT_MS',
     DEFAULT_REQUEST_TIMEOUT_MS,
   );
+}
+
+/**
+ * Loads optional standalone model preferences without requiring provider credentials.
+ *
+ * This is primarily used by provider paths such as `codex-oauth` that can reuse
+ * the same repository-local model defaults when exact ids are available.
+ */
+export function loadPreferredStandaloneModelConfig(
+  options: LoadRLMConfigOptions = {},
+): PreferredStandaloneModelConfig {
+  const fileValues = loadDotEnvFile({
+    path: options.path,
+    readTextFileSync: options.readTextFileSync,
+  });
+  const values: Record<string, string | undefined> = {
+    ...fileValues,
+    ...(options.env ?? {}),
+  };
+  const rootModel = values.RLM_OPENAI_ROOT_MODEL?.trim() || undefined;
+  const subModel = values.RLM_OPENAI_SUB_MODEL?.trim() || undefined;
+
+  return {
+    rootModel,
+    subModel,
+  };
 }
 
 /**
