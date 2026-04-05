@@ -58,6 +58,7 @@ Deno.test('deno.json contains the metadata needed for JSR publishing', async () 
       include?: string[];
     };
     tasks?: {
+      'smoke:bun'?: string;
       'build:core'?: string;
       'smoke:browser'?: string;
       'smoke:build'?: string;
@@ -102,11 +103,15 @@ Deno.test('deno.json contains the metadata needed for JSR publishing', async () 
   );
   assert.equal(
     config.tasks?.['smoke:build'],
-    'deno task build:core && docker compose -f smoke/compose.yml build node-smoke browser-smoke',
+    'deno task build:core && docker compose -f smoke/compose.yml build node-smoke bun-smoke browser-smoke',
   );
   assert.equal(
     config.tasks?.['smoke:node'],
     'deno task build:core && docker compose -f smoke/compose.yml run --rm node-smoke',
+  );
+  assert.equal(
+    config.tasks?.['smoke:bun'],
+    'deno task build:core && docker compose -f smoke/compose.yml run --rm bun-smoke',
   );
   assert.equal(
     config.tasks?.['smoke:browser'],

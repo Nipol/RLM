@@ -3,6 +3,10 @@ services:
     build:
       context: ..
       dockerfile: smoke/node/Dockerfile
+  bun-smoke:
+    build:
+      context: ..
+      dockerfile: smoke/bun/Dockerfile
   browser-smoke:
     build:
       context: ..

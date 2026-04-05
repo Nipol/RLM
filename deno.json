@@ -1,6 +1,6 @@
 {
   "name": "@yoonsung/rlm",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "license": "LGPL-3.0-only",
   "exports": {
     ".": "./mod.ts",
@@ -51,8 +51,9 @@
     "test:openai:long-context": "deno task test:codex:long-context",
     "test:openai:long-context:evaluator": "deno task test:codex:long-context:evaluator",
     "build:core": "deno run --allow-read --allow-write --allow-run scripts/build_core_bundle.ts",
-    "smoke:build": "deno task build:core && docker compose -f smoke/compose.yml build node-smoke browser-smoke",
+    "smoke:build": "deno task build:core && docker compose -f smoke/compose.yml build node-smoke bun-smoke browser-smoke",
     "smoke:node": "deno task build:core && docker compose -f smoke/compose.yml run --rm node-smoke",
+    "smoke:bun": "deno task build:core && docker compose -f smoke/compose.yml run --rm bun-smoke",
     "smoke:browser": "deno task build:core && docker compose -f smoke/compose.yml run --rm browser-smoke"
   }
 }

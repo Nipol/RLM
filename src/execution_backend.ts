@@ -10,6 +10,11 @@
  */
 import type { ExecutionBackend, PersistentRuntimeLike } from './types.ts';
 import { importNodeBuiltin } from './platform.ts';
+import {
+  buildDataWorkerSourceUrl,
+  buildPreferredWorkerSourceHandle,
+  type WorkerSourceScope,
+} from './worker_source.ts';
 import { PersistentSandboxRuntime } from './worker_runtime.ts';
 
 interface WorkerConstructorLike {
@@ -42,7 +47,16 @@ interface WorkerExecutionBackendOptions {
   globalWorker?: WorkerConstructorLike;
   importWorkerThreads?: () => Promise<NodeWorkerThreadsModule>;
   useDenoPermissions?: boolean;
+  workerSourceScope?: WorkerSourceScope;
 }
+
+type WorkerBridgeLike = {
+  onerror: ((event: ErrorEvent) => void) | null;
+  onmessage: ((event: MessageEvent<unknown>) => void) | null;
+  onmessageerror: ((event: MessageEvent<unknown>) => void) | null;
+  postMessage(message: unknown): void;
+  terminate(): void;
+};
 
 function createWorkerOptions(
   supportsDenoPermissions: boolean,
@@ -68,15 +82,6 @@ function runtimeSupportsDenoWorkerPermissions(
     };
   }).Deno;
   return typeof deno?.version?.deno === 'string';
-}
-
-function decodeWorkerDataUrl(sourceUrl: string): string {
-  const commaIndex = sourceUrl.indexOf(',');
-  if (commaIndex < 0) {
-    throw new Error('Worker source URL must be a data URL with encoded source text.');
-  }
-
-  return decodeURIComponent(sourceUrl.slice(commaIndex + 1));
 }
 
 function buildNodeWorkerSource(webWorkerSource: string): string {
@@ -142,6 +147,42 @@ function adaptNodeWorkerThread(
   return adapted;
 }
 
+function wrapWorkerWithCleanup(
+  worker: WorkerBridgeLike,
+  cleanup: () => void,
+): WorkerBridgeLike {
+  return {
+    get onerror() {
+      return worker.onerror;
+    },
+    set onerror(value) {
+      worker.onerror = value;
+    },
+    get onmessage() {
+      return worker.onmessage;
+    },
+    set onmessage(value) {
+      worker.onmessage = value;
+    },
+    get onmessageerror() {
+      return worker.onmessageerror;
+    },
+    set onmessageerror(value) {
+      worker.onmessageerror = value;
+    },
+    postMessage(message: unknown): void {
+      worker.postMessage(message);
+    },
+    terminate(): void {
+      try {
+        worker.terminate();
+      } finally {
+        cleanup();
+      }
+    },
+  };
+}
+
 function createPortableWorkerFactory(
   options: WorkerExecutionBackendOptions = {},
 ): ConstructorParameters<typeof PersistentSandboxRuntime>[1] {
@@ -150,24 +191,34 @@ function createPortableWorkerFactory(
     const workerOptions = createWorkerOptions(
       (options.useDenoPermissions ?? false) && runtimeSupportsDenoWorkerPermissions(),
     );
-    return (url) =>
-      new globalWorker(url, workerOptions) as unknown as {
-        onerror: ((event: ErrorEvent) => void) | null;
-        onmessage: ((event: MessageEvent<unknown>) => void) | null;
-        onmessageerror: ((event: MessageEvent<unknown>) => void) | null;
-        postMessage(message: unknown): void;
-        terminate(): void;
-      };
+    const workerSourceScope = options.workerSourceScope ??
+      (globalThis as unknown as WorkerSourceScope);
+    return (source) => {
+      const handle = buildPreferredWorkerSourceHandle(source, workerSourceScope);
+      try {
+        const worker = new globalWorker(handle.url, workerOptions) as unknown as WorkerBridgeLike;
+        return wrapWorkerWithCleanup(worker, handle.revoke) as {
+          onerror: ((event: ErrorEvent) => void) | null;
+          onmessage: ((event: MessageEvent<unknown>) => void) | null;
+          onmessageerror: ((event: MessageEvent<unknown>) => void) | null;
+          postMessage(message: unknown): void;
+          terminate(): void;
+        };
+      } catch (error) {
+        handle.revoke();
+        throw error;
+      }
+    };
   }
 
   const importWorkerThreads = options.importWorkerThreads ??
     (async () => await importNodeBuiltin<NodeWorkerThreadsModule>('worker_threads'));
 
-  return async (url) => {
+  return async (source) => {
     const workerThreads = await importWorkerThreads();
-    const nodeSource = buildNodeWorkerSource(decodeWorkerDataUrl(url));
+    const nodeSource = buildNodeWorkerSource(source);
     const worker = new workerThreads.Worker(
-      new URL(`data:text/javascript;charset=utf-8,${encodeURIComponent(nodeSource)}`),
+      new URL(buildDataWorkerSourceUrl(nodeSource)),
       { type: 'module' },
     );
     return adaptNodeWorkerThread(worker) as unknown as {
@@ -247,6 +298,6 @@ export const __executionBackendTestables = {
   buildNodeWorkerSource,
   createPortableWorkerFactory,
   createWorkerOptions,
-  decodeWorkerDataUrl,
   runtimeSupportsDenoWorkerPermissions,
+  wrapWorkerWithCleanup,
 };

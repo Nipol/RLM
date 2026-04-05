@@ -2058,6 +2058,46 @@ Deno.test('network-facing globals are unavailable inside the sandbox', async () 
   assert.equal(result.result.preview, 'undefined');
 });
 
+Deno.test('sandbox rejects constructor-based access to the Function constructor and global object re-entry', async () => {
+  const journalPath = await createSessionPath('sandbox-constructor-escape');
+  const session = await ReplSession.open({
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    journalPath,
+  });
+
+  const result = await session.execute(`({
+  functionType: typeof Function,
+  constructorType: typeof ({}).constructor,
+  objectCtorCtorType: typeof ({}).constructor?.constructor,
+  arrayCtorCtorType: typeof [].constructor?.constructor,
+  escapedFetchType: (() => {
+    try {
+      return ({}).constructor.constructor('return typeof fetch')();
+    } catch (error) {
+      return error instanceof Error ? error.name + ': ' + error.message : String(error);
+    }
+  })(),
+  escapedGlobalType: (() => {
+    try {
+      return ({}).constructor.constructor('return typeof globalThis')();
+    } catch (error) {
+      return error instanceof Error ? error.name + ': ' + error.message : String(error);
+    }
+  })(),
+})`);
+
+  assert.equal(result.status, 'success');
+  assert.deepEqual(result.result.json, {
+    arrayCtorCtorType: 'function',
+    constructorType: 'function',
+    escapedFetchType: 'undefined',
+    escapedGlobalType: 'object',
+    functionType: 'function',
+    objectCtorCtorType: 'function',
+  });
+});
+
 Deno.test('file hierarchy access is rejected inside the sandbox with a clear error', async () => {
   const tempDir = await Deno.makeTempDir({ prefix: 'rlm-sandbox-files-' });
   const targetPath = join(tempDir, 'secret.txt');

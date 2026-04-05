@@ -10,6 +10,7 @@
  */
 import { splitTrailingExpression } from './code_guard.ts';
 import { assertRuntimeHelperDefinition } from './plugin.ts';
+import { buildPreferredWorkerSourceHandle } from './worker_source.ts';
 import type {
   CellEntry,
   ExecutionErrorSnapshot,
@@ -43,11 +44,12 @@ interface WorkerLike {
   onerror: ((event: ErrorEvent) => void) | null;
   onmessage: ((event: MessageEvent<SandboxExecutionOutput>) => void) | null;
   onmessageerror: ((event: MessageEvent<unknown>) => void) | null;
+  postMessage?(message: unknown): void;
   terminate(): void;
 }
 
 type WorkerFactory = (
-  url: string,
+  source: string,
   options: WorkerOptions,
 ) => WorkerLike | Promise<WorkerLike>;
 
@@ -74,9 +76,17 @@ interface PersistentWorkerLike {
 }
 
 type PersistentWorkerFactory = (
-  url: string,
+  source: string,
   options: WorkerOptions,
 ) => PersistentWorkerLike | Promise<PersistentWorkerLike>;
+
+type WorkerBridgeLike = {
+  onerror: ((event: ErrorEvent) => void) | null;
+  onmessage: ((event: MessageEvent<unknown>) => void) | null;
+  onmessageerror: ((event: MessageEvent<unknown>) => void) | null;
+  postMessage(message: unknown): void;
+  terminate(): void;
+};
 
 interface PersistentWorkerExecuteMessage {
   captureFinals: boolean;
@@ -756,11 +766,40 @@ function createErrorSnapshot(error: unknown, fallbackName = 'Error'): ExecutionE
   };
 }
 
-/**
- * Encodes generated worker source as a self-contained TypeScript data URL.
- */
-function buildWorkerUrl(source: string): string {
-  return `data:text/javascript;charset=utf-8,${encodeURIComponent(source)}`;
+function wrapWorkerWithCleanup(
+  worker: WorkerBridgeLike,
+  cleanup: () => void,
+): WorkerBridgeLike {
+  return {
+    get onerror() {
+      return worker.onerror;
+    },
+    set onerror(value) {
+      worker.onerror = value;
+    },
+    get onmessage() {
+      return worker.onmessage;
+    },
+    set onmessage(value) {
+      worker.onmessage = value;
+    },
+    get onmessageerror() {
+      return worker.onmessageerror;
+    },
+    set onmessageerror(value) {
+      worker.onmessageerror = value;
+    },
+    postMessage(message: unknown): void {
+      worker.postMessage(message);
+    },
+    terminate(): void {
+      try {
+        worker.terminate();
+      } finally {
+        cleanup();
+      }
+    },
+  };
 }
 
 /**
@@ -773,7 +812,16 @@ export async function executeCellInSandbox(
     throw new Error('No global Worker constructor is available in this runtime.');
   }
 
-  return await executeCellInSandboxWithFactory(input, (url, options) => new Worker(url, options));
+  return await executeCellInSandboxWithFactory(input, (source, options) => {
+    const handle = buildPreferredWorkerSourceHandle(source);
+    try {
+      const worker = new Worker(handle.url, options) as unknown as WorkerBridgeLike;
+      return wrapWorkerWithCleanup(worker, handle.revoke);
+    } catch (error) {
+      handle.revoke();
+      throw error;
+    }
+  });
 }
 
 /**
@@ -783,7 +831,7 @@ export async function executeCellInSandboxWithFactory(
   input: SandboxExecutionInput,
   workerFactory: WorkerFactory,
 ): Promise<SandboxExecutionOutput> {
-  const worker = await workerFactory(buildWorkerUrl(buildWorkerSource(input)), {
+  const worker = await workerFactory(buildWorkerSource(input), {
     type: 'module',
   });
 
@@ -2378,8 +2426,16 @@ export class PersistentSandboxRuntime {
    */
   constructor(
     options: PersistentRuntimeOptions,
-    workerFactory: PersistentWorkerFactory = (url, workerOptions) =>
-      new Worker(url, workerOptions) as unknown as PersistentWorkerLike,
+    workerFactory: PersistentWorkerFactory = (source, workerOptions) => {
+      const handle = buildPreferredWorkerSourceHandle(source);
+      try {
+        const worker = new Worker(handle.url, workerOptions) as unknown as WorkerBridgeLike;
+        return wrapWorkerWithCleanup(worker, handle.revoke) as unknown as PersistentWorkerLike;
+      } catch (error) {
+        handle.revoke();
+        throw error;
+      }
+    },
   ) {
     this.#context = structuredClone(options.context ?? null);
     this.#llmQueryHandler = options.llmQueryHandler;
@@ -2464,7 +2520,7 @@ export class PersistentSandboxRuntime {
     this.#syncedHistoryLength = 0;
     this.#startupFailure = null;
     const worker = await this.#workerFactory(
-      buildWorkerUrl(buildPersistentWorkerSource([...this.#runtimeHelpers])),
+      buildPersistentWorkerSource([...this.#runtimeHelpers]),
       {
         type: 'module',
       },
@@ -2786,4 +2842,5 @@ export const __workerRuntimeTestables = {
   rewriteTopLevelBindings,
   startsRegexLiteral,
   shouldAbortPendingQueryController,
+  wrapWorkerWithCleanup,
 };

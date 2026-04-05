@@ -6,6 +6,7 @@ import { createOpenAIRLM } from '/dist/providers/openai/index.mjs';
 import { runOllamaProviderSmokeScenario } from '/shared/ollama_provider_scenario.mjs';
 import { runOpenAIProviderSmokeScenario } from '/shared/openai_provider_scenario.mjs';
 import { runPluginSmokeScenario } from '/shared/plugin_scenario.mjs';
+import { runRuntimeHelpersSmokeScenario } from '/shared/runtime_helpers_scenario.mjs';
 import { runSmokeScenario } from '/shared/runtime_scenario.mjs';
 
 const statusElement = document.getElementById('status');
@@ -14,6 +15,7 @@ const resultElement = document.getElementById('result');
 async function main() {
   try {
     const result = await runSmokeScenario(createRLM);
+    const runtimeHelpers = await runRuntimeHelpersSmokeScenario(createRLM);
     const pluginResult = await runPluginSmokeScenario(
       createRLM,
       createPingPongPlugin,
@@ -42,6 +44,26 @@ async function main() {
         `Browser OpenAI provider smoke failed: expected PONG:PONG, got ${openAIProvider.answer}`,
       );
     }
+    if (JSON.stringify(runtimeHelpers.finalValue) !== JSON.stringify({
+      delegated: 'PONG',
+      delegatedBatch: ['LEFT', 'RIGHT'],
+      grepPreview: [{ contextText: 'alpha\nbeta\ngamma', line: 'beta', lineNumber: 2 }],
+      plain: 'PONG',
+      plainBatch: ['ALPHA', 'BETA'],
+    })) {
+      throw new Error(
+        `Browser runtime-helper smoke failed: unexpected helper result ${JSON.stringify(runtimeHelpers.finalValue)}`,
+      );
+    }
+    if (JSON.stringify(runtimeHelpers.kindCounts) !== JSON.stringify({
+      child_turn: 3,
+      plain_query: 3,
+      root_turn: 1,
+    })) {
+      throw new Error(
+        `Browser runtime-helper smoke failed: unexpected kind counts ${JSON.stringify(runtimeHelpers.kindCounts)}`,
+      );
+    }
 
     if (statusElement !== null) {
       statusElement.textContent = 'PASS';
@@ -50,6 +72,7 @@ async function main() {
     if (resultElement !== null) {
       resultElement.textContent = JSON.stringify({
         core: result,
+        runtimeHelpers,
         plugin: pluginResult,
         ollamaProvider,
         openAIProvider,

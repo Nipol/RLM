@@ -17,25 +17,25 @@ const module = {
   result: await runSmokeScenario(createRLM),
 };
 if (module.pluginResult.answer !== 'PONG') {
-  throw new Error(`Node plugin smoke failed: expected PONG, got ${module.pluginResult.answer}`);
+  throw new Error(`Bun plugin smoke failed: expected PONG, got ${module.pluginResult.answer}`);
 }
 if (module.pluginResult.aotHelperName !== 'aot') {
   throw new Error(
-    `Node AoT plugin import smoke failed: expected aot helper, got ${module.pluginResult.aotHelperName}`,
+    `Bun AoT plugin import smoke failed: expected aot helper, got ${module.pluginResult.aotHelperName}`,
   );
 }
 if (module.ollamaProvider.answer !== 'PONG:PONG') {
   throw new Error(
-    `Node Ollama provider smoke failed: expected PONG:PONG, got ${module.ollamaProvider.answer}`,
+    `Bun Ollama provider smoke failed: expected PONG:PONG, got ${module.ollamaProvider.answer}`,
   );
 }
 if (module.openAIProvider.answer !== 'PONG:PONG') {
   throw new Error(
-    `Node OpenAI provider smoke failed: expected PONG:PONG, got ${module.openAIProvider.answer}`,
+    `Bun OpenAI provider smoke failed: expected PONG:PONG, got ${module.openAIProvider.answer}`,
   );
 }
 if (module.result.answer !== 'PONG:PONG') {
-  throw new Error(`Node core smoke failed: expected PONG:PONG, got ${module.result.answer}`);
+  throw new Error(`Bun core smoke failed: expected PONG:PONG, got ${module.result.answer}`);
 }
 if (JSON.stringify(module.runtimeHelpers.finalValue) !== JSON.stringify({
   delegated: 'PONG',
@@ -45,7 +45,7 @@ if (JSON.stringify(module.runtimeHelpers.finalValue) !== JSON.stringify({
   plainBatch: ['ALPHA', 'BETA'],
 })) {
   throw new Error(
-    `Node runtime-helper smoke failed: unexpected helper result ${JSON.stringify(module.runtimeHelpers.finalValue)}`,
+    `Bun runtime-helper smoke failed: unexpected helper result ${JSON.stringify(module.runtimeHelpers.finalValue)}`,
   );
 }
 if (JSON.stringify(module.runtimeHelpers.kindCounts) !== JSON.stringify({
@@ -54,7 +54,7 @@ if (JSON.stringify(module.runtimeHelpers.kindCounts) !== JSON.stringify({
   root_turn: 1,
 })) {
   throw new Error(
-    `Node runtime-helper smoke failed: unexpected kind counts ${JSON.stringify(module.runtimeHelpers.kindCounts)}`,
+    `Bun runtime-helper smoke failed: unexpected kind counts ${JSON.stringify(module.runtimeHelpers.kindCounts)}`,
   );
 }
 console.log(JSON.stringify({

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 
 import { __executionBackendTestables, WorkerExecutionBackend } from '../src/execution_backend.ts';
+import { buildDataWorkerSourceUrl } from '../src/worker_source.ts';
 
 Deno.test('execution backend helpers choose standard or Deno worker options by runtime capability', () => {
   assert.deepEqual(__executionBackendTestables.createWorkerOptions(false), {
@@ -25,20 +26,17 @@ Deno.test('execution backend helpers choose standard or Deno worker options by r
   );
 });
 
-Deno.test('execution backend helpers can decode generated worker URLs and wrap node worker source', () => {
+Deno.test('execution backend helpers can wrap node worker source around one generated worker program', () => {
   const source = 'globalThis.postMessage("pong");';
-  const url = `data:text/javascript;charset=utf-8,${encodeURIComponent(source)}`;
-
-  assert.equal(__executionBackendTestables.decodeWorkerDataUrl(url), source);
-  assert.throws(
-    () => __executionBackendTestables.decodeWorkerDataUrl('data:text/javascript;charset=utf-8'),
-    /data URL with encoded source text/u,
-  );
 
   const nodeSource = __executionBackendTestables.buildNodeWorkerSource(source);
   assert(nodeSource.includes("import { parentPort } from 'node:worker_threads';"));
   assert(nodeSource.includes('globalThis.postMessage = (value) =>'));
   assert(nodeSource.includes(source));
+  assert.equal(
+    buildDataWorkerSourceUrl(nodeSource),
+    `data:text/javascript;charset=utf-8,${encodeURIComponent(nodeSource)}`,
+  );
 });
 
 Deno.test('execution backend helpers adapt node worker thread events into worker-like callbacks', () => {
@@ -140,15 +138,71 @@ Deno.test('execution backend helpers can build a node-style worker factory when 
     }),
   });
 
-  const adapted = await factory!(
-    `data:text/javascript;charset=utf-8,${encodeURIComponent('globalThis.postMessage("pong");')}`,
-    { type: 'module' },
-  );
+  const adapted = await factory!('globalThis.postMessage("pong");', { type: 'module' });
 
   assert(receivedScriptUrl.startsWith('data:text/javascript;charset=utf-8,'));
   assert.equal(receivedType, 'module');
   assert.equal(typeof adapted.postMessage, 'function');
   assert.equal(typeof adapted.terminate, 'function');
+});
+
+Deno.test('execution backend helpers prefer blob-backed worker sources when one global Worker path is available', async () => {
+  const createdUrls: string[] = [];
+  const revokedUrls: string[] = [];
+  let receivedScriptUrl = '';
+  let terminateCount = 0;
+  const posted: unknown[] = [];
+
+  const factory = __executionBackendTestables.createPortableWorkerFactory({
+    globalWorker: class {
+      onerror = null;
+      onmessage = null;
+      onmessageerror = null;
+
+      constructor(scriptUrl: string | URL) {
+        receivedScriptUrl = String(scriptUrl);
+      }
+
+      postMessage(message: unknown): void {
+        posted.push(message);
+      }
+
+      terminate(): void {
+        terminateCount += 1;
+      }
+    },
+    workerSourceScope: {
+      Blob,
+      URL: {
+        createObjectURL: (_blob: Blob) => {
+          const url = `blob:worker-${createdUrls.length + 1}`;
+          createdUrls.push(url);
+          return url;
+        },
+        revokeObjectURL: (url: string) => {
+          revokedUrls.push(url);
+        },
+      },
+    },
+  });
+
+  const adapted = await factory!('globalThis.postMessage("pong");', { type: 'module' });
+  let seenMessage: unknown;
+  adapted.onmessage = (event) => {
+    seenMessage = event.data;
+  };
+
+  assert.equal(receivedScriptUrl, 'blob:worker-1');
+  (adapted as { postMessage(message: unknown): void }).postMessage('ping');
+  (adapted as { onmessage: ((event: MessageEvent<unknown>) => void) | null }).onmessage?.({
+    data: 'pong',
+  } as MessageEvent<unknown>);
+  adapted.terminate();
+  assert.deepEqual(posted, ['ping']);
+  assert.equal(seenMessage, 'pong');
+  assert.equal(terminateCount, 1);
+  assert.deepEqual(createdUrls, ['blob:worker-1']);
+  assert.deepEqual(revokedUrls, ['blob:worker-1']);
 });
 
 Deno.test('WorkerExecutionBackend can create runtimes through the portable worker factory path', () => {

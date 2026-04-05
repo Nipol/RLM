@@ -77,7 +77,7 @@ provider 전용 진입점은 다음 subpath를 사용합니다.
 
 ## Core ESM build
 
-browser와 일반 Node ESM 소비를 위해 browser-safe ESM bundle을 만들 수 있습니다.
+browser, Node, Bun ESM 소비를 위해 browser-safe ESM bundle을 만들 수 있습니다.
 
 ```bash
 deno task build:core
@@ -819,12 +819,14 @@ browser-safe bundle 빌드:
 deno task build:core
 ```
 
-Node/browser 환경 검증은 `smoke/compose.yml` 기반 컨테이너로 실행됩니다.
+Node/Bun/browser 환경 검증은 `smoke/compose.yml` 기반 컨테이너로 실행됩니다.
 
 - Node smoke 컨테이너: [smoke/node/Dockerfile](/Users/yoonsung/Development/RLM/smoke/node/Dockerfile)
+- Bun smoke 컨테이너: [smoke/bun/Dockerfile](/Users/yoonsung/Development/RLM/smoke/bun/Dockerfile)
 - Browser smoke 컨테이너: [smoke/browser/Dockerfile](/Users/yoonsung/Development/RLM/smoke/browser/Dockerfile)
 - 두 smoke 모두 먼저 `dist/` 번들을 만든 뒤, 공개 entrypoint가 실제 런타임에서 import 가능한지 확인합니다.
 - smoke는 core/provider bundle뿐 아니라 repository plugin bundle도 함께 확인합니다.
+- core smoke 안에는 runtime helper smoke도 포함되어, `llm_query(...)`, `llm_query_batched(...)`, `rlm_query(...)`, `rlm_query_batched(...)`, `grep(...)` 경로를 각각 별도로 검증합니다.
 - plugin smoke에서는 `ping_pong("PING")` helper 실행과 `createAoTPlugin()` import surface를 같이 검증합니다.
 
 Node smoke:
@@ -833,14 +835,20 @@ Node smoke:
 deno task smoke:node
 ```
 
+Bun smoke:
+
+```bash
+deno task smoke:bun
+```
+
 Browser smoke:
 
 ```bash
 deno task smoke:browser
 ```
 
-smoke task는 `deno.json`에 정의되어 있으며, bundle을 만든 뒤 다음 entrypoint가 실제 Node와 browser
-환경에서 import 가능한지 확인합니다.
+smoke task는 `deno.json`에 정의되어 있으며, bundle을 만든 뒤 다음 entrypoint가 실제 Node, Bun,
+browser 환경에서 import 가능한지 확인합니다.
 
 - `dist/core/index.mjs`
 - `dist/providers/openai/index.mjs`
@@ -848,11 +856,19 @@ smoke task는 `deno.json`에 정의되어 있으며, bundle을 만든 뒤 다음
 - `dist/plugin/aot/index.mjs`
 - `dist/plugin/pingpong/index.mjs`
 
+각 컨테이너는 다음 시나리오를 함께 실행합니다.
+
+- core smoke: root loop, `llm_query(...)`, `rlm_query(...)`
+- runtime helper smoke: batched/non-batched helper와 `grep(...)`를 helper별로 분리 검증
+- provider smoke: OpenAI/Ollama provider entrypoint를 통한 동일 runtime 경로 검증
+- plugin smoke: repository plugin import와 helper 실행 검증
+
 동일한 검증은 직접 Docker Compose로도 실행할 수 있습니다.
 
 ```bash
-docker compose -f smoke/compose.yml build node-smoke browser-smoke
+docker compose -f smoke/compose.yml build node-smoke bun-smoke browser-smoke
 docker compose -f smoke/compose.yml run --rm node-smoke
+docker compose -f smoke/compose.yml run --rm bun-smoke
 docker compose -f smoke/compose.yml run --rm browser-smoke
 ```
 
@@ -861,6 +877,7 @@ docker compose -f smoke/compose.yml run --rm browser-smoke
 ```bash
 deno task smoke:build
 deno task smoke:node
+deno task smoke:bun
 deno task smoke:browser
 ```
 
