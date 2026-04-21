@@ -9,7 +9,9 @@ import * as openAIProvider from '../openai.ts';
 
 Deno.test('root mod entrypoint re-exports the library surface used by JSR consumers', () => {
   assert.equal(typeof root.createRLM, 'function');
+  assert.equal(typeof root.formatLLMCallerMessagesAsText, 'function');
   assert.equal(typeof root.runRLM, 'function');
+  assert.equal(typeof root.resolveLLMCallerInputText, 'function');
   assert.equal(typeof root.ReplSession.open, 'function');
   assert.equal(typeof root.InMemoryRLMLogger, 'function');
   assert.equal(typeof root.NullRLMLogger, 'function');

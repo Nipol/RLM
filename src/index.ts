@@ -41,6 +41,7 @@ export {
   serializeRuntimeHelperSource,
 } from './plugin.ts';
 export { createRLM, RLMMaxStepsError, RLMProtocolError, runRLM } from './rlm_runner.ts';
+export { formatLLMCallerMessagesAsText, resolveLLMCallerInputText } from './llm_adapter.ts';
 export type {
   RLMClient,
   RLMClientOptions,
@@ -61,6 +62,7 @@ export type { RLMPlugin, RuntimeHelperSourceSerializationOptions } from './plugi
 export type {
   LLMAdapter,
   LLMCaller,
+  LLMCallerMessage,
   LLMCallerRequest,
   LLMCallerResponse,
   LLMCallKind,

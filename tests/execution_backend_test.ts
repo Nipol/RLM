@@ -82,12 +82,13 @@ Deno.test('execution backend helpers adapt node worker thread events into worker
 
   messageListener?.('pong');
   errorListener?.(new Error('broken'));
+  errorListener?.('string failure' as unknown as Error);
   messageErrorListener?.({ stale: true });
   adapted.postMessage('ping');
   adapted.terminate();
 
   assert.equal(seenMessage, 'pong');
-  assert.equal(seenError, 'broken');
+  assert.equal(seenError, 'string failure');
   assert.deepEqual(seenMessageError, { stale: true });
   assert.deepEqual(posted, ['ping']);
   assert.equal(terminated, true);
@@ -144,6 +145,16 @@ Deno.test('execution backend helpers can build a node-style worker factory when 
   assert.equal(receivedType, 'module');
   assert.equal(typeof adapted.postMessage, 'function');
   assert.equal(typeof adapted.terminate, 'function');
+});
+
+Deno.test('execution backend node fallback can import the default worker_threads module', async () => {
+  const factory = __executionBackendTestables.createPortableWorkerFactory({
+    globalWorker: undefined,
+  });
+
+  const worker = await factory!('', { type: 'module' });
+  assert.equal(typeof worker.postMessage, 'function');
+  worker.terminate();
 });
 
 Deno.test('execution backend helpers prefer blob-backed worker sources when one global Worker path is available', async () => {
@@ -203,6 +214,128 @@ Deno.test('execution backend helpers prefer blob-backed worker sources when one 
   assert.equal(terminateCount, 1);
   assert.deepEqual(createdUrls, ['blob:worker-1']);
   assert.deepEqual(revokedUrls, ['blob:worker-1']);
+});
+
+Deno.test('execution backend portable worker factory can request Deno worker permissions when supported', async () => {
+  let receivedOptions: WorkerOptions | undefined;
+  const factory = __executionBackendTestables.createPortableWorkerFactory({
+    globalWorker: class {
+      onerror = null;
+      onmessage = null;
+      onmessageerror = null;
+
+      constructor(_scriptUrl: string | URL, options?: WorkerOptions) {
+        receivedOptions = options;
+      }
+
+      postMessage(_message: unknown): void {}
+
+      terminate(): void {}
+    },
+    useDenoPermissions: true,
+    workerSourceScope: {
+      Blob,
+      URL: {
+        createObjectURL: (_blob: Blob) => 'blob:deno-permission-worker',
+        revokeObjectURL: (_url: string) => {},
+      },
+    },
+  });
+
+  await factory!('globalThis.postMessage("pong");', { type: 'module' });
+
+  assert.deepEqual(receivedOptions, {
+    deno: { permissions: 'none' },
+    type: 'module',
+  });
+});
+
+Deno.test('execution backend cleanup wrapper forwards all event accessors and revokes on terminate', () => {
+  let onerror: ((event: ErrorEvent) => void) | null = null;
+  let onmessage: ((event: MessageEvent<unknown>) => void) | null = null;
+  let onmessageerror: ((event: MessageEvent<unknown>) => void) | null = null;
+  let terminateCount = 0;
+  let cleanupCount = 0;
+  const posted: unknown[] = [];
+
+  const wrapped = __executionBackendTestables.wrapWorkerWithCleanup({
+    get onerror() {
+      return onerror;
+    },
+    set onerror(value) {
+      onerror = value;
+    },
+    get onmessage() {
+      return onmessage;
+    },
+    set onmessage(value) {
+      onmessage = value;
+    },
+    get onmessageerror() {
+      return onmessageerror;
+    },
+    set onmessageerror(value) {
+      onmessageerror = value;
+    },
+    postMessage(message: unknown): void {
+      posted.push(message);
+    },
+    terminate(): void {
+      terminateCount += 1;
+    },
+  }, () => {
+    cleanupCount += 1;
+  });
+
+  const handleError = () => undefined;
+  const handleMessage = () => undefined;
+  const handleMessageError = () => undefined;
+  wrapped.onerror = handleError;
+  wrapped.onmessage = handleMessage;
+  wrapped.onmessageerror = handleMessageError;
+  wrapped.postMessage('ping');
+  wrapped.terminate();
+
+  assert.equal(wrapped.onerror, handleError);
+  assert.equal(wrapped.onmessage, handleMessage);
+  assert.equal(wrapped.onmessageerror, handleMessageError);
+  assert.deepEqual(posted, ['ping']);
+  assert.equal(terminateCount, 1);
+  assert.equal(cleanupCount, 1);
+});
+
+Deno.test('execution backend portable worker factory revokes worker URLs when construction fails', () => {
+  const revokedUrls: string[] = [];
+  const factory = __executionBackendTestables.createPortableWorkerFactory({
+    globalWorker: class {
+      onerror = null;
+      onmessage = null;
+      onmessageerror = null;
+
+      constructor(_scriptUrl: string | URL) {
+        throw new Error('worker construction failed');
+      }
+
+      postMessage(_message: unknown): void {}
+
+      terminate(): void {}
+    },
+    workerSourceScope: {
+      Blob,
+      URL: {
+        createObjectURL: (_blob: Blob) => 'blob:failed-worker',
+        revokeObjectURL: (url: string) => {
+          revokedUrls.push(url);
+        },
+      },
+    },
+  });
+
+  assert.throws(
+    () => factory!('globalThis.postMessage("pong");', { type: 'module' }),
+    /worker construction failed/u,
+  );
+  assert.deepEqual(revokedUrls, ['blob:failed-worker']);
 });
 
 Deno.test('WorkerExecutionBackend can create runtimes through the portable worker factory path', () => {

@@ -52,3 +52,25 @@ Deno.test('Ollama provider smoke scenario fetcher rejects unexpected model ids',
     /Unexpected smoke provider model: unknown-model/u,
   );
 });
+
+Deno.test('Ollama provider smoke scenario records defensive defaults for missing request init', async () => {
+  const result = await runOllamaProviderSmokeScenario((
+    options: Parameters<typeof createOllamaRLM>[0],
+  ) => ({
+    async run() {
+      await assert.rejects(
+        () => options.fetcher!('http://localhost:11434/api/generate'),
+        /Unexpected smoke provider model:/u,
+      );
+      return {
+        answer: 'stub',
+        finalValue: 'stub',
+        session: { close: async () => undefined },
+        steps: 0,
+      };
+    },
+  }));
+
+  assert.deepEqual(result.requestKinds, ['child_turn']);
+  assert.deepEqual(result.urls, ['http://localhost:11434/api/generate']);
+});

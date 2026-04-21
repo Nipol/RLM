@@ -150,6 +150,8 @@ Deno.test('provider config helpers cover labels, invalid payloads, and empty sel
 Deno.test('coerceStoredProviderRequestTimeoutMs restores the default for older snapshots', () => {
   assert.equal(coerceStoredProviderRequestTimeoutMs(undefined), 30_000);
   assert.equal(coerceStoredProviderRequestTimeoutMs('broken'), 30_000);
+  assert.equal(coerceStoredProviderRequestTimeoutMs(0), 30_000);
+  assert.equal(coerceStoredProviderRequestTimeoutMs(-1), 30_000);
   assert.equal(coerceStoredProviderRequestTimeoutMs(45_000), 45_000);
 });
 

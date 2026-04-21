@@ -49,7 +49,9 @@ export interface LLMCallMetadata {
 /**
  * Describes one provider-neutral model invocation emitted by the RLM core.
  *
- * `turnState` is opaque provider state. The core forwards it but does not inspect it.
+ * `messages` carries the provider-neutral append-only conversation form when
+ * one caller can consume structured turns. `input` remains the flattened
+ * fallback for callers that only support a single prompt string.
  *
  * @example
  * ```ts
@@ -65,10 +67,16 @@ export interface LLMCallMetadata {
 export interface LLMCallerRequest {
   input: string;
   kind: LLMCallKind;
+  messages?: LLMCallerMessage[];
   metadata?: LLMCallMetadata;
   model: string;
   signal?: AbortSignal;
   systemPrompt: string;
+  /**
+   * @deprecated Stateful provider continuation is no longer used by the core.
+   * Prefer explicit append-only `messages` so every provider sees the same
+   * conversation state.
+   */
   turnState?: unknown;
 }
 
@@ -79,14 +87,63 @@ export interface LLMCallerRequest {
  * ```ts
  * const response: LLMCallerResponse = {
  *   outputText: '```repl\\nFINAL_VAR(\"ok\")\\n```',
- *   turnState: { cursor: 'opaque-provider-state' },
  * };
  * ```
  */
 export interface LLMCallerResponse {
   outputText: string;
+  /**
+   * @deprecated Stateful provider continuation is ignored by the core.
+   */
   turnState?: unknown;
   usage?: LLMUsage;
+}
+
+/**
+ * Describes one provider-neutral conversational message.
+ *
+ * @example
+ * ```ts
+ * const message: LLMCallerMessage = {
+ *   role: 'user',
+ *   content: 'Run the next REPL step.',
+ * };
+ * ```
+ */
+export interface LLMCallerMessage {
+  content: string;
+  role: 'assistant' | 'user';
+}
+
+/**
+ * Renders structured messages into the legacy single-string caller input.
+ *
+ * @example
+ * ```ts
+ * const input = formatLLMCallerMessagesAsText([
+ *   { role: 'user', content: 'Question' },
+ *   { role: 'assistant', content: '```repl\\n1 + 1\\n```' },
+ * ]);
+ * ```
+ */
+export function formatLLMCallerMessagesAsText(
+  messages: readonly LLMCallerMessage[],
+): string {
+  return messages
+    .map((message) => `${message.role}:\n${message.content}`)
+    .join('\n\n');
+}
+
+/**
+ * Returns the best prompt string available for callers that do not support
+ * structured messages.
+ */
+export function resolveLLMCallerInputText(request: LLMCallerRequest): string {
+  if (request.messages !== undefined && request.messages.length > 0) {
+    return formatLLMCallerMessagesAsText(request.messages);
+  }
+
+  return request.input;
 }
 
 /**

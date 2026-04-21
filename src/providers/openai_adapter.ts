@@ -10,6 +10,7 @@
  */
 import type {
   LLMCaller,
+  LLMCallerMessage,
   LLMCallerRequest,
   LLMCallerResponse,
   LLMProvider,
@@ -57,6 +58,11 @@ interface OpenAIResponsePayload {
 
 interface OpenAIReasoningRequestPayload {
   effort?: OpenAIReasoningEffort;
+}
+
+interface OpenAIInputMessagePayload {
+  content: string;
+  role: LLMCallerMessage['role'];
 }
 
 /**
@@ -223,6 +229,17 @@ function resolveReasoningEffortForRequest(
   return config.subReasoningEffort;
 }
 
+function buildOpenAIInputPayload(request: LLMCallerRequest): string | OpenAIInputMessagePayload[] {
+  if (request.messages !== undefined && request.messages.length > 0) {
+    return request.messages.map((message) => ({
+      content: message.content,
+      role: message.role,
+    }));
+  }
+
+  return request.input;
+}
+
 /**
  * Implements the provider-neutral adapter interface on top of the OpenAI Responses API.
  *
@@ -285,7 +302,7 @@ export class OpenAIResponsesAdapter implements LLMCaller {
 
     try {
       const requestBody: Record<string, unknown> = {
-        input: request.input,
+        input: buildOpenAIInputPayload(request),
         instructions: request.systemPrompt,
         model: request.model,
       };
@@ -295,10 +312,6 @@ export class OpenAIResponsesAdapter implements LLMCaller {
           effort: reasoningEffort,
         } satisfies OpenAIReasoningRequestPayload;
       }
-      if (typeof request.turnState === 'string' && request.turnState.length > 0) {
-        requestBody.previous_response_id = request.turnState;
-      }
-
       const response = await this.#fetcher(
         `${this.#config.baseUrl.replace(/\/+$/u, '')}/responses`,
         {
@@ -327,14 +340,8 @@ export class OpenAIResponsesAdapter implements LLMCaller {
         throw new OpenAIResponsesError(response.status, providerMessage);
       }
 
-      let turnState: unknown = undefined;
-      if (typeof payload.id === 'string') {
-        turnState = payload.id;
-      }
-
       const normalizedResponse = {
         outputText: extractOutputText(payload),
-        turnState,
         usage: normalizeUsage(payload),
       };
 
@@ -419,6 +426,7 @@ export class OpenAIResponsesProvider implements LLMProvider<OpenAIProviderConfig
  */
 export const __openAIAdapterTestables = {
   attachAbortListener,
+  buildOpenAIInputPayload,
   cleanupCompletionRequest,
   detachAbortListener,
   resolveFetcher,

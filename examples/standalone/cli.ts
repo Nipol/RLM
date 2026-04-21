@@ -525,8 +525,20 @@ function resolveStandaloneSystemPromptExtension(
 
 function resolveCodexOAuthProvider(
   createProvider: StandaloneCLIDependencies['createCodexOAuthProvider'],
+  options: {
+    clock?: () => Date;
+    cwd?: string;
+    fetcher?: typeof fetch;
+  } = {},
 ): StandaloneCodexOAuthProviderLike {
-  return createProvider?.() ?? new CodexOAuthProvider();
+  return createProvider?.() ??
+    new CodexOAuthProvider({
+      clock: options.clock,
+      fetcher: options.fetcher,
+      storagePath: options.cwd === undefined
+        ? undefined
+        : joinFilePath(options.cwd, '.rlm', 'codex-oauth.json'),
+    });
 }
 
 function resolveStandaloneWriteLine(
@@ -553,6 +565,23 @@ async function closeStandaloneBaseLogger(baseLogger: RLMLogger): Promise<void> {
   }
 
   await baseLogger.close();
+}
+
+type StandaloneRunSession = {
+  close?(): Promise<void> | void;
+};
+
+async function closeStandaloneRunResources(
+  resultSession: StandaloneRunSession | undefined,
+  logger: RLMLogger,
+): Promise<void> {
+  try {
+    if (resultSession !== undefined && resultSession.close !== undefined) {
+      await resultSession.close();
+    }
+  } finally {
+    await closeStandaloneBaseLogger(logger);
+  }
 }
 
 /**
@@ -759,11 +788,15 @@ function formatStandaloneStepGapSuffix(
   }
 
   const nextAssistantCreatedAtMs = parseStandaloneTimeMs(nextAssistantCreatedAt);
-  if (nextAssistantCreatedAtMs === null || nextAssistantCreatedAtMs < previousAssistantCreatedAtMs) {
+  if (
+    nextAssistantCreatedAtMs === null || nextAssistantCreatedAtMs < previousAssistantCreatedAtMs
+  ) {
     return '';
   }
 
-  return ` after=${formatStandaloneDurationMs(nextAssistantCreatedAtMs - previousAssistantCreatedAtMs)}`;
+  return ` after=${
+    formatStandaloneDurationMs(nextAssistantCreatedAtMs - previousAssistantCreatedAtMs)
+  }`;
 }
 
 /**
@@ -1266,10 +1299,6 @@ function buildStandaloneUsageLines(
   if (missingPricingModels.length > 0 || estimate.totalCostUsd === undefined) {
     lines.push(
       `[cost] input_usd= output_usd= total_usd=${
-        missingPricingModels.length > 0 || estimate.totalCostUsd === undefined
-          ? ''
-          : formatUsd(estimate.totalCostUsd)
-      }${
         missingPricingModels.length === 0
           ? ''
           : ` missing_pricing_models=${missingPricingModels.join(', ')}`
@@ -1333,10 +1362,11 @@ export async function runStandaloneCLI(
     : dependencies.estimateRunCost;
 
   if (resolved.provider === 'codex-oauth' && resolved.login === true) {
-    const provider = dependencies.createCodexOAuthProvider?.() ??
-      new CodexOAuthProvider({
-        fetcher,
-      });
+    const provider = resolveCodexOAuthProvider(dependencies.createCodexOAuthProvider, {
+      clock: dependencies.clock,
+      cwd,
+      fetcher,
+    });
     writeLine('[login] provider: codex-oauth');
     await provider.login({
       onAuthUrl: async (url) => {
@@ -1359,10 +1389,11 @@ export async function runStandaloneCLI(
   }
 
   if (resolved.provider === 'codex-oauth' && resolved.listModels === true) {
-    const provider = dependencies.createCodexOAuthProvider?.() ??
-      new CodexOAuthProvider({
-        fetcher,
-      });
+    const provider = resolveCodexOAuthProvider(dependencies.createCodexOAuthProvider, {
+      clock: dependencies.clock,
+      cwd,
+      fetcher,
+    });
     writeLine('[models] provider: codex-oauth');
     const models = await provider.listModels();
     for (const model of models) {
@@ -1384,11 +1415,7 @@ export async function runStandaloneCLI(
   });
   const plugins = await resolveStandalonePlugins(resolved, dependencies);
   const systemPromptExtension = resolveStandaloneSystemPromptExtension(resolved);
-  let resultSession:
-    | {
-      close?(): Promise<void> | void;
-    }
-    | undefined;
+  let resultSession: StandaloneRunSession | undefined;
 
   writeLine(`[standalone] provider: ${resolved.provider}`);
   if (resolved.aotMode !== undefined) {
@@ -1401,6 +1428,7 @@ export async function runStandaloneCLI(
   writeLine(`[standalone] system prompt: ${systemPromptPath}`);
   writeLine(`[standalone] log: ${resolved.logPath}`);
 
+  let renderedAnswer = '';
   try {
     const context = {
       document,
@@ -1411,10 +1439,11 @@ export async function runStandaloneCLI(
         const runtime = loadRLMRuntimeConfig({ path: envPath });
         const requestTimeoutMs = resolved.requestTimeoutMs ??
           loadProviderRequestTimeoutMs({ path: envPath });
-        const provider = dependencies.createCodexOAuthProvider?.() ??
-          new CodexOAuthProvider({
-            fetcher,
-          });
+        const provider = resolveCodexOAuthProvider(dependencies.createCodexOAuthProvider, {
+          clock: dependencies.clock,
+          cwd,
+          fetcher,
+        });
         const availableModels = await provider.listModels();
         const preferredModels = loadPreferredStandaloneModelConfig({ path: envPath });
         const models = resolveCodexOAuthModels(availableModels, {
@@ -1482,11 +1511,11 @@ export async function runStandaloneCLI(
           prompt: query,
           systemPromptExtension,
           ...(resolved.aotDebug === true ? { queryTrace: true } : {}),
-        });
+      });
         return { render, runResult };
       })();
     resultSession = result.runResult.session;
-    const renderedAnswer = await result.render({
+    renderedAnswer = await result.render({
       finalValue: result.runResult.finalValue,
       inputFilePath: inputPath,
       query,
@@ -1498,22 +1527,28 @@ export async function runStandaloneCLI(
     for (const usageLine of buildStandaloneUsageLines(result.runResult.usage, estimateRunCost)) {
       writeLine(usageLine);
     }
-    return {
-      answer: renderedAnswer,
-    };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await logger.append({
-      createdAt: (dependencies.clock ?? (() => new Date()))().toISOString(),
-      message,
-      stage: 'run',
-      type: 'standalone_error',
-    });
+    try {
+      await logger.append({
+        createdAt: (dependencies.clock ?? (() => new Date()))().toISOString(),
+        message,
+        stage: 'run',
+        type: 'standalone_error',
+      });
+    } catch (appendError) {
+      await closeStandaloneRunResources(resultSession, logger);
+      throw appendError;
+    }
+
+    await closeStandaloneRunResources(resultSession, logger);
     throw error;
-  } finally {
-    await resultSession?.close?.();
-    await logger.close?.();
   }
+
+  await closeStandaloneRunResources(resultSession, logger);
+  return {
+    answer: renderedAnswer,
+  };
 }
 
 /**
@@ -1523,6 +1558,7 @@ export const __standaloneCLITestables = {
   buildStandaloneUsageLines,
   createStandaloneCodexOAuthAuthorizationReceiver,
   closeStandaloneBaseLogger,
+  closeStandaloneRunResources,
   formatStandaloneDurationMs,
   formatStandaloneElapsedSuffix,
   formatStandaloneFinalSuffix,

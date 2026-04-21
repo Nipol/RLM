@@ -4,6 +4,7 @@ import {
   __platformTestables,
   decodeBase64Url,
   encodeBase64Url,
+  extnameFilePath,
   isAbsolutePath,
   isNotFoundError,
   joinFilePath,
@@ -65,6 +66,10 @@ Deno.test('platform path helpers normalize relative, posix, and windows-like pat
     __platformTestables.dirnameFilePath('C:\\workspace\\logs\\session.jsonl'),
     'C:\\workspace\\logs',
   );
+  assert.equal(__platformTestables.dirnameFilePath('/workspace/logs/'), '/workspace');
+  assert.equal(extnameFilePath('book.md'), '.md');
+  assert.equal(extnameFilePath('/workspace/archive.tar.gz'), '.gz');
+  assert.equal(extnameFilePath('/workspace/.env'), '');
 });
 
 Deno.test('platform helpers resolve cwd, not-found errors, and base64url encoding portably', () => {

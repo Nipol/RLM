@@ -21,7 +21,7 @@ export interface OpenAILiveScenarioCatalog {
 }
 
 export function createOpenAILiveSeed(
-  nextUInt32: () => number = () => crypto.getRandomValues(new Uint32Array(1))[0] ?? 0,
+  nextUInt32: () => number = () => crypto.getRandomValues(new Uint32Array(1))[0],
 ): number {
   const raw = nextUInt32() >>> 0;
   return raw === 0 ? 1 : raw;

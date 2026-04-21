@@ -191,6 +191,21 @@ Deno.test('listModelsForDraft covers provider validation, raw errors, and empty 
         kind: 'openai',
         rootModel: '',
         subModel: '',
+      }, async () => {
+        throw new Error('network down');
+      }),
+    /network down/u,
+  );
+
+  await assert.rejects(
+    () =>
+      listModelsForDraft({
+        apiKey: 'sk-openai',
+        availableModels: [],
+        baseUrl: '',
+        kind: 'openai',
+        rootModel: '',
+        subModel: '',
       }, async () =>
         new Response('upstream broken', {
           status: 502,

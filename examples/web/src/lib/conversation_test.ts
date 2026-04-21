@@ -156,6 +156,29 @@ Deno.test('buildConversationContext covers usage snapshots and ollama provider l
   });
 });
 
+Deno.test('buildConversationContext normalizes usage snapshots without model breakdowns', () => {
+  const context = buildConversationContext([
+    {
+      content: '토큰 사용량만 있는 답변',
+      createdAt: '2026-03-31T10:06:00.000Z',
+      id: 'a2',
+      role: 'assistant',
+      usage: {
+        inputTokens: 12,
+        outputTokens: 8,
+        totalTokens: 20,
+      },
+    },
+  ], settings) as { conversation: Array<{ usage: unknown }> };
+
+  assert.deepEqual(context.conversation[0]?.usage, {
+    byModel: null,
+    inputTokens: 12,
+    outputTokens: 8,
+    totalTokens: 20,
+  });
+});
+
 Deno.test('buildConversationContext covers the Ollama Cloud provider label', () => {
   const cloudSettings = createProviderSettings({
     apiKey: 'ollama-cloud-key',

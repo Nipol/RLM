@@ -172,8 +172,7 @@ export function dirnameFilePath(path: string): string {
     return normalized;
   }
 
-  const trimmed = normalized.endsWith(separator) ? normalized.slice(0, -1) : normalized;
-  const index = trimmed.lastIndexOf(separator);
+  const index = normalized.lastIndexOf(separator);
   if (index < 0) {
     return '.';
   }
@@ -182,7 +181,7 @@ export function dirnameFilePath(path: string): string {
     return separator;
   }
 
-  return trimmed.slice(0, index);
+  return normalized.slice(0, index);
 }
 
 /**

@@ -14,6 +14,7 @@ import type {
   LLMCallerResponse,
   LLMProvider,
 } from '../llm_adapter.ts';
+import { resolveLLMCallerInputText } from '../llm_adapter.ts';
 
 type FetchLike = typeof fetch;
 
@@ -156,7 +157,7 @@ export class OllamaGenerateAdapter implements LLMCaller {
     try {
       const requestBody: Record<string, unknown> = {
         model: request.model,
-        prompt: request.input,
+        prompt: resolveLLMCallerInputText(request),
         stream: false,
         system: request.systemPrompt,
       };

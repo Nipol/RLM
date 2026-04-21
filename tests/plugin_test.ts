@@ -62,7 +62,16 @@ Deno.test('resolveRuntimeHelpers validates plugin helpers and preserves helper p
 });
 
 Deno.test('runtime helper prompt docs describe object, array, and mixed object/string inputs when declared', () => {
-  const [helper, objectOnly, arrayOnly, objectAndSource, objectAndText, objectAndCode, helperWithBlankExample] = resolveRuntimeHelpers({
+  const [
+    helper,
+    objectOnly,
+    arrayOnly,
+    objectAndSource,
+    objectAndText,
+    objectAndCode,
+    arrayAndSource,
+    helperWithBlankExample,
+  ] = resolveRuntimeHelpers({
     runtimeHelpers: [{
       description: '객체 또는 배열 입력을 분석합니다.',
       inputKinds: ['object', 'array'],
@@ -95,6 +104,11 @@ Deno.test('runtime helper prompt docs describe object, array, and mixed object/s
       name: 'object_or_code',
       source: 'typeof input === "string" ? input : Object.keys(input).length',
     }, {
+      description: '배열 또는 소스 문자열을 받습니다.',
+      inputKinds: ['array', 'source'],
+      name: 'array_or_source',
+      source: 'typeof input === "string" ? input : input.length',
+    }, {
       description: '빈 예시는 무시됩니다.',
       examples: ['  ', 'await helper_with_blank_example("x")'],
       inputKinds: ['text'],
@@ -121,6 +135,10 @@ Deno.test('runtime helper prompt docs describe object, array, and mixed object/s
   assert.match(
     buildRuntimeHelperPromptBlock(objectAndCode!),
     /입력값: null\/undefined가 아닌 객체 또는 비어 있지 않은 REPL 코드 문자열/u,
+  );
+  assert.match(
+    buildRuntimeHelperPromptBlock(arrayAndSource!),
+    /입력값: null\/undefined가 아닌 배열 또는 비어 있지 않은 소스 문자열/u,
   );
   assert.equal(
     buildRuntimeHelperPromptBlock(helperWithBlankExample!).match(/예시:/gu)?.length ?? 0,
@@ -309,6 +327,28 @@ Deno.test('runtime helper resolution rejects unknown input kinds, duplicate help
       }),
     /requires a non-empty source body/u,
   );
+
+  assert.deepEqual(resolveRuntimeHelpers({
+    plugins: [{
+      name: 'no-runtime-helpers',
+    }],
+  }), []);
+});
+
+Deno.test('runtime helper prompt block resolution can derive helpers from plugins directly', () => {
+  const blocks = resolveRuntimeHelperPromptBlocks({
+    plugins: [{
+      name: 'inline-plugin',
+      runtimeHelpers: [{
+        description: '직접 resolve된 helper입니다.',
+        name: 'inline_helper',
+        source: 'input',
+      }],
+    }],
+  });
+
+  assert.equal(blocks.length, 1);
+  assert.match(blocks[0] ?? '', /`inline_helper\(input\)`/u);
 });
 
 Deno.test('serializeRuntimeHelperSource turns named functions into runnable helper source', () => {

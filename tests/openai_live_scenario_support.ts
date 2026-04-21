@@ -140,11 +140,8 @@ export function resolveCodexLiveModels(
         'gpt-5-t-mini',
         'gpt-5-mini',
         rootModel,
-        'gpt-5.2-instant',
-        'gpt-5-2-instant',
       ],
-    ) ??
-    rootModel;
+    )!;
 
   return {
     rootModel,

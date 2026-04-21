@@ -621,7 +621,8 @@ Deno.test('runtime helper source can use built-in llm_query inside its sandbox',
 
 Deno.test('runtime helper source injects a default rlm_query maxSubcallDepth of 1 and leaves maxSteps unbounded', async () => {
   const journalPath = await createSessionPath('runtime-helper-rlm-query-default-depth');
-  const seenCalls: Array<{ maxSteps?: number; maxSubcallDepth?: number; prompt: string | object }> = [];
+  const seenCalls: Array<{ maxSteps?: number; maxSubcallDepth?: number; prompt: string | object }> =
+    [];
   const session = await ReplSession.open({
     clock: createClock(),
     idGenerator: createIdGenerator(),
@@ -658,7 +659,8 @@ Deno.test('runtime helper source injects a default rlm_query maxSubcallDepth of 
 
 Deno.test('runtime helper source preserves an explicit rlm_query maxSubcallDepth override while keeping maxSteps unbounded', async () => {
   const journalPath = await createSessionPath('runtime-helper-rlm-query-explicit-depth');
-  const seenCalls: Array<{ maxSteps?: number; maxSubcallDepth?: number; prompt: string | object }> = [];
+  const seenCalls: Array<{ maxSteps?: number; maxSubcallDepth?: number; prompt: string | object }> =
+    [];
   const session = await ReplSession.open({
     clock: createClock(),
     idGenerator: createIdGenerator(),
@@ -699,7 +701,8 @@ Deno.test('runtime helper source preserves an explicit rlm_query maxSubcallDepth
 
 Deno.test('runtime helper source can explicitly override nested rlm_query maxSteps with a second argument', async () => {
   const journalPath = await createSessionPath('runtime-helper-rlm-query-explicit-steps');
-  const seenCalls: Array<{ maxSteps?: number; maxSubcallDepth?: number; prompt: string | object }> = [];
+  const seenCalls: Array<{ maxSteps?: number; maxSubcallDepth?: number; prompt: string | object }> =
+    [];
   const session = await ReplSession.open({
     clock: createClock(),
     idGenerator: createIdGenerator(),
@@ -732,6 +735,61 @@ Deno.test('runtime helper source can explicitly override nested rlm_query maxSte
     maxSubcallDepth: 1,
     prompt: 'solve this',
   }]);
+});
+
+Deno.test('runtime helper source runs batched rlm_query calls concurrently with helper defaults', async () => {
+  const journalPath = await createSessionPath('runtime-helper-rlm-query-batched-parallel');
+  const seenCalls: Array<{ maxSteps?: number; maxSubcallDepth?: number; prompt: string | object }> =
+    [];
+  let activeQueries = 0;
+  let maxActiveQueries = 0;
+  const session = await ReplSession.open({
+    clock: createClock(),
+    idGenerator: createIdGenerator(),
+    journalPath,
+    rlmQueryHandler: async (prompt, options) => {
+      activeQueries += 1;
+      maxActiveQueries = Math.max(maxActiveQueries, activeQueries);
+      seenCalls.push({
+        maxSteps: options?.maxSteps,
+        maxSubcallDepth: options?.maxSubcallDepth,
+        prompt,
+      });
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return typeof prompt === 'string' ? `delegated:${prompt}` : prompt.task;
+      } finally {
+        activeQueries -= 1;
+      }
+    },
+    runtimeHelpers: [{
+      description: '여러 child RLM 호출을 위임합니다.',
+      inputKinds: ['text'],
+      name: 'delegate_many',
+      source: [
+        'const values = await rlm_query_batched([`${input}:left`, `${input}:right`]);',
+        'values',
+      ].join('\n'),
+    }],
+  });
+
+  const result = await session.execute('await delegate_many("solve")');
+
+  assert.equal(result.status, 'success');
+  assert.deepEqual(result.result.json, ['delegated:solve:left', 'delegated:solve:right']);
+  assert.deepEqual(seenCalls, [
+    {
+      maxSteps: Number.POSITIVE_INFINITY,
+      maxSubcallDepth: 1,
+      prompt: 'solve:left',
+    },
+    {
+      maxSteps: Number.POSITIVE_INFINITY,
+      maxSubcallDepth: 1,
+      prompt: 'solve:right',
+    },
+  ]);
+  assert.equal(maxActiveQueries, 2);
 });
 
 Deno.test('runtime helper input rejects nullish and non-string payloads', async () => {
@@ -1207,7 +1265,10 @@ Deno.test('AoT plugin can use reflective refinement when the first contracted st
   assert.match(llmPrompts[0] ?? '', /"launches"/u);
   assert.equal(llmPrompts.filter((prompt) => prompt.includes('AOT_REFINE_JSON')).length, 1);
   assert.match(
-    llmPrompts.find((prompt) => prompt.includes('AOT_SOLVE_STATE') && prompt.includes('Using the listed launch dates 2025-01 and 2025-02')) ?? '',
+    llmPrompts.find((prompt) =>
+      prompt.includes('AOT_SOLVE_STATE') &&
+      prompt.includes('Using the listed launch dates 2025-01 and 2025-02')
+    ) ?? '',
     /Using the listed launch dates 2025-01 and 2025-02/u,
   );
   assert.equal(rlmPrompts.length, 0);
@@ -1374,7 +1435,9 @@ Deno.test('AoT plugin can rank multiple accepted next states at the same depth a
     /selected_ids/u,
   );
   assert.match(
-    llmPrompts.find((prompt) => prompt.includes('AOT_SOLVE_STATE') && prompt.includes('Answer using both alpha and beta.')) ?? '',
+    llmPrompts.find((prompt) =>
+      prompt.includes('AOT_SOLVE_STATE') && prompt.includes('Answer using both alpha and beta.')
+    ) ?? '',
     /Answer using both alpha and beta\./u,
   );
   assert.equal(rlmPrompts.length, 0);
@@ -1415,8 +1478,10 @@ Deno.test('AoT plugin can rank accepted candidates globally across multiple fron
         return 'blue';
       }
 
-      if (prompt.includes('AOT_CONTRACT_JSON') && prompt.includes('Candidate sample: 1 / 2') &&
-        prompt.includes('Current question:\nAssemble the final brief.')) {
+      if (
+        prompt.includes('AOT_CONTRACT_JSON') && prompt.includes('Candidate sample: 1 / 2') &&
+        prompt.includes('Current question:\nAssemble the final brief.')
+      ) {
         return JSON.stringify({
           next_question: 'Track red branch.',
           ready: false,
@@ -1424,8 +1489,10 @@ Deno.test('AoT plugin can rank accepted candidates globally across multiple fron
         });
       }
 
-      if (prompt.includes('AOT_CONTRACT_JSON') && prompt.includes('Candidate sample: 2 / 2') &&
-        prompt.includes('Current question:\nAssemble the final brief.')) {
+      if (
+        prompt.includes('AOT_CONTRACT_JSON') && prompt.includes('Candidate sample: 2 / 2') &&
+        prompt.includes('Current question:\nAssemble the final brief.')
+      ) {
         return JSON.stringify({
           next_question: 'Track blue branch.',
           ready: false,
@@ -1493,8 +1560,10 @@ Deno.test('AoT plugin can rank accepted candidates globally across multiple fron
         return 'blue-strong';
       }
 
-      if (prompt.includes('AOT_CONTRACT_JSON') && prompt.includes('Candidate sample: 1 / 2') &&
-        prompt.includes('Current question:\nTrack red branch.')) {
+      if (
+        prompt.includes('AOT_CONTRACT_JSON') && prompt.includes('Candidate sample: 1 / 2') &&
+        prompt.includes('Current question:\nTrack red branch.')
+      ) {
         return JSON.stringify({
           next_question: 'Red child weak.',
           ready: false,
@@ -1502,8 +1571,10 @@ Deno.test('AoT plugin can rank accepted candidates globally across multiple fron
         });
       }
 
-      if (prompt.includes('AOT_CONTRACT_JSON') && prompt.includes('Candidate sample: 2 / 2') &&
-        prompt.includes('Current question:\nTrack red branch.')) {
+      if (
+        prompt.includes('AOT_CONTRACT_JSON') && prompt.includes('Candidate sample: 2 / 2') &&
+        prompt.includes('Current question:\nTrack red branch.')
+      ) {
         return JSON.stringify({
           next_question: 'Red child medium.',
           ready: false,
@@ -1511,8 +1582,10 @@ Deno.test('AoT plugin can rank accepted candidates globally across multiple fron
         });
       }
 
-      if (prompt.includes('AOT_CONTRACT_JSON') && prompt.includes('Candidate sample: 1 / 2') &&
-        prompt.includes('Current question:\nTrack blue branch.')) {
+      if (
+        prompt.includes('AOT_CONTRACT_JSON') && prompt.includes('Candidate sample: 1 / 2') &&
+        prompt.includes('Current question:\nTrack blue branch.')
+      ) {
         return JSON.stringify({
           next_question: 'Blue child medium.',
           ready: false,
@@ -1520,8 +1593,10 @@ Deno.test('AoT plugin can rank accepted candidates globally across multiple fron
         });
       }
 
-      if (prompt.includes('AOT_CONTRACT_JSON') && prompt.includes('Candidate sample: 2 / 2') &&
-        prompt.includes('Current question:\nTrack blue branch.')) {
+      if (
+        prompt.includes('AOT_CONTRACT_JSON') && prompt.includes('Candidate sample: 2 / 2') &&
+        prompt.includes('Current question:\nTrack blue branch.')
+      ) {
         return JSON.stringify({
           next_question: 'Blue child best.',
           ready: true,
@@ -1709,7 +1784,9 @@ Deno.test('AoT plugin can rank accepted candidates globally across multiple fron
   );
   assert.equal(llmPrompts.filter((prompt) => prompt.includes('AOT_FRONTIER_JSON')).length, 1);
   assert.match(
-    llmPrompts.find((prompt) => prompt.includes('AOT_FRONTIER_JSON') && prompt.includes('Red child weak.')) ?? '',
+    llmPrompts.find((prompt) =>
+      prompt.includes('AOT_FRONTIER_JSON') && prompt.includes('Red child weak.')
+    ) ?? '',
     /"selected_ids": \[/u,
   );
   assert.equal(rlmPrompts.length, 0);
@@ -1741,7 +1818,9 @@ Deno.test('AoT plugin keeps exploring the beam when a ready candidate is selecte
         });
       }
 
-      if (prompt.includes('AOT_ATOM_SOLVE') && prompt.includes('What evidence is already available?')) {
+      if (
+        prompt.includes('AOT_ATOM_SOLVE') && prompt.includes('What evidence is already available?')
+      ) {
         return 'core-evidence';
       }
 
@@ -1955,22 +2034,33 @@ Deno.test('AoT plugin keeps exploring the beam when a ready candidate is selecte
     /"pathScore": 0/u,
   );
   assert.match(
-    llmPrompts.find((prompt) => prompt.includes('Best final answer.') && prompt.includes('AOT_SOLVE_STATE')) ?? '',
+    llmPrompts.find((prompt) =>
+      prompt.includes('Best final answer.') && prompt.includes('AOT_SOLVE_STATE')
+    ) ?? '',
     /Best final answer\./u,
   );
   assert.equal(rlmPrompts.length, 0);
 });
 
-Deno.test('llm_query_batched resolves plain subcalls in input order', async () => {
+Deno.test('llm_query_batched starts plain subcalls concurrently while preserving input order', async () => {
   const journalPath = await createSessionPath('llm-query-batched');
   const seenPrompts: string[] = [];
+  let activeQueries = 0;
+  let maxActiveQueries = 0;
   const session = await ReplSession.open({
     clock: createClock(),
     idGenerator: createIdGenerator(),
     journalPath,
     llmQueryHandler: async (prompt) => {
+      activeQueries += 1;
+      maxActiveQueries = Math.max(maxActiveQueries, activeQueries);
       seenPrompts.push(prompt);
-      return `echo:${prompt}`;
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return `echo:${prompt}`;
+      } finally {
+        activeQueries -= 1;
+      }
     },
   });
 
@@ -1985,18 +2075,28 @@ Deno.test('llm_query_batched resolves plain subcalls in input order', async () =
     'echo:gamma',
   ]);
   assert.deepEqual(seenPrompts, ['alpha', 'beta', 'gamma']);
+  assert.equal(maxActiveQueries, 3);
 });
 
-Deno.test('rlm_query_batched resolves delegated subcalls in input order', async () => {
+Deno.test('rlm_query_batched starts delegated subcalls concurrently while preserving input order', async () => {
   const journalPath = await createSessionPath('rlm-query-batched');
   const seenPrompts: Array<string | { task: string }> = [];
+  let activeQueries = 0;
+  let maxActiveQueries = 0;
   const session = await ReplSession.open({
     clock: createClock(),
     idGenerator: createIdGenerator(),
     journalPath,
     rlmQueryHandler: async (prompt) => {
+      activeQueries += 1;
+      maxActiveQueries = Math.max(maxActiveQueries, activeQueries);
       seenPrompts.push(typeof prompt === 'string' ? prompt : { task: prompt.task });
-      return typeof prompt === 'string' ? `delegated:${prompt}` : { task: prompt.task, ok: true };
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return typeof prompt === 'string' ? `delegated:${prompt}` : { task: prompt.task, ok: true };
+      } finally {
+        activeQueries -= 1;
+      }
     },
   });
 
@@ -2014,6 +2114,7 @@ Deno.test('rlm_query_batched resolves delegated subcalls in input order', async 
     'pick dossier',
     { task: 'pick stamp' },
   ]);
+  assert.equal(maxActiveQueries, 2);
 });
 
 Deno.test('batched query helpers reject invalid prompt collections defensively', async () => {
@@ -2782,6 +2883,16 @@ hits.slice(0, 10).map((hit) => hit.contextText).join("\\n---\\n");
   assert.doesNotThrow(() => new Function(transformed));
 });
 
+Deno.test('worker runtime persistent transform preserves regex literals without flags', () => {
+  const transformed = __workerRuntimeTestables.buildPersistentCellCode(`
+const directPattern = /safe handoff/;
+directPattern.test("safe handoff");
+`);
+
+  assert.match(transformed, /directPattern = \/safe handoff\/;/u);
+  assert.doesNotThrow(() => new Function(transformed));
+});
+
 Deno.test('direct sandbox helper executes a cell in the default worker runtime', async () => {
   const result = await executeCellInSandbox({
     context: null,
@@ -2793,6 +2904,113 @@ Deno.test('direct sandbox helper executes a cell in the default worker runtime',
 
   assert.equal(result.status, 'success');
   assert.equal(result.result.preview, '2');
+});
+
+Deno.test('direct sandbox helper revokes worker source handles when construction fails', async () => {
+  const originalWorker = globalThis.Worker;
+
+  try {
+    Object.defineProperty(globalThis, 'Worker', {
+      configurable: true,
+      value: class {
+        constructor() {
+          throw new Error('worker construction failed');
+        }
+      },
+      writable: true,
+    });
+
+    await assert.rejects(
+      () =>
+        executeCellInSandbox({
+          context: null,
+          currentCode: '1 + 1',
+          history: [],
+          replayCells: [],
+          timeoutMs: 100,
+        }),
+      /worker construction failed/u,
+    );
+  } finally {
+    Object.defineProperty(globalThis, 'Worker', {
+      configurable: true,
+      value: originalWorker,
+      writable: true,
+    });
+  }
+});
+
+Deno.test('persistent runtime can execute through its default worker factory', async () => {
+  const runtime = new PersistentSandboxRuntime({ context: null });
+
+  try {
+    const result = await runtime.execute({
+      code: 'FINAL_VAR(7);',
+      history: [],
+      timeoutMs: 1_000,
+    });
+
+    assert.equal(result.status, 'success');
+    assert.equal(result.finalAnswer, '7');
+  } finally {
+    await runtime.close?.();
+  }
+});
+
+Deno.test('persistent runtime default worker factory revokes handles when construction fails', async () => {
+  const originalWorker = globalThis.Worker;
+  const runtime = new PersistentSandboxRuntime({ context: null });
+
+  try {
+    Object.defineProperty(globalThis, 'Worker', {
+      configurable: true,
+      value: class {
+        constructor() {
+          throw new Error('persistent worker construction failed');
+        }
+      },
+      writable: true,
+    });
+
+    await assert.rejects(
+      () => runtime.execute({ code: '1 + 1', history: [], timeoutMs: 100 }),
+      /persistent worker construction failed/u,
+    );
+  } finally {
+    Object.defineProperty(globalThis, 'Worker', {
+      configurable: true,
+      value: originalWorker,
+      writable: true,
+    });
+    await runtime.close?.();
+  }
+});
+
+Deno.test('persistent runtime helper source supports finite nested budgets and timeout guards', async () => {
+  const runtime = new PersistentSandboxRuntime({
+    context: null,
+    runtimeHelpers: [{
+      description: 'Echoes text with explicit nested budget and timeout guard.',
+      inputKinds: ['text'],
+      name: 'finite_timeout_helper',
+      rlmQueryMaxSteps: 3,
+      source: 'return input;',
+      timeoutMs: 100,
+    }],
+  });
+
+  try {
+    const result = await runtime.execute({
+      code: 'const echoed = await finite_timeout_helper("ok"); FINAL_VAR(echoed);',
+      history: [],
+      timeoutMs: 1_000,
+    });
+
+    assert.equal(result.status, 'success');
+    assert.equal(result.finalAnswer, 'ok');
+  } finally {
+    await runtime.close?.();
+  }
 });
 
 Deno.test('direct sandbox helper fails clearly when the runtime has no global Worker constructor', async () => {

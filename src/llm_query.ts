@@ -15,6 +15,7 @@ import type {
   JsonObject,
   JsonValue,
   LLMQueryHandler,
+  QueryTraceEntry,
   RLMDelegationRequest,
   RLMExpectContract,
   RLMExpectInput,
@@ -23,7 +24,6 @@ import type {
   RLMQueryHandler,
   RLMQueryInput,
   RLMUsageSummary,
-  QueryTraceEntry,
 } from './types.ts';
 
 export { createSubqueryJournalPath } from './subquery_path.ts';
@@ -111,13 +111,11 @@ export type NestedRLMRunner = (
  * ```ts
  * const completion: PlainLLMQueryCompletion = {
  *   model: 'gpt-5-mini',
- *   turnState: { cursor: 'opaque-provider-state' },
  * };
  * ```
  */
 export interface PlainLLMQueryCompletion {
   model: string;
-  turnState?: unknown;
   usage?: LLMUsage;
 }
 
@@ -920,7 +918,6 @@ export function createLLMQueryHandler(options: LLMQueryBridgeOptions): LLMQueryH
 
       await options.onComplete?.({
         model: options.subModel,
-        turnState: completion.turnState,
         usage: completion.usage,
       });
       await options.onTrace?.({
@@ -977,7 +974,6 @@ export function createLLMQueryHandler(options: LLMQueryBridgeOptions): LLMQueryH
  */
 export function createRLMQueryHandler(options: RLMQueryBridgeOptions): RLMQueryHandler {
   let queryCount = 0;
-  let pendingRun = Promise.resolve();
   const clock = options.clock ?? (() => new Date());
 
   return async (prompt: RLMQueryInput, invocationOptions = {}) => {
@@ -1071,10 +1067,7 @@ export function createRLMQueryHandler(options: RLMQueryBridgeOptions): RLMQueryH
       }
     };
 
-    const previousRun = pendingRun;
-    const currentRun = previousRun.catch(() => undefined).then(run);
-    pendingRun = currentRun.then(() => undefined, () => undefined);
-    return await currentRun;
+    return await run();
   };
 }
 

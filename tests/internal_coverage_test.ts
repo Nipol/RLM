@@ -931,6 +931,7 @@ Deno.test('worker runtime helpers cover stale worker detection and pending-query
 
 Deno.test('worker runtime helper internals cover regex-literal heuristics and default helper input kinds', () => {
   assert.equal(__workerRuntimeTestables.startsRegexLiteral('/abc/', 0), true);
+  assert.equal(__workerRuntimeTestables.startsRegexLiteral('/abc/giu', 0), true);
   assert.equal(__workerRuntimeTestables.startsRegexLiteral('value / other', 6), false);
   assert.equal(__workerRuntimeTestables.startsRegexLiteral('return /abc/', 7), true);
   assert.equal(__workerRuntimeTestables.startsRegexLiteral('items[0] / 2', 9), false);
@@ -954,4 +955,56 @@ Deno.test('worker runtime helper internals cover regex-literal heuristics and de
     }),
     ['object', 'array'],
   );
+
+  let onerror: ((event: ErrorEvent) => void) | null = null;
+  let onmessage: ((event: MessageEvent<unknown>) => void) | null = null;
+  let onmessageerror: ((event: MessageEvent<unknown>) => void) | null = null;
+  let terminateCount = 0;
+  let cleanupCount = 0;
+  const posted: unknown[] = [];
+
+  const wrapped = __workerRuntimeTestables.wrapWorkerWithCleanup({
+    get onerror() {
+      return onerror;
+    },
+    set onerror(value) {
+      onerror = value;
+    },
+    get onmessage() {
+      return onmessage;
+    },
+    set onmessage(value) {
+      onmessage = value;
+    },
+    get onmessageerror() {
+      return onmessageerror;
+    },
+    set onmessageerror(value) {
+      onmessageerror = value;
+    },
+    postMessage(message: unknown): void {
+      posted.push(message);
+    },
+    terminate(): void {
+      terminateCount += 1;
+    },
+  }, () => {
+    cleanupCount += 1;
+  });
+  const handleError = () => undefined;
+  const handleMessage = () => undefined;
+  const handleMessageError = () => undefined;
+
+  wrapped.onerror = handleError;
+  wrapped.onmessage = handleMessage;
+  wrapped.onmessageerror = handleMessageError;
+  wrapped.postMessage('ping');
+  wrapped.terminate();
+
+  assert.equal(wrapped.onerror, handleError);
+  assert.equal(wrapped.onmessage, handleMessage);
+  assert.equal(wrapped.onmessageerror, handleMessageError);
+  assert.deepEqual(posted, ['ping']);
+  assert.equal(terminateCount, 1);
+  assert.equal(cleanupCount, 1);
 });

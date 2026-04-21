@@ -22,6 +22,10 @@ Deno.test('system prompts load from embedded markdown source and render injected
   assert.match(rootPrompt, /\*\*문제 분해:\*\*/u);
   assert.match(rootPrompt, /프로그래밍 가능한 전략/u);
   assert.doesNotMatch(rootPrompt, /\{\{MAX_STEPS_SENTENCE\}\}/u);
+  assert.equal(
+    await buildRLMSystemPrompt({ markdown: 'known={{MAX_STEPS_SENTENCE}}\nunknown={{UNKNOWN_TOKEN}}' }),
+    'known=\nunknown=',
+  );
   assert.match(markdown, /^# Recursive Language Agent/mu);
   assert.equal(markdown, DEFAULT_RLM_SYSTEM_PROMPT_MARKDOWN);
 
@@ -29,7 +33,7 @@ Deno.test('system prompts load from embedded markdown source and render injected
   assert.doesNotMatch(childPrompt, /# Root Controller/u);
   assert.doesNotMatch(childPrompt, /# Focused Child Controller/u);
   assert.match(injectedPrompt, /^# 사용자 정의 시스템/mu);
-  assert.match(injectedPrompt, /사용할 수 있는 최대 단계 예산은 3입니다\./u);
+  assert.doesNotMatch(injectedPrompt, /사용할 수 있는 최대 단계 예산/u);
   assert.match(injectedPrompt, /동적 프롬프트입니다\./u);
 });
 
@@ -89,6 +93,55 @@ Deno.test('surfaced execution feedback renders as plain-text transcript sections
   assert.match(record, /Project Selene/u);
 });
 
+Deno.test('surfaced execution feedback renders empty result previews explicitly', () => {
+  const record = __rlmPromptTestables.buildExecutionFeedbackText(
+    1,
+    1,
+    {
+      code: 'undefined',
+      finalAnswer: null,
+      resultPreview: '',
+      status: 'success',
+      stderr: '',
+      stdout: '',
+    },
+    240,
+  );
+
+  assert.match(record, /REPL 결과:\n\n```text\n\(비어 있음\)\n```/u);
+});
+
+Deno.test('prompt value stringification falls back for non-JSON defensive inputs', () => {
+  assert.equal(__rlmPromptTestables.stringifyPromptValue(undefined), null);
+  assert.equal(
+    __rlmPromptTestables.stringifyPromptValue(Symbol('not-json') as never),
+    'Symbol(not-json)',
+  );
+});
+
+Deno.test('execution feedback input is explicitly framed as runtime output', () => {
+  const input = __rlmPromptTestables.buildRLMExecutionFeedbackInput({
+    evaluatorFeedback: 'Prefer the surfaced pivot.',
+    executions: [{
+      code: '({ pivot: "Project Selene" })',
+      finalAnswer: null,
+      resultPreview: '{"pivot":"Project Selene"}',
+      status: 'success',
+      stderr: '',
+      stdout: 'Project Selene',
+    }],
+    outputCharLimit: 240,
+    step: 2,
+  });
+
+  assert.match(input, /^## REPL 코드 실행 결과/mu);
+  assert.match(input, /새로운 사용자 요청이 아닙니다/u);
+  assert.match(input, /REPL 코드:/u);
+  assert.match(input, /Project Selene/u);
+  assert.match(input, /Evaluator Feedback/u);
+  assert.match(input, /Prefer the surfaced pivot/u);
+});
+
 Deno.test('root turn input reflects the current compact prompt shape', () => {
   const input = buildRLMTurnInput({
     context: {
@@ -120,8 +173,13 @@ Deno.test('root turn input reflects the current compact prompt shape', () => {
   });
 
   assert.match(input, /## REPL 목표 :\nFind the dossier for the moon garden initiative\./u);
-  assert.match(input, /질문형 문맥 필드:\n- question: Which dossier now contains the moon garden initiative\?/u);
-  assert.match(input, /단계 예산: 2 \/ 6/u);
+  assert.match(input, /## 사용 가능한 런타임 문맥/u);
+  assert.match(input, /document: string/u);
+  assert.match(
+    input,
+    /질문형 문맥 필드:\n- question: Which dossier now contains the moon garden initiative\?/u,
+  );
+  assert.doesNotMatch(input, /단계 예산/u);
   assert.doesNotMatch(input, /## REPL 기록 형식/u);
   assert.doesNotMatch(input, /## 최신 REPL 실행/u);
   assert.doesNotMatch(input, /## 이전 REPL 기록/u);
@@ -167,7 +225,7 @@ Deno.test('delegated turn input keeps recursive note and plain feedback format',
   assert.match(input, /좁힌 row를 고르거나 넘길 때 그 원본 필드 이름을 유지/u);
   assert.doesNotMatch(input, /## REPL 기록 형식/u);
   assert.doesNotMatch(input, /다음 행동:/u);
-  assert.match(input, /단계 예산: undefined \/ undefined/u);
+  assert.doesNotMatch(input, /단계 예산/u);
 });
 
 Deno.test('turn input no longer injects large-context or recovery banners', () => {
@@ -217,7 +275,7 @@ Deno.test('root turn input keeps the current compact shape even after a failed f
     }],
   });
 
-  assert.match(input, /단계 예산: 2 \/ 3/u);
+  assert.doesNotMatch(input, /단계 예산/u);
   assert.match(input, /## REPL 목표 :\nExtract the approved amount\./u);
   assert.doesNotMatch(input, /## 최신 REPL 실행/u);
   assert.doesNotMatch(input, /채택된 최종 답: undefined/u);

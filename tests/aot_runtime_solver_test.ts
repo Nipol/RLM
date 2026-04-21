@@ -469,6 +469,29 @@ Deno.test('expandFrontierNode covers atomic, no-independent, and refinement-acce
   });
 });
 
+Deno.test('expandFrontierNode covers atomic fallback reasons without appending trace', async () => {
+  await withAoTRuntimeMocks({
+    llm_query: async (prompt) => {
+      if (prompt.includes('AOT_DECOMPOSE_JSON') && prompt.includes('Current question:\nAtomic fallback?')) {
+        return '{"atomic":true,"reason":"","subquestions":[]}';
+      }
+      if (prompt.includes('AOT_SOLVE_STATE') && prompt.includes('Current Markov state:\nAtomic fallback?')) {
+        return 'atomic fallback answer';
+      }
+      throw new Error(`Unexpected llm_query prompt: ${prompt}`);
+    },
+  }, async () => {
+    const result = await expandFrontierNode(
+      { path: [], question: 'Atomic fallback?', score: 0 },
+      1,
+      baseConfig({ includeTrace: false, question: 'Original?' }),
+    );
+    assert.equal(result.acceptedCandidates.length, 0);
+    assert.equal(result.completedCandidates[0]?.stoppedBecause, 'atomic');
+    assert.deepEqual(result.completedCandidates[0]?.path, []);
+  });
+});
+
 Deno.test('expandFrontierNode covers judge-terminated candidates', async () => {
   await withAoTRuntimeMocks({
     llm_query: async (prompt) => {
@@ -504,6 +527,94 @@ Deno.test('expandFrontierNode covers judge-terminated candidates', async () => {
     assert.equal(result.acceptedCandidates.length, 0);
     assert.equal(result.completedCandidates.length, 1);
     assert.equal(result.completedCandidates[0]?.stoppedBecause, 'judge_terminated');
+  });
+});
+
+Deno.test('AoT lite entrypoint can suppress trace across atomic, no-independent, ready, and max-iteration exits', async () => {
+  await withAoTRuntimeMocks({
+    llm_query: async (prompt) => {
+      if (prompt.includes('AOT_DECOMPOSE_JSON') && prompt.includes('Current question:\nLite atomic fallback?')) {
+        return '{"atomic":true,"reason":"","subquestions":[]}';
+      }
+      if (prompt.includes('AOT_SOLVE_STATE') && prompt.includes('Current Markov state:\nLite atomic fallback?')) {
+        return 'lite atomic fallback answer';
+      }
+
+      if (prompt.includes('AOT_DECOMPOSE_JSON') && prompt.includes('Current question:\nLite no trace no-independent?')) {
+        return '{"atomic":false,"reason":"cyclic","subquestions":[{"id":"q1","question":"Later one?","deps":["q2"]},{"id":"q2","question":"Later two?","deps":["q1"]}]}';
+      }
+      if (prompt.includes('AOT_SOLVE_STATE') && prompt.includes('Current Markov state:\nLite no trace no-independent?')) {
+        return 'lite no trace no-independent answer';
+      }
+
+      if (prompt.includes('AOT_DECOMPOSE_JSON') && prompt.includes('Current question:\nLite no trace ready?')) {
+        return '{"atomic":false,"reason":"split","subquestions":[{"id":"q1","question":"Why ready?","deps":[]}]}';
+      }
+      if (prompt.includes('AOT_ATOM_SOLVE') && prompt.includes('Atomic subquestion:\nWhy ready?')) {
+        return 'because ready';
+      }
+      if (prompt.includes('AOT_CONTRACT_JSON') && prompt.includes('Current question:\nLite no trace ready?')) {
+        return '{"next_question":"Lite no trace final?","ready":true,"reason":"done"}';
+      }
+      if (prompt.includes('AOT_SOLVE_STATE') && prompt.includes('Current Markov state:\nLite no trace final?')) {
+        return 'lite no trace ready answer';
+      }
+
+      if (prompt.includes('AOT_DECOMPOSE_JSON') && prompt.includes('Current question:\nLite no trace continue?')) {
+        return '{"atomic":false,"reason":"split","subquestions":[{"id":"q1","question":"Why continue?","deps":[]}]}';
+      }
+      if (prompt.includes('AOT_ATOM_SOLVE') && prompt.includes('Atomic subquestion:\nWhy continue?')) {
+        return 'because continue';
+      }
+      if (prompt.includes('AOT_CONTRACT_JSON') && prompt.includes('Current question:\nLite no trace continue?')) {
+        return '{"next_question":"Lite no trace next?","ready":false,"reason":"keep going"}';
+      }
+      if (prompt.includes('AOT_SOLVE_STATE') && prompt.includes('Current Markov state:\nLite no trace next?')) {
+        return 'lite no trace max answer';
+      }
+
+      throw new Error(`Unexpected llm_query prompt: ${prompt}`);
+    },
+  }, async () => {
+    const atomic = await runAOTLiteHelperFromConfig(baseConfig({
+      includeTrace: false,
+      maxIterations: 1,
+      question: 'Lite atomic fallback?',
+    }));
+    assert.equal(atomic.stoppedBecause, 'lite_atomic');
+    assert.deepEqual(atomic.iterations, []);
+
+    const atomicWithTrace = await runAOTLiteHelperFromConfig(baseConfig({
+      includeTrace: true,
+      maxIterations: 1,
+      question: 'Lite atomic fallback?',
+    }));
+    assert.equal(atomicWithTrace.stoppedBecause, 'lite_atomic');
+    assert.match(JSON.stringify(atomicWithTrace.iterations), /Question was already atomic/u);
+
+    const noIndependent = await runAOTLiteHelperFromConfig(baseConfig({
+      includeTrace: false,
+      maxIterations: 1,
+      question: 'Lite no trace no-independent?',
+    }));
+    assert.equal(noIndependent.stoppedBecause, 'lite_no_independent_subquestion');
+    assert.deepEqual(noIndependent.iterations, []);
+
+    const ready = await runAOTLiteHelperFromConfig(baseConfig({
+      includeTrace: false,
+      maxIterations: 1,
+      question: 'Lite no trace ready?',
+    }));
+    assert.equal(ready.stoppedBecause, 'lite_ready');
+    assert.deepEqual(ready.iterations, []);
+
+    const maxIterations = await runAOTLiteHelperFromConfig(baseConfig({
+      includeTrace: false,
+      maxIterations: 1,
+      question: 'Lite no trace continue?',
+    }));
+    assert.equal(maxIterations.stoppedBecause, 'lite_max_iterations');
+    assert.deepEqual(maxIterations.iterations, []);
   });
 });
 
@@ -645,6 +756,15 @@ Deno.test('AoT runtime entrypoints cover lite atomic, lite no-independent, hard 
     }));
     assert.equal(hardCompleted.answer, 'hard completed answer');
     assert.equal(hardCompleted.stoppedBecause, 'atomic');
+
+    const hardCompletedNoTrace = await runAOTHardHelperFromConfig(baseConfig({
+      includeTrace: false,
+      maxIterations: 1,
+      question: 'Hard completed?',
+      transitionSamples: 2,
+    }));
+    assert.equal(hardCompletedNoTrace.answer, 'hard completed answer');
+    assert.deepEqual(hardCompletedNoTrace.iterations, []);
 
     const hardContinue = await runAOTHardHelperFromConfig(baseConfig({
       maxIterations: 1,

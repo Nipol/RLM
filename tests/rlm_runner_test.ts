@@ -106,7 +106,7 @@ Deno.test('runner executes a repl turn and returns the final answer captured ins
   assert.equal('responseId' in result, false);
 });
 
-Deno.test('runner keeps provider turnState opaque and forwards it across root turns', async () => {
+Deno.test('runner sends append-only messages across root turns without provider turnState', async () => {
   const llm = new MockCaller([
     {
       outputText: '```repl\nconst subtotal = 40 + 2;\nsubtotal\n```',
@@ -132,12 +132,24 @@ Deno.test('runner keeps provider turnState opaque and forwards it across root tu
   });
 
   assert.equal(result.answer, '50');
-  assert.match(llm.requests[0]?.input ?? '', /단계 예산: 1 \/ 3/u);
-  assert.match(llm.requests[1]?.input ?? '', /단계 예산: 2 \/ 3/u);
+  assert.doesNotMatch(llm.requests[0]?.input ?? '', /단계 예산/u);
+  assert.doesNotMatch(llm.requests[1]?.input ?? '', /단계 예산/u);
   assert.match(llm.requests[0]?.systemPrompt ?? '', /^# Recursive Language Agent/mu);
   assert.match(llm.requests[1]?.systemPrompt ?? '', /^# Recursive Language Agent/mu);
   assert.equal(llm.requests[0]?.turnState, undefined);
-  assert.deepEqual(llm.requests[1]?.turnState, { opaque: 'root-1' });
+  assert.equal(llm.requests[1]?.turnState, undefined);
+  assert.equal(llm.requests[0]?.messages?.length, 1);
+  assert.equal(llm.requests[0]?.messages?.[0]?.role, 'user');
+  assert.match(llm.requests[0]?.messages?.[0]?.content ?? '', /## REPL 목표 :\nAdd eight/u);
+  assert.match(llm.requests[0]?.messages?.[0]?.content ?? '', /## 사용 가능한 런타임 문맥/u);
+  assert.equal(llm.requests[1]?.messages?.length, 3);
+  assert.equal(llm.requests[1]?.messages?.[0]?.role, 'user');
+  assert.equal(llm.requests[1]?.messages?.[1]?.role, 'assistant');
+  assert.match(llm.requests[1]?.messages?.[1]?.content ?? '', /const subtotal = 40 \+ 2/u);
+  assert.equal(llm.requests[1]?.messages?.[2]?.role, 'user');
+  assert.match(llm.requests[1]?.messages?.[2]?.content ?? '', /REPL 코드 실행 결과/u);
+  assert.match(llm.requests[1]?.messages?.[2]?.content ?? '', /새로운 사용자 요청이 아닙니다/u);
+  assert.match(llm.requests[1]?.messages?.[2]?.content ?? '', /42/u);
 });
 
 Deno.test('runner helper utilities cover limit resolution, final acceptance, and abort handling', () => {
@@ -200,6 +212,16 @@ Deno.test('runner helper utilities cover limit resolution, final acceptance, and
       },
     ]),
     '{"childExtracted":"42"}\n',
+  );
+  assert.equal(
+    __rlmRunnerTestables.readLatestAcceptedFinalStdout([
+      {
+        finalAnswer: null,
+        status: 'success',
+        stdout: 'intermediate\n',
+      },
+    ]),
+    '',
   );
   assert.equal(__rlmRunnerTestables.isLikelyMultipleChoiceAnswer('A'), true);
   assert.equal(__rlmRunnerTestables.isLikelyMultipleChoiceAnswer('AA'), false);
@@ -277,7 +299,8 @@ Deno.test('runner helper utilities cover limit resolution, final acceptance, and
     __rlmRunnerTestables.readCompetingTargetCandidates({
       context: {
         document: 'alpha '.repeat(4_000),
-        question: 'Which stamp identifier seals the outgoing manifests for the courier carrying the cobalt envelope?',
+        question:
+          'Which stamp identifier seals the outgoing manifests for the courier carrying the cobalt envelope?',
       },
       execution: {
         resultPreview: 'undefined',
@@ -298,6 +321,12 @@ Deno.test('runner helper utilities cover limit resolution, final acceptance, and
   assert.equal(
     __rlmRunnerTestables.usesFirstCandidateFinalWithoutUniquenessGuard(
       'FINAL_VAR(candidates[0] || "");',
+    ),
+    true,
+  );
+  assert.equal(
+    __rlmRunnerTestables.usesFirstCandidateFinalWithoutUniquenessGuard(
+      'const selected = rows.find((row) => row.active) ?? rows[0]; FINAL_VAR(selected);',
     ),
     true,
   );
@@ -328,6 +357,10 @@ Deno.test('runner helper utilities cover limit resolution, final acceptance, and
       ].join('\n'),
     ),
     '7318452',
+  );
+  assert.equal(
+    __rlmRunnerTestables.readTruncatedScalarPrefixFromEvidence('abcd', '!!!'),
+    null,
   );
   assert.equal(
     __rlmRunnerTestables.summarizeWeakFinalization({
@@ -367,7 +400,8 @@ Deno.test('runner helper utilities cover limit resolution, final acceptance, and
     __rlmRunnerTestables.summarizeWeakFinalization({
       context: {
         document: 'alpha '.repeat(4_000),
-        question: 'Which stamp identifier seals the outgoing manifests for the courier carrying the cobalt envelope?',
+        question:
+          'Which stamp identifier seals the outgoing manifests for the courier carrying the cobalt envelope?',
       },
       execution: {
         code:
@@ -449,6 +483,30 @@ Deno.test('runner helper utilities cover limit resolution, final acceptance, and
       totalSteps: 3,
     }),
     /단계 예산:/u,
+  );
+  assert.match(
+    __rlmRunnerTestables.buildEvaluatorInput({
+      assistantText: '```repl\nFINAL_VAR("ok");\n```',
+      executions: [
+        {
+          code: 'FINAL_VAR("ok");',
+          finalAnswer: 'ok',
+          resultPreview: '"ok"',
+          resultSignals: [
+            {
+              preview: 'ok',
+            },
+          ],
+          status: 'success',
+          stderr: '',
+          stdout: '',
+        },
+      ],
+      prompt: 'Return ok.',
+      step: 1,
+      totalSteps: 3,
+    }),
+    /관찰된 값:\n\$ \(알 수 없음\): ok/u,
   );
   assert.deepEqual(
     __rlmRunnerTestables.readContextOptions({
@@ -678,7 +736,10 @@ Deno.test('runner evidence helpers cover null contexts, embedded string document
   assert.deepEqual(
     __rlmRunnerTestables.collectRequestedEntityLabels(
       'Return only the exact final requested dossier name through FINAL_VAR.',
-      { question: 'Which exact final requested dossier name is assigned to the moon garden initiative?' },
+      {
+        question:
+          'Which exact final requested dossier name is assigned to the moon garden initiative?',
+      },
     ),
     ['exact final requested dossier name', 'dossier name', 'dossier'],
   );
@@ -704,6 +765,7 @@ Deno.test('runner evidence helpers cover null contexts, embedded string document
     },
   );
   assert.equal(__rlmRunnerTestables.readAvailableOptions({ document: 'no options here' }), null);
+  assert.equal(__rlmRunnerTestables.readAvailableOptions({ note: 'no document' } as never), null);
 
   assert.equal(
     __rlmRunnerTestables.matchOptionFromEvidence(
@@ -720,6 +782,41 @@ Deno.test('runner evidence helpers cover null contexts, embedded string document
       },
     ),
     null,
+  );
+  assert.equal(
+    __rlmRunnerTestables.matchOptionFromEvidence(
+      'Return the multiple-choice option letter.',
+      {
+        options: {
+          A: 'west route',
+          B: 'east route',
+        },
+      },
+      {
+        resultPreview: 'west route east route',
+        stdout: '',
+      },
+    ),
+    null,
+  );
+  assert.deepEqual(
+    __rlmRunnerTestables.matchOptionFromEvidence(
+      'Return the multiple-choice option letter.',
+      {
+        options: {
+          A: 'west route',
+          B: 'east route',
+        },
+      },
+      {
+        resultPreview: 'west route only',
+        stdout: '',
+      },
+    ),
+    {
+      label: 'A',
+      text: 'west route',
+    },
   );
   assert.deepEqual(
     __rlmRunnerTestables.matchOptionFromTranscriptEvidence(
@@ -740,6 +837,48 @@ Deno.test('runner evidence helpers cover null contexts, embedded string document
           ],
         },
       ],
+    ),
+    {
+      label: 'B',
+      text: 'bundle B',
+    },
+  );
+  assert.equal(
+    __rlmRunnerTestables.matchOptionFromTranscriptEvidence(
+      'Return the option letter.',
+      {
+        options: {
+          A: 'bundle A',
+          B: 'bundle B',
+        },
+      },
+      [
+        {
+          executions: [
+            {
+              resultPreview: 'bundle A and bundle B were both observed',
+              stdout: '',
+            },
+          ],
+        },
+      ],
+    ),
+    null,
+  );
+  assert.deepEqual(
+    __rlmRunnerTestables.matchOptionFromEvidence(
+      'Return the option letter.',
+      {
+        options: {
+          A: 'bundle A',
+          B: 'bundle B',
+        },
+      },
+      {
+        resultPreview: 'undefined',
+        resultSignals: [{ preview: 'bundle B' }],
+        stdout: '',
+      },
     ),
     {
       label: 'B',
@@ -965,6 +1104,7 @@ Deno.test('runner evidence helpers cover null contexts, embedded string document
     ),
     false,
   );
+  assert.equal(__rlmRunnerTestables.isScalarLikeTask('Explain generally.', null), false);
   assert.equal(
     __rlmRunnerTestables.isScalarLikeTask(
       'Pick the correct option.',
@@ -1055,6 +1195,42 @@ Deno.test('runner evaluator helper returns undefined before calling the evaluato
     undefined,
   );
   assert.equal(llmCalls, 0);
+
+  let evaluatorRequest: LLMCallerRequest | undefined;
+  const whitespaceEvaluator: LLMCaller = {
+    complete: async (request) => {
+      evaluatorRequest = request;
+      return { outputText: '   ' };
+    },
+  };
+  const completedModels: string[] = [];
+
+  assert.equal(
+    await __rlmRunnerTestables.generateEvaluatorFeedback({
+      assistantText: '```repl\nFINAL_VAR("ok");\n```',
+      depth: 0,
+      evaluator: { enabled: true, model: 'gpt-5-evaluator' },
+      executions: [{
+        code: 'FINAL_VAR("ok");',
+        finalAnswer: 'ok',
+        resultPreview: '"ok"',
+        status: 'success',
+        stderr: '',
+        stdout: '',
+      }],
+      llm: whitespaceEvaluator,
+      onComplete: (_response, model) => {
+        completedModels.push(model);
+      },
+      prompt: 'Return ok.',
+      step: 1,
+      totalSteps: 3,
+    }),
+    undefined,
+  );
+  assert.equal(evaluatorRequest?.model, 'gpt-5-evaluator');
+  assert.match(evaluatorRequest?.systemPrompt ?? '', /240자 이내/u);
+  assert.deepEqual(completedModels, ['gpt-5-evaluator']);
 });
 
 Deno.test('runner appends query trace entries when tracing is enabled', async () => {
@@ -1160,7 +1336,7 @@ Deno.test('OpenAI provider helper utilities cover provider-aware timeout and log
   assert.equal((logger as { path?: string }).path, journalPath);
 });
 
-Deno.test('runner keeps later root turns compact instead of replaying execution feedback', async () => {
+Deno.test('runner appends prior assistant code and execution feedback into later root turns', async () => {
   const adapter = new MockCaller([
     {
       outputText: '```repl\nconst subtotal = 40 + 2;\nsubtotal\n```',
@@ -1188,13 +1364,18 @@ Deno.test('runner keeps later root turns compact instead of replaying execution 
   });
 
   assert.equal(result.answer, '50');
-  assert.match(adapter.requests[1]?.input ?? '', /단계 예산: 2 \/ 3/u);
-  assert.match(adapter.requests[1]?.input ?? '', /## REPL 목표 :\nAdd eight after the first computation\./u);
-  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /42/u);
-  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /success/u);
+  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /단계 예산/u);
+  assert.match(
+    adapter.requests[1]?.input ?? '',
+    /## REPL 목표 :\nAdd eight after the first computation\./u,
+  );
+  assert.match(adapter.requests[1]?.input ?? '', /assistant:\n```repl\nconst subtotal = 40 \+ 2/u);
+  assert.match(adapter.requests[1]?.input ?? '', /## REPL 코드 실행 결과/u);
+  assert.match(adapter.requests[1]?.input ?? '', /REPL 결과:[\s\S]*42/u);
+  assert.match(adapter.requests[1]?.input ?? '', /상태: success/u);
 });
 
-Deno.test('runner does not replay nested result signals into the next compact turn input', async () => {
+Deno.test('runner appends result signals into the next root turn input', async () => {
   const adapter = new MockCaller([
     {
       outputText:
@@ -1223,11 +1404,14 @@ Deno.test('runner does not replay nested result signals into the next compact tu
   });
 
   assert.equal(result.answer, 'done');
-  assert.match(adapter.requests[1]?.input ?? '', /단계 예산: 2 \/ 3/u);
-  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /\$\.operatorId \(string\): op-7/u);
-  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /\$\.routing\.lockerId \(string\): locker-9/u);
-  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /\$\.routing\.accessCode \(string\): 7318452/u);
-  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /\$\.routing\.missingLockerId \(undefined\): undefined/u);
+  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /단계 예산/u);
+  assert.match(adapter.requests[1]?.input ?? '', /\$\.operatorId \(string\): op-7/u);
+  assert.match(adapter.requests[1]?.input ?? '', /\$\.routing\.lockerId \(string\): locker-9/u);
+  assert.match(adapter.requests[1]?.input ?? '', /\$\.routing\.accessCode \(string\): 7318452/u);
+  assert.match(
+    adapter.requests[1]?.input ?? '',
+    /\$\.routing\.missingLockerId \(undefined\): undefined/u,
+  );
 });
 
 Deno.test('runner routes llm_query through the sub-model as a plain completion without spawning a nested RLM journal', async () => {
@@ -1339,7 +1523,7 @@ Deno.test('runner surfaces delegated contract mismatches into the next turn so r
 
   assert.equal(result.answer, 'V-554');
   assert.doesNotMatch(adapter.requests[2]?.input ?? '', /위임 계약 복구/u);
-  assert.doesNotMatch(adapter.requests[2]?.input ?? '', /RLMSubqueryContractError/u);
+  assert.match(adapter.requests[2]?.input ?? '', /RLMSubqueryContractError/u);
 });
 
 Deno.test('runner routes rlm_query through the sub-model and records the nested subquery in the journal', async () => {
@@ -1421,6 +1605,27 @@ Deno.test('runner lets a nested rlm_query override the root step budget for the 
 
   assert.equal(result.answer, '42');
   assert.equal(adapter.requests.length, 3);
+  assert.equal(adapter.requests[0]?.kind, 'root_turn');
+  assert.equal(adapter.requests[0]?.messages?.length, 1);
+  assert.equal(adapter.requests[1]?.kind, 'child_turn');
+  assert.deepEqual(adapter.requests[1]?.metadata, { depth: 1, step: 1 });
+  assert.equal(adapter.requests[1]?.messages?.length, 1);
+  assert.match(
+    adapter.requests[1]?.messages?.[0]?.content ?? '',
+    /## REPL 목표 :\nCompute 6 \* 7\./u,
+  );
+  assert.match(
+    adapter.requests[1]?.messages?.[0]?.content ?? '',
+    /## 사용 가능한 런타임 문맥/u,
+  );
+  assert.equal(adapter.requests[2]?.kind, 'child_turn');
+  assert.deepEqual(adapter.requests[2]?.metadata, { depth: 1, step: 2 });
+  assert.equal(adapter.requests[2]?.messages?.length, 3);
+  assert.equal(adapter.requests[2]?.messages?.[1]?.role, 'assistant');
+  assert.match(adapter.requests[2]?.messages?.[1]?.content ?? '', /const scratch = 40 \+ 2/u);
+  assert.equal(adapter.requests[2]?.messages?.[2]?.role, 'user');
+  assert.match(adapter.requests[2]?.messages?.[2]?.content ?? '', /REPL 코드 실행 결과/u);
+  assert.match(adapter.requests[2]?.messages?.[2]?.content ?? '', /undefined/u);
 });
 
 Deno.test('runner keeps root step budget and metadata aligned after an internal rlm_query before the next root turn', async () => {
@@ -1456,27 +1661,26 @@ Deno.test('runner keeps root step budget and metadata aligned after an internal 
   assert.equal(result.answer, '42');
   assert.equal(adapter.requests.length, 3);
 
-  assert.match(adapter.requests[0]?.input ?? '', /단계 예산: 1 \/ 4/u);
+  assert.doesNotMatch(adapter.requests[0]?.input ?? '', /단계 예산/u);
   assert.equal(adapter.requests[0]?.metadata?.step, 1);
   assert.equal(adapter.requests[0]?.metadata?.depth, 0);
 
-  assert.match(adapter.requests[1]?.input ?? '', /단계 예산: 1 \/ 4/u);
+  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /단계 예산/u);
   assert.equal(adapter.requests[1]?.metadata?.step, 1);
   assert.equal(adapter.requests[1]?.metadata?.depth, 1);
 
-  assert.match(adapter.requests[2]?.input ?? '', /단계 예산: 2 \/ 4/u);
+  assert.doesNotMatch(adapter.requests[2]?.input ?? '', /단계 예산/u);
   assert.doesNotMatch(adapter.requests[2]?.input ?? '', /## 이전 REPL 기록/u);
-  assert.doesNotMatch(adapter.requests[2]?.input ?? '', /^REPL 표준 출력:/mu);
-  assert.doesNotMatch(adapter.requests[2]?.input ?? '', /\{"nested":"42"\}/u);
+  assert.match(adapter.requests[2]?.input ?? '', /REPL 표준 출력:/u);
+  assert.match(adapter.requests[2]?.input ?? '', /\{"nested":"42"\}/u);
   assert.equal(adapter.requests[2]?.metadata?.step, 2);
   assert.equal(adapter.requests[2]?.metadata?.depth, 0);
 });
 
-Deno.test('runner does not surface child final stdout into the next root input after rlm_query returns', async () => {
+Deno.test('runner surfaces child final stdout through append-only execution feedback', async () => {
   const adapter = new MockCaller([
     {
-      outputText:
-        '```repl\nconst nested = await rlm_query("Compute 6 * 7.");\n({ nested })\n```',
+      outputText: '```repl\nconst nested = await rlm_query("Compute 6 * 7.");\n({ nested })\n```',
       turnState: 'resp_root_1',
     },
     {
@@ -1503,7 +1707,7 @@ Deno.test('runner does not surface child final stdout into the next root input a
   });
 
   assert.equal(result.answer, '42');
-  assert.doesNotMatch(adapter.requests[2]?.input ?? '', /childExtracted/u);
+  assert.match(adapter.requests[2]?.input ?? '', /childExtracted/u);
 });
 
 Deno.test('runner closes nested child sessions after rlm_query returns so only the root session remains live', async () => {
@@ -1654,13 +1858,14 @@ Deno.test('runner uses an injected system prompt markdown for both root and chil
     prompt: 'Use rlm_query to solve the task.',
     rootModel: 'gpt-5-nano',
     subModel: 'gpt-5-mini',
-    systemPromptMarkdown: '# 사용자 정의 시스템\n{{MAX_STEPS_SENTENCE}}\n이 프롬프트는 동적으로 주입됩니다.',
+    systemPromptMarkdown:
+      '# 사용자 정의 시스템\n{{MAX_STEPS_SENTENCE}}\n이 프롬프트는 동적으로 주입됩니다.',
   });
 
   assert.equal(result.answer, '42');
   assert.match(adapter.requests[0]?.systemPrompt ?? '', /^# 사용자 정의 시스템/mu);
   assert.match(adapter.requests[0]?.systemPrompt ?? '', /이 프롬프트는 동적으로 주입됩니다\./u);
-  assert.match(adapter.requests[0]?.systemPrompt ?? '', /사용할 수 있는 최대 단계 예산은 4입니다\./u);
+  assert.doesNotMatch(adapter.requests[0]?.systemPrompt ?? '', /사용할 수 있는 최대 단계 예산/u);
   assert.match(adapter.requests[1]?.systemPrompt ?? '', /^# 사용자 정의 시스템/mu);
 });
 
@@ -1797,9 +2002,9 @@ Deno.test('runner ignores FINAL_VAR values from a cell that later errors and ask
 
   assert.equal(result.answer, 'fixed');
   assert.equal(result.steps, 2);
-  assert.match(adapter.requests[1]?.input ?? '', /단계 예산: 2 \/ 3/u);
-  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /Error: boom/u);
-  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /^상태: error/mu);
+  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /단계 예산/u);
+  assert.match(adapter.requests[1]?.input ?? '', /Error: boom/u);
+  assert.match(adapter.requests[1]?.input ?? '', /상태: error/u);
 });
 
 Deno.test('runner ignores FINAL_VAR(undefined) and asks the model to keep working', async () => {
@@ -1829,8 +2034,8 @@ Deno.test('runner ignores FINAL_VAR(undefined) and asks the model to keep workin
 
   assert.equal(result.answer, '42');
   assert.equal(result.steps, 2);
-  assert.match(adapter.requests[1]?.input ?? '', /단계 예산: 2 \/ 3/u);
-  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /채택된 최종 답: undefined/u);
+  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /단계 예산/u);
+  assert.match(adapter.requests[1]?.input ?? '', /채택된 최종 답: undefined/u);
 });
 
 Deno.test('runner ignores FINAL_VAR(null) and asks the model to keep working', async () => {
@@ -1860,8 +2065,8 @@ Deno.test('runner ignores FINAL_VAR(null) and asks the model to keep working', a
 
   assert.equal(result.answer, '42');
   assert.equal(result.steps, 2);
-  assert.match(adapter.requests[1]?.input ?? '', /단계 예산: 2 \/ 3/u);
-  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /채택된 최종 답: null/u);
+  assert.doesNotMatch(adapter.requests[1]?.input ?? '', /단계 예산/u);
+  assert.match(adapter.requests[1]?.input ?? '', /채택된 최종 답: null/u);
 });
 
 Deno.test('runner accepts empty finals once execution succeeds under the current compact policy', async () => {
@@ -2324,7 +2529,8 @@ Deno.test('runner continues executing later repl blocks in the same assistant tu
     maxSteps: 3,
     maxSubcallDepth: 1,
     outputCharLimit: 200,
-    prompt: 'Report the failed block in stderr and continue to the trailing block in the same turn.',
+    prompt:
+      'Report the failed block in stderr and continue to the trailing block in the same turn.',
     rootModel: 'gpt-5-nano',
     subModel: 'gpt-5-mini',
   });
@@ -2517,7 +2723,9 @@ Deno.test('runner journaling stays backward-compatible with the existing session
 });
 
 Deno.test('runOpenAIRLM requires explicit OpenAI config instead of reading repository env state', async () => {
-  const runWithoutConfig = runOpenAIRLM as unknown as (options: Record<string, unknown>) => Promise<unknown>;
+  const runWithoutConfig = runOpenAIRLM as unknown as (
+    options: Record<string, unknown>,
+  ) => Promise<unknown>;
 
   await assert.rejects(
     async () =>

@@ -52,3 +52,25 @@ Deno.test('OpenAI provider smoke scenario fetcher rejects unexpected model ids',
     /Unexpected smoke provider model: unknown-model/u,
   );
 });
+
+Deno.test('OpenAI provider smoke scenario records defensive defaults for missing request init', async () => {
+  const result = await runOpenAIProviderSmokeScenario((
+    options: Parameters<typeof createOpenAIRLM>[0],
+  ) => ({
+    async run() {
+      await assert.rejects(
+        () => options.fetcher!('https://api.openai.com/v1/responses'),
+        /Unexpected smoke provider model:/u,
+      );
+      return {
+        answer: 'stub',
+        finalValue: 'stub',
+        session: { close: async () => undefined },
+        steps: 0,
+      };
+    },
+  }));
+
+  assert.deepEqual(result.requestKinds, ['child_turn']);
+  assert.deepEqual(result.urls, ['https://api.openai.com/v1/responses']);
+});

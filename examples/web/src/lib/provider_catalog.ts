@@ -103,11 +103,14 @@ export async function listModelsForDraft(
       throw new Error(`${getProviderLabel(draft.kind)}에서 사용할 수 있는 모델을 찾지 못했습니다.`);
     }
 
-    return {
+    const result = {
       availableModels,
       baseUrl,
     };
+    clearTimeout(timer);
+    return result;
   } catch (error) {
+    clearTimeout(timer);
     if (error instanceof DOMException && error.name === 'AbortError') {
       throw new Error(
         `${getProviderLabel(draft.kind)} 모델 목록 요청이 ${requestTimeoutMs}ms 뒤에 시간 초과되었습니다.`,
@@ -115,7 +118,5 @@ export async function listModelsForDraft(
     }
 
     throw error;
-  } finally {
-    clearTimeout(timer);
   }
 }

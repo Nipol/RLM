@@ -1,15 +1,21 @@
 import assert from 'node:assert/strict';
+import { join } from 'node:path';
 
 import type { LLMCaller } from '../src/llm_adapter.ts';
 import { buildOpenAILiveScenarioCatalog, createOpenAILiveSeed } from './openai_live_scenarios.ts';
 import {
   buildCodexLiveRunOptions,
+  createOpenAILiveJournalPath,
   loadCodexLiveHarness,
   probeCodexLiveProvider,
+  readSubqueryJournals,
   resolveCodexLiveModels,
+  runOpenAILiveScenario,
 } from './openai_live_scenario_support.ts';
 
 Deno.test('createOpenAILiveSeed produces a stable non-zero run seed from the injected source', () => {
+  assert.ok(createOpenAILiveSeed() >= 1);
+  assert.equal(createOpenAILiveSeed(() => undefined as never), 1);
   assert.equal(createOpenAILiveSeed(() => 0), 1);
   assert.equal(createOpenAILiveSeed(() => 53), 53);
   assert.equal(createOpenAILiveSeed(() => 4_294_967_295), 4_294_967_295);
@@ -55,6 +61,83 @@ Deno.test('buildOpenAILiveScenarioCatalog uses one run seed across the unified l
   );
   assert.ok(syntheticFiltering);
   assert.match(syntheticFiltering.name, /seed 4242/u);
+
+  const zeroDerivedSeedCatalog = buildOpenAILiveScenarioCatalog(
+    Math.imul(512, 2654435761) >>> 0,
+  );
+  assert.ok(
+    zeroDerivedSeedCatalog.scenarios.some((scenario) => scenario.name.includes('seed 1')),
+  );
+});
+
+Deno.test('OpenAI live scenarios normalize code answers and validate subquery journal assertions', async () => {
+  const catalog = buildOpenAILiveScenarioCatalog(4242);
+  const subqueryScenario = catalog.scenarios.find((scenario) =>
+    scenario.normalizeAnswer !== undefined && scenario.assertJournal === undefined
+  );
+  assert.ok(subqueryScenario?.normalizeAnswer);
+  assert.equal(subqueryScenario.normalizeAnswer('  123456  '), '123456');
+  assert.equal(subqueryScenario.normalizeAnswer('{"code":"654321"}'), '654321');
+  assert.equal(subqueryScenario.normalizeAnswer('not-json'), 'not-json');
+
+  const structuredObjectScenario = catalog.scenarios.find((scenario) =>
+    scenario.prompt.includes('JSON object with one string field named `vaultKey`')
+  );
+  assert.ok(structuredObjectScenario?.assertJournal);
+  const objectJournalDir = await Deno.makeTempDir({ prefix: 'rlm-openai-live-object-journal-' });
+  await Deno.writeTextFile(
+    join(objectJournalDir, 'session.subquery.1.jsonl'),
+    '{"vaultKey":"alpha","kind":"object"}',
+  );
+  await structuredObjectScenario.assertJournal({
+    journal: '',
+    journalDir: objectJournalDir,
+    journalPath: join(objectJournalDir, 'session.jsonl'),
+    result: {} as never,
+  });
+
+  const structuredArrayScenario = catalog.scenarios.find((scenario) =>
+    scenario.prompt.includes('structured array payload')
+  );
+  assert.ok(structuredArrayScenario?.assertJournal);
+  const arrayJournalDir = await Deno.makeTempDir({ prefix: 'rlm-openai-live-array-journal-' });
+  await Deno.mkdir(join(arrayJournalDir, 'ignored.subquery.dir'));
+  await Deno.writeTextFile(join(arrayJournalDir, 'notes.jsonl'), 'ignored');
+  await Deno.writeTextFile(join(arrayJournalDir, 'session.subquery.skip.txt'), 'ignored');
+  await Deno.writeTextFile(
+    join(arrayJournalDir, 'session.subquery.1.jsonl'),
+    '{"payload":[{"vaultKey":"alpha"}]}',
+  );
+  assert.deepEqual(
+    (await readSubqueryJournals(arrayJournalDir)).map((path) => path.slice(arrayJournalDir.length + 1)),
+    ['session.subquery.1.jsonl'],
+  );
+  await structuredArrayScenario.assertJournal({
+    journal: '',
+    journalDir: arrayJournalDir,
+    journalPath: join(arrayJournalDir, 'session.jsonl'),
+    result: {} as never,
+  });
+
+  const retryScenario = catalog.scenarios.find((scenario) =>
+    scenario.prompt.includes('field-specific expect')
+  );
+  assert.ok(retryScenario?.assertJournal);
+  assert.throws(
+    () =>
+      retryScenario.assertJournal?.({
+        journal: '',
+        journalDir: arrayJournalDir,
+        journalPath: join(arrayJournalDir, 'session.jsonl'),
+        result: {} as never,
+      }),
+  );
+  await retryScenario.assertJournal({
+    journal: '{"type":"subquery"}\n{"type":"subquery"}',
+    journalDir: arrayJournalDir,
+    journalPath: join(arrayJournalDir, 'session.jsonl'),
+    result: {} as never,
+  });
 });
 
 Deno.test('resolveCodexLiveModels prefers stable catalog ids and rejects unavailable overrides', () => {
@@ -77,6 +160,18 @@ Deno.test('resolveCodexLiveModels prefers stable catalog ids and rejects unavail
       rootModel: 'gpt-5.4-mini',
       subModel: 'gpt-5-mini',
     },
+  );
+  assert.deepEqual(resolveCodexLiveModels(['custom-root']), {
+    rootModel: 'custom-root',
+    subModel: 'custom-root',
+  });
+  assert.deepEqual(resolveCodexLiveModels(['gpt-5-2-instant']), {
+    rootModel: 'gpt-5-2-instant',
+    subModel: 'gpt-5-2-instant',
+  });
+  assert.throws(
+    () => resolveCodexLiveModels([]),
+    /at least one available model/u,
   );
   assert.throws(
     () => resolveCodexLiveModels(availableModels, { rootModel: 'gpt-5-4-thinking' }),
@@ -109,6 +204,34 @@ Deno.test('buildCodexLiveRunOptions combines provider timeouts with runtime caps
     rootModel: 'gpt-5-mini',
     subModel: 'gpt-5.3-instant',
   });
+
+  const uncapped = buildCodexLiveRunOptions({
+    availableModels: ['custom-root'],
+    minimumRequestTimeoutMs: 1,
+    requestTimeoutMs: 2,
+    runtime: {
+      cellTimeoutMs: 3,
+      maxSteps: 4,
+      maxSubcallDepth: 5,
+      outputCharLimit: 6,
+    },
+  });
+  assert.deepEqual(uncapped, {
+    cellTimeoutMs: 5,
+    maxSteps: 4,
+    maxSubcallDepth: 5,
+    outputCharLimit: 6,
+    requestTimeoutMs: 2,
+    rootModel: 'custom-root',
+    subModel: 'custom-root',
+  });
+
+  const defaults = buildCodexLiveRunOptions({
+    availableModels: ['custom-root'],
+  });
+  assert.ok(defaults.requestTimeoutMs >= 90_000);
+  assert.equal(defaults.rootModel, 'custom-root');
+  assert.equal(defaults.subModel, 'custom-root');
 });
 
 Deno.test('probeCodexLiveProvider requires granted chatgpt.com net permission and stored OAuth auth', async () => {
@@ -209,4 +332,90 @@ Deno.test('loadCodexLiveHarness keeps provider ownership in the caller file and 
     subModel: 'gpt-5.3-instant',
   });
   assert.deepEqual(calls, ['listModels']);
+});
+
+Deno.test('runOpenAILiveScenario can execute a local harness and validate the generated journal', async () => {
+  const journalPath = await createOpenAILiveJournalPath('synthetic', 'unit-journal-path');
+  assert.match(journalPath, /unit-journal-path\/session\.jsonl$/u);
+
+  let assertJournalCalled = false;
+  const harness = {
+    provider: {
+      createCaller() {
+        return {
+          async complete() {
+            return {
+              outputText: '```repl\nFINAL_VAR("42");\n```',
+              usage: {
+                inputTokens: 10,
+                outputTokens: 2,
+                totalTokens: 12,
+              },
+            };
+          },
+        };
+      },
+      async listModels() {
+        return ['gpt-5-mini'];
+      },
+      async loadAuth() {
+        return { provider: 'codex-oauth' };
+      },
+    },
+    runOptions: {
+      cellTimeoutMs: 5_000,
+      maxSteps: 1,
+      maxSubcallDepth: 1,
+      outputCharLimit: 512,
+      requestTimeoutMs: 5_000,
+      rootModel: 'gpt-5-mini',
+      subModel: 'gpt-5-mini',
+    },
+  };
+
+  await runOpenAILiveScenario(
+    {
+      context: { document: 'answer 42' },
+      expectedAnswer: '42',
+      journalPatterns: [/"type":"assistant_turn"/u],
+      journalPathName: 'unit-live-scenario',
+      name: 'unit live scenario',
+      prompt: 'Return 42 through FINAL_VAR.',
+      suite: 'synthetic',
+      assertJournal({ journal, journalPath }) {
+        assertJournalCalled = true;
+        assert.match(journal, /"type":"cell"/u);
+        assert.match(journalPath, /unit-live-scenario\/session\.jsonl$/u);
+      },
+    },
+    harness,
+  );
+
+  assert.equal(assertJournalCalled, true);
+
+  await runOpenAILiveScenario(
+    {
+      context: { document: 'answer 42' },
+      expectedAnswer: '42',
+      journalPatterns: [],
+      journalPathName: 'unit-live-scenario-empty-patterns',
+      name: 'unit live scenario with fallback normalization',
+      normalizeAnswer: () => undefined as never,
+      prompt: 'Return 42 through FINAL_VAR.',
+      suite: 'synthetic',
+    },
+    harness,
+  );
+
+  await runOpenAILiveScenario(
+    {
+      context: { document: 'answer 42' },
+      expectedAnswer: '42',
+      journalPathName: 'unit-live-scenario-omitted-patterns',
+      name: 'unit live scenario with omitted journal patterns',
+      prompt: 'Return 42 through FINAL_VAR.',
+      suite: 'synthetic',
+    },
+    harness,
+  );
 });

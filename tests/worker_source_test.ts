@@ -61,6 +61,13 @@ Deno.test('worker source helpers can build and revoke blob-backed handles', () =
   assert.deepEqual(revoked, ['blob:worker-source']);
 });
 
+Deno.test('worker source helpers reject blob handles when object URLs are unavailable', () => {
+  assert.throws(
+    () => buildBlobWorkerSourceHandle('postMessage("pong");', {}),
+    /Blob-backed worker URLs are not supported/u,
+  );
+});
+
 Deno.test('worker source helpers prefer blob URLs when the runtime supports them and fall back otherwise', () => {
   const supported = buildPreferredWorkerSourceHandle('postMessage("pong");', {
     Blob,

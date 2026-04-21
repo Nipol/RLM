@@ -37,10 +37,11 @@ class MockCaller implements LLMCaller {
   }
 }
 
-Deno.test('runtime keeps the next root turn input compact after an unfinished first step', async () => {
+Deno.test('runtime appends the previous assistant code and execution result into the next root turn input', async () => {
   const llm = new MockCaller([
     {
-      outputText: '```repl\nconst subtotal = 40 + 2;\nconsole.log({ subtotal });\nFINAL_VAR(undefined);\n```',
+      outputText:
+        '```repl\nconst subtotal = 40 + 2;\nconsole.log({ subtotal });\nFINAL_VAR(undefined);\n```',
       turnState: { opaque: 'root-1' },
     },
     {
@@ -69,14 +70,18 @@ Deno.test('runtime keeps the next root turn input compact after an unfinished fi
     prompt: 'Add eight after the first computation.',
   });
 
-  assert.match(llm.requests[1]?.input ?? '', /단계 예산: 2 \/ 3/u);
-  assert.match(llm.requests[1]?.input ?? '', /## REPL 목표 :\nAdd eight after the first computation\./u);
-  assert.doesNotMatch(llm.requests[1]?.input ?? '', /## 최신 REPL 실행/u);
-  assert.doesNotMatch(llm.requests[1]?.input ?? '', /subtotal/u);
-  assert.doesNotMatch(llm.requests[1]?.input ?? '', /채택된 최종 답: undefined/u);
+  assert.doesNotMatch(llm.requests[1]?.input ?? '', /단계 예산/u);
+  assert.match(
+    llm.requests[1]?.input ?? '',
+    /## REPL 목표 :\nAdd eight after the first computation\./u,
+  );
+  assert.match(llm.requests[1]?.input ?? '', /assistant:\n```repl\nconst subtotal = 40 \+ 2/u);
+  assert.match(llm.requests[1]?.input ?? '', /## REPL 코드 실행 결과/u);
+  assert.match(llm.requests[1]?.input ?? '', /새로운 사용자 요청이 아닙니다/u);
+  assert.match(llm.requests[1]?.input ?? '', /채택된 최종 답: undefined/u);
 });
 
-Deno.test('runtime logs evaluator feedback but does not replay it into the next root turn input', async () => {
+Deno.test('runtime appends evaluator feedback into the next root turn input after logging it', async () => {
   const llm = new MockCaller([
     {
       outputText: '```repl\nconst sample = "amount=120";\nconsole.log({ sample });\n```',
@@ -120,9 +125,9 @@ Deno.test('runtime logs evaluator feedback but does not replay it into the next 
 
   assert.equal(llm.requests[1]?.kind, 'plain_query');
   assert.equal(llm.requests[2]?.kind, 'root_turn');
-  assert.match(llm.requests[2]?.input ?? '', /단계 예산: 2 \/ 3/u);
-  assert.doesNotMatch(llm.requests[2]?.input ?? '', /Evaluator feedback:/u);
-  assert.doesNotMatch(llm.requests[2]?.input ?? '', /You surfaced a sample row/u);
+  assert.doesNotMatch(llm.requests[2]?.input ?? '', /단계 예산/u);
+  assert.match(llm.requests[2]?.input ?? '', /## Evaluator Feedback/u);
+  assert.match(llm.requests[2]?.input ?? '', /You surfaced a sample row/u);
   const evaluatorEntry = logger.entries.find((entry) => entry.type === 'evaluator_feedback');
   assert.ok(evaluatorEntry !== undefined);
 });

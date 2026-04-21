@@ -10,6 +10,7 @@
  */
 import type {
   LLMCaller,
+  LLMCallerMessage,
   LLMCallerRequest,
   LLMCallerResponse,
   LLMProvider,
@@ -752,6 +753,10 @@ function serializeRawResponsePayload(payload: unknown, rawText: string): string 
   }
 }
 
+function formatThrownErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function normalizeModelIds(payload: ModelListResponse): string[] {
   const ids: string[] = [];
   const buckets = [
@@ -1010,29 +1015,32 @@ export function extractAuthorizationCodeFromCallbackUrl(
 async function defaultReceiveAuthorizationCode(
   session: CodexOAuthAuthorizationSession,
   importBuiltin: typeof importNodeBuiltin = importNodeBuiltin,
-  denoServeOverride: false | ((
-    options: {
-      hostname: string;
-      port: number;
-      signal: AbortSignal;
-    },
-    handler: (request: Request) => Response | Promise<Response>,
-  ) => {
-    finished: Promise<void>;
-  }) | undefined = (globalThis as typeof globalThis & {
-    Deno?: {
-      serve?: (
-        options: {
-          hostname: string;
-          port: number;
-          signal: AbortSignal;
-        },
-        handler: (request: Request) => Response | Promise<Response>,
-      ) => {
-        finished: Promise<void>;
+  denoServeOverride:
+    | false
+    | ((
+      options: {
+        hostname: string;
+        port: number;
+        signal: AbortSignal;
+      },
+      handler: (request: Request) => Response | Promise<Response>,
+    ) => {
+      finished: Promise<void>;
+    })
+    | undefined = (globalThis as typeof globalThis & {
+      Deno?: {
+        serve?: (
+          options: {
+            hostname: string;
+            port: number;
+            signal: AbortSignal;
+          },
+          handler: (request: Request) => Response | Promise<Response>,
+        ) => {
+          finished: Promise<void>;
+        };
       };
-    };
-  }).Deno?.serve,
+    }).Deno?.serve,
 ): Promise<CodexOAuthAuthorizationCodeResult> {
   const denoServe = denoServeOverride === false ? undefined : denoServeOverride;
 
@@ -1154,6 +1162,32 @@ interface CodexOAuthCallerOptions {
   userAgent: string;
 }
 
+interface CodexInputTextPayload {
+  text: string;
+  type: 'input_text';
+}
+
+interface CodexInputMessagePayload {
+  content: CodexInputTextPayload[];
+  role: LLMCallerMessage['role'];
+}
+
+function buildCodexInputPayload(request: LLMCallerRequest): CodexInputMessagePayload[] {
+  const messages = request.messages !== undefined && request.messages.length > 0
+    ? request.messages
+    : [{ content: request.input, role: 'user' as const }];
+
+  return messages.map((message) => ({
+    content: [
+      {
+        text: message.content,
+        type: 'input_text',
+      },
+    ],
+    role: message.role,
+  }));
+}
+
 function attachAbortListener(
   signal: AbortSignal | undefined,
   controller: AbortController,
@@ -1220,29 +1254,13 @@ class CodexOAuthCaller implements LLMCaller {
 
     try {
       const requestBody: {
-        input: Array<{
-          content: Array<{
-            text: string;
-            type: 'input_text';
-          }>;
-          role: 'user';
-        }>;
+        input: CodexInputMessagePayload[];
         instructions: string;
         model: string;
         store: false;
         stream: true;
       } = {
-        input: [
-          {
-            content: [
-              {
-                text: request.input,
-                type: 'input_text',
-              },
-            ],
-            role: 'user',
-          },
-        ],
+        input: buildCodexInputPayload(request),
         instructions: request.systemPrompt,
         model: request.model,
         store: false,
@@ -1250,7 +1268,8 @@ class CodexOAuthCaller implements LLMCaller {
       };
       requestBody.model = resolveCodexModelId(request.model, this.#availableModels);
 
-      for (let attempt = 0;; attempt += 1) {
+      let attempt = 0;
+      while (true) {
         const response = await this.#fetcher(
           buildResponsesUrl(this.#apiBaseUrl),
           {
@@ -1301,18 +1320,18 @@ class CodexOAuthCaller implements LLMCaller {
           cleanupCompletionRequest(timer, request.signal, handleExternalAbort);
           return {
             outputText,
-            turnState: typeof payload.id === 'string' ? payload.id : undefined,
             usage: normalizeUsage(payload),
           };
         } catch (error) {
-          const normalizedError = error instanceof Error ? error : new Error(String(error));
+          const message = formatThrownErrorMessage(error);
           const rawPayloadText = serializeRawResponsePayload(rawPayload, rawText);
           if (attempt < EMPTY_ASSISTANT_TEXT_RETRY_COUNT) {
+            attempt += 1;
             continue;
           }
 
           throw new Error(
-            `${normalizedError.message} after ${attempt + 1} attempts raw=${rawPayloadText}`,
+            `${message} after ${attempt + 1} attempts raw=${rawPayloadText}`,
           );
         }
       }
@@ -1534,7 +1553,8 @@ export class CodexOAuthProvider implements LLMProvider<CodexOAuthCallerConfig> {
     if (auth.tokens.accountId === null || auth.tokens.accountId.length === 0) {
       throw new Error('Codex OAuth model listing requires an account ID.');
     }
-    for (let attempt = 0;; attempt += 1) {
+    let attempt = 0;
+    while (true) {
       const response = await this.#fetcher(
         buildModelListUrl(auth.apiBaseUrl),
         {
@@ -1556,6 +1576,7 @@ export class CodexOAuthProvider implements LLMProvider<CodexOAuthCallerConfig> {
           ? `${fallback} raw=${rawText.trim() || '(empty)'}`
           : extractStructuredErrorMessage(payload, fallback);
         if (payload === null && attempt < MODEL_LIST_RETRY_COUNT) {
+          attempt += 1;
           continue;
         }
 
@@ -1564,6 +1585,7 @@ export class CodexOAuthProvider implements LLMProvider<CodexOAuthCallerConfig> {
 
       if (payload === null) {
         if (attempt < MODEL_LIST_RETRY_COUNT) {
+          attempt += 1;
           continue;
         }
 
@@ -1616,6 +1638,7 @@ export class CodexOAuthProvider implements LLMProvider<CodexOAuthCallerConfig> {
 export const __codexOAuthProviderTestables = {
   attachAbortListener,
   buildAuthorizeUrl,
+  buildCodexInputPayload,
   buildModelListUrl,
   buildResponsesUrl,
   cleanupCompletionRequest,
@@ -1638,6 +1661,7 @@ export const __codexOAuthProviderTestables = {
   parseModelListPayload,
   normalizeStreamedCodexPayload,
   normalizeUsage,
+  formatThrownErrorMessage,
   formatInvalidModelListPayloadMessage,
   parseCodexResponseBody,
   parseServerSentEventPayload,

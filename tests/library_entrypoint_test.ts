@@ -365,9 +365,9 @@ Deno.test('createRLM can request optional evaluator feedback through the same in
   assert.equal(llm.requests[1]?.model, 'gpt-5-evaluator');
   assert.equal(llm.requests[1]?.metadata?.step, 1);
   assert.equal(llm.requests[2]?.kind, 'root_turn');
-  assert.match(llm.requests[2]?.input ?? '', /단계 예산: 2 \/ 3/u);
-  assert.doesNotMatch(llm.requests[2]?.input ?? '', /Evaluator feedback:/u);
-  assert.doesNotMatch(llm.requests[2]?.input ?? '', /You surfaced a sample row/u);
+  assert.doesNotMatch(llm.requests[2]?.input ?? '', /단계 예산/u);
+  assert.match(llm.requests[2]?.input ?? '', /## Evaluator Feedback/u);
+  assert.match(llm.requests[2]?.input ?? '', /You surfaced a sample row/u);
   const evaluatorEntry = logger.entries.find(
     (entry): entry is {
       createdAt: string;

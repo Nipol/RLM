@@ -526,6 +526,13 @@ Deno.test('standalone AoT plugin helpers load the built-in plugin and resolve in
       }),
     /Failed to load the default AoT plugin: missing aot plugin/u,
   );
+  await assert.rejects(
+    () =>
+      __standaloneCLITestables.loadStandaloneAOTPlugin(async () => {
+        throw 'string plugin failure';
+      }),
+    /Failed to load the default AoT plugin: string plugin failure/u,
+  );
 
   const injectedPlugin = { name: 'custom-aot' } as const;
   assert.deepEqual(
@@ -541,6 +548,10 @@ Deno.test('standalone AoT plugin helpers load the built-in plugin and resolve in
       { createAOTPlugin: async () => injectedPlugin as never },
     ),
     [injectedPlugin],
+  );
+  assert.equal(
+    (await __standaloneCLITestables.resolveStandalonePlugins({ aotMode: 'lite' }, {}))?.[0]?.name,
+    'aot',
   );
   assert.match(
     __standaloneCLITestables.resolveStandaloneSystemPromptExtension({ aotMode: 'lite' }) ?? '',
@@ -841,9 +852,19 @@ Deno.test('createStandaloneProgressLogger can report AoT query trace entries whe
   };
 
   await logger.append(entry);
+  await logger.append({
+    ...entry,
+    kind: 'rlm_query',
+    maxSubcallDepth: undefined,
+    maxSteps: 2,
+    promptTag: undefined,
+    queryIndex: 1,
+    steps: 4,
+  });
 
   assert.deepEqual(lines, [
     '[aot-debug] llm_query tag=AOT_DECOMPOSE_JSON query=0 depth=1 elapsed=42ms status=success model=gpt-5.4-mini maxSteps=unbounded maxSubcallDepth=1',
+    '[aot-debug] rlm_query tag=(none) query=1 depth=1 elapsed=42ms status=success model=gpt-5.4-mini maxSteps=2 steps=4',
   ]);
 });
 
@@ -1054,6 +1075,71 @@ Deno.test('standalone helpers can leave cost fields blank without provider prici
     [
       '[usage] input_tokens=12 output_tokens=3 total_tokens=15',
       '[cost] input_usd= output_usd= total_usd= missing_pricing_models=unknown-model',
+    ],
+  );
+  assert.deepEqual(
+    __standaloneCLITestables.buildStandaloneUsageLines({
+      byModel: [
+        {
+          cachedInputTokens: 0,
+          inputTokens: 12,
+          model: 'partial-model',
+          outputTokens: 3,
+          reportedRequests: 1,
+          requests: 1,
+          totalTokens: 15,
+        },
+      ],
+      cachedInputTokens: 0,
+      inputTokens: 12,
+      outputTokens: 3,
+      reportedRequests: 1,
+      requests: 1,
+      totalTokens: 15,
+    }, () => ({
+      byModel: [{
+        model: 'partial-model',
+      }],
+      totalCostUsd: undefined,
+    })),
+    [
+      '[usage] input_tokens=12 output_tokens=3 total_tokens=15',
+      '[cost] input_usd= output_usd= total_usd=',
+    ],
+  );
+  assert.deepEqual(
+    __standaloneCLITestables.buildStandaloneUsageLines({
+      byModel: [
+        {
+          cachedInputTokens: 1,
+          inputTokens: 12,
+          model: 'priced-model',
+          outputTokens: 3,
+          reportedRequests: 1,
+          requests: 1,
+          totalTokens: 15,
+        },
+      ],
+      cachedInputTokens: 1,
+      inputTokens: 12,
+      outputTokens: 3,
+      reportedRequests: 1,
+      requests: 1,
+      totalTokens: 15,
+    }, () => ({
+      byModel: [{
+        cachedInputCostUsd: 0.000001,
+        inputCostUsd: 0.000012,
+        model: 'priced-model',
+        outputCostUsd: 0.000006,
+        totalCostUsd: 0.000019,
+      }],
+      missingPricingModels: [],
+      totalCostUsd: 0.000019,
+    })),
+    [
+      '[usage] input_tokens=12 output_tokens=3 total_tokens=15',
+      '[cost] input_usd=$0.000013 output_usd=$0.000006 total_usd=$0.000019',
     ],
   );
 
@@ -1439,7 +1525,10 @@ Deno.test('runStandaloneCLI can attach the AoT-hard controller guidance and debu
   assert.match(runCalls[0]?.systemPromptExtension ?? '', /transitionSamples: 1/u);
   assert.match(runCalls[0]?.systemPromptExtension ?? '', /beamWidth: 1/u);
   assert.match(runCalls[0]?.systemPromptExtension ?? '', /maxRefinements: 1/u);
-  assert.match(runCalls[0]?.systemPromptExtension ?? '', /Do not widen AoT search after a timeout/u);
+  assert.match(
+    runCalls[0]?.systemPromptExtension ?? '',
+    /Do not widen AoT search after a timeout/u,
+  );
 });
 
 Deno.test('runStandaloneCLI can execute without an input file by using an empty document context', async () => {
@@ -1552,6 +1641,46 @@ Deno.test('runStandaloneCLI closes the returned session so standalone runs can e
 
   assert.equal(result.answer, '정답은 42입니다.');
   assert.equal(closed, true);
+});
+
+Deno.test('runStandaloneCLI tolerates run sessions without an explicit close hook', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'rlm-standalone-cli-open-session-' });
+  const inputPath = join(root, 'book.txt');
+  const systemPromptPath = join(root, 'ebook-system.txt');
+  await Deno.writeTextFile(inputPath, 'Chapter 1\nThe answer is 42.\n');
+  await Deno.writeTextFile(systemPromptPath, 'Always answer in concise Korean.');
+  await Deno.writeTextFile(
+    join(root, '.env'),
+    [
+      'OPENAI_API_KEY=sk-test',
+      'RLM_OPENAI_ROOT_MODEL=gpt-5.4-mini',
+      'RLM_OPENAI_SUB_MODEL=gpt-5.4-nano',
+    ].join('\n'),
+  );
+
+  const result = await runStandaloneCLI(
+    [
+      '--input',
+      inputPath,
+      '--query',
+      'What is the answer?',
+      '--system-prompt',
+      systemPromptPath,
+    ],
+    {
+      clock: createClock(),
+      cwd: root,
+      run: async () => ({
+        answer: '42',
+        finalValue: '42',
+        session: {},
+      }),
+      render: async () => '정답은 42입니다.',
+      writeLine: () => {},
+    },
+  );
+
+  assert.equal(result.answer, '정답은 42입니다.');
 });
 
 Deno.test('runStandaloneCLI uses the default final renderer when no custom render dependency is provided', async () => {
@@ -1674,6 +1803,7 @@ Deno.test('runStandaloneCLI can perform a Codex OAuth login flow and print the d
 Deno.test('runStandaloneCLI can use the default Codex OAuth provider for login and list models through the injected fetcher', async () => {
   const root = await Deno.makeTempDir({ prefix: 'rlm-standalone-cli-default-codex-login-' });
   const lines: string[] = [];
+  let callbackState = 'state-test';
 
   const result = await runStandaloneCLI(
     [
@@ -1719,14 +1849,21 @@ Deno.test('runStandaloneCLI can use the default Codex OAuth provider for login a
         throw new Error(`Unexpected request: ${url} ${body}`);
       },
       readLoginLine: async () =>
-        'http://localhost:1455/auth/callback?code=code-test&state=state-test',
+        `http://localhost:1455/auth/callback?code=code-test&state=${callbackState}`,
       receiveLoopbackAuthorizationCode: async (_session, signal) => {
         await new Promise<void>((resolve) => {
           signal?.addEventListener('abort', () => resolve(), { once: true });
         });
         throw new DOMException('Aborted', 'AbortError');
       },
-      writeLine: (line) => lines.push(line),
+      writeLine: (line) => {
+        lines.push(line);
+        const openPrefix = '[login] open: ';
+        if (line.startsWith(openPrefix)) {
+          callbackState = new URL(line.slice(openPrefix.length)).searchParams.get('state') ??
+            callbackState;
+        }
+      },
     },
   );
 
@@ -2958,6 +3095,61 @@ Deno.test('runStandaloneCLI preserves non-Error failures and still records a sta
   ]);
 });
 
+Deno.test('runStandaloneCLI still closes resources when writing the standalone error entry fails', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'rlm-standalone-cli-error-log-failure-' });
+  const inputPath = join(root, 'book.txt');
+  const systemPromptPath = join(root, 'ebook-system.txt');
+  const logPath = join(root, 'logs-as-directory');
+  await Deno.writeTextFile(inputPath, 'Chapter 1\nThe answer is 42.\n');
+  await Deno.writeTextFile(systemPromptPath, 'Always answer in concise Korean.');
+  await Deno.mkdir(logPath);
+  await Deno.writeTextFile(
+    join(root, '.env'),
+    [
+      'OPENAI_API_KEY=sk-test',
+      'RLM_OPENAI_ROOT_MODEL=gpt-5.4-mini',
+      'RLM_OPENAI_SUB_MODEL=gpt-5.4-nano',
+    ].join('\n'),
+  );
+
+  let closed = false;
+  let thrown: unknown;
+  try {
+    await runStandaloneCLI(
+      [
+        '--input',
+        inputPath,
+        '--query',
+        'What is the answer?',
+        '--system-prompt',
+        systemPromptPath,
+        '--log',
+        logPath,
+      ],
+      {
+        cwd: root,
+        run: async () => ({
+          answer: 'unreachable',
+          session: {
+            close() {
+              closed = true;
+            },
+          },
+        }),
+        render: async () => {
+          throw new Error('render failed before cleanup');
+        },
+        writeLine: () => {},
+      },
+    );
+  } catch (error) {
+    thrown = error;
+  }
+
+  assert.equal(closed, true);
+  assert.match(String(thrown), /Is a directory|EISDIR|directory/u);
+});
+
 Deno.test('runStandaloneCLI surfaces missing required run flags after provider-only modes are ruled out', async () => {
   await assert.rejects(
     async () => {
@@ -3177,14 +3369,20 @@ Deno.test('createStandaloneFetchLogger falls back to GET and can derive a URL fr
   );
 
   await loggedFetch(new Request('https://chatgpt.com/backend-api/models?limit=1'));
+  await loggedFetch(new URL('https://chatgpt.com/backend-api/models?limit=2'));
 
   assert.deepEqual(lines, [
     '[https] GET https://chatgpt.com/backend-api/models?limit=1',
+    '[https] GET https://chatgpt.com/backend-api/models?limit=2',
   ]);
   assert.deepEqual(fetchCalls, [
     {
       method: 'GET',
       url: 'https://chatgpt.com/backend-api/models?limit=1',
+    },
+    {
+      method: 'GET',
+      url: 'https://chatgpt.com/backend-api/models?limit=2',
     },
   ]);
 });
@@ -3224,4 +3422,19 @@ Deno.test('standalone base logger closer handles present and missing close hooks
   await __standaloneCLITestables.closeStandaloneBaseLogger({
     append() {},
   });
+
+  let runResourceLoggerClosed = 0;
+  await __standaloneCLITestables.closeStandaloneRunResources(undefined, {
+    append() {},
+    close() {
+      runResourceLoggerClosed += 1;
+    },
+  });
+  await __standaloneCLITestables.closeStandaloneRunResources({}, {
+    append() {},
+    close() {
+      runResourceLoggerClosed += 1;
+    },
+  });
+  assert.equal(runResourceLoggerClosed, 2);
 });

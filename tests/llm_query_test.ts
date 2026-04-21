@@ -1,11 +1,7 @@
 import assert from 'node:assert/strict';
 
 import { InMemoryRLMLogger } from '../src/index.ts';
-import type {
-  LLMCaller,
-  LLMCallerRequest,
-  LLMCallerResponse,
-} from '../src/llm_adapter.ts';
+import type { LLMCaller, LLMCallerRequest, LLMCallerResponse } from '../src/llm_adapter.ts';
 import {
   buildLLMQuerySystemPrompt,
   createLLMQueryHandler,
@@ -80,7 +76,6 @@ Deno.test('llm_query forwards prompts into plain sub-model completions', async (
   ]);
   const captured: Array<{
     model: string;
-    turnState?: unknown;
     usage?: {
       inputTokens?: number;
       outputTokens?: number;
@@ -110,7 +105,6 @@ Deno.test('llm_query forwards prompts into plain sub-model completions', async (
   assert.deepEqual(captured, [
     {
       model: 'gpt-5-nano',
-      turnState: 'plain-turn-1',
       usage: {
         inputTokens: 9,
         outputTokens: 4,
@@ -120,7 +114,7 @@ Deno.test('llm_query forwards prompts into plain sub-model completions', async (
   ]);
 });
 
-Deno.test('llm_query keeps provider turnState opaque and forwards it through completion callbacks', async () => {
+Deno.test('llm_query ignores deprecated provider turnState in completion callbacks', async () => {
   const llm = new MockCaller([
     {
       outputText: 'done',
@@ -131,7 +125,7 @@ Deno.test('llm_query keeps provider turnState opaque and forwards it through com
   const handler = createLLMQueryHandler({
     llm,
     onComplete: (completion) => {
-      states.push(completion.turnState);
+      states.push('turnState' in completion ? completion.turnState : undefined);
     },
     subModel: 'gpt-5-mini',
   });
@@ -139,7 +133,7 @@ Deno.test('llm_query keeps provider turnState opaque and forwards it through com
   const result = await handler('return done');
 
   assert.equal(result, 'done');
-  assert.deepEqual(states, [{ cursor: 'opaque-1' }]);
+  assert.deepEqual(states, [undefined]);
 });
 
 Deno.test('llm_query can report parent depth and monotonically increasing query indices to the caller', async () => {
@@ -1107,7 +1101,7 @@ Deno.test('rlm_query defaults the starting depth to zero when the parent run omi
   assert.deepEqual(calls, [1]);
 });
 
-Deno.test('rlm_query serializes sibling nested runs instead of starting them in parallel', async () => {
+Deno.test('rlm_query can start sibling nested runs in parallel', async () => {
   const first = createDeferred<{
     answer: string;
     steps: number;
@@ -1144,14 +1138,11 @@ Deno.test('rlm_query serializes sibling nested runs instead of starting them in 
   const secondAnswerPromise = handler('second prompt');
 
   await flushMicrotasks(2);
-  assert.deepEqual(started, ['first prompt']);
-
-  first.resolve({ answer: 'first', steps: 1, usage: createUsageSummary(), value: 'first' });
-  assertRLMQueryResultEnvelope(await firstAnswerPromise, 'first');
-
-  await flushMicrotasks(2);
   assert.deepEqual(started, ['first prompt', 'second prompt']);
 
   second.resolve({ answer: 'second', steps: 1, usage: createUsageSummary(), value: 'second' });
   assertRLMQueryResultEnvelope(await secondAnswerPromise, 'second');
+
+  first.resolve({ answer: 'first', steps: 1, usage: createUsageSummary(), value: 'first' });
+  assertRLMQueryResultEnvelope(await firstAnswerPromise, 'first');
 });

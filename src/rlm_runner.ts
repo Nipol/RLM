@@ -18,9 +18,19 @@ import type {
 import { createDefaultExecutionBackend } from './execution_backend.ts';
 import { createSubqueryLogger, getLoggerJournalPath, resolveRLMLogger } from './logger.ts';
 import { createLLMQueryHandler, createRLMQueryHandler } from './llm_query.ts';
-import type { LLMAdapter, LLMCaller, LLMCallerResponse } from './llm_adapter.ts';
+import {
+  formatLLMCallerMessagesAsText,
+  type LLMAdapter,
+  type LLMCaller,
+  type LLMCallerMessage,
+  type LLMCallerResponse,
+} from './llm_adapter.ts';
 import { resolveRuntimeHelperPromptBlocks, resolveRuntimeHelpers } from './plugin.ts';
-import { buildRLMSystemPrompt, buildRLMTurnInput } from './rlm_prompt.ts';
+import {
+  buildRLMExecutionFeedbackInput,
+  buildRLMSystemPrompt,
+  buildRLMTurnInput,
+} from './rlm_prompt.ts';
 import { extractFinalSignal, extractReplCodeBlocks } from './repl_protocol.ts';
 import type { FinalSignal, ReplCodeBlock } from './repl_protocol.ts';
 import { ReplSession } from './repl_session.ts';
@@ -1241,20 +1251,23 @@ async function runRLMInternal(options: InternalRLMRunOptions): Promise<RLMRunRes
       }),
       runtimeHelpers,
     });
-    let turnState: unknown = undefined;
+    const initialInput = buildRLMTurnInput({
+      context: options.context,
+      outputCharLimit: options.outputCharLimit,
+      prompt: options.prompt,
+      role,
+      transcript,
+    });
+    const messages: LLMCallerMessage[] = [{
+      content: initialInput,
+      role: 'user',
+    }];
 
     for (let index = 0; index < options.maxSteps; index += 1) {
       throwIfAborted(options.signal);
       const step = index + 1;
-      const baseInput = buildRLMTurnInput({
-        context: options.context,
-        currentStep: step,
-        outputCharLimit: options.outputCharLimit,
-        prompt: options.prompt,
-        role,
-        totalSteps: options.maxSteps,
-        transcript,
-      });
+      const requestMessages = messages.map((message) => ({ ...message }));
+      const baseInput = formatLLMCallerMessagesAsText(requestMessages);
       let completion: LLMCallerResponse | null = null;
       let codeBlocks: ReplCodeBlock[] = [];
       let finalSignal: FinalSignal | null = null;
@@ -1262,6 +1275,7 @@ async function runRLMInternal(options: InternalRLMRunOptions): Promise<RLMRunRes
       completion = await llm.complete({
         input: baseInput,
         kind: role === 'root' ? 'root_turn' : 'child_turn',
+        messages: requestMessages,
         metadata: {
           depth: options.depth,
           step,
@@ -1269,11 +1283,9 @@ async function runRLMInternal(options: InternalRLMRunOptions): Promise<RLMRunRes
         model: options.rootModel,
         signal: options.signal,
         systemPrompt,
-        turnState,
       });
       throwIfAborted(options.signal);
       recordUsage(usageSummary, options.rootModel, completion.usage);
-      turnState = completion.turnState;
 
       await appendAssistantTurnEntry(options.logger, {
         assistantText: completion.outputText,
@@ -1363,6 +1375,20 @@ async function runRLMInternal(options: InternalRLMRunOptions): Promise<RLMRunRes
           type: 'evaluator_feedback',
         });
       }
+
+      messages.push({
+        content: completion.outputText,
+        role: 'assistant',
+      });
+      messages.push({
+        content: buildRLMExecutionFeedbackInput({
+          evaluatorFeedback,
+          executions,
+          outputCharLimit: options.outputCharLimit,
+          step,
+        }),
+        role: 'user',
+      });
 
       transcript.push({
         assistantText: completion.outputText,

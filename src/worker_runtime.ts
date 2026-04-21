@@ -1662,9 +1662,7 @@ function buildRuntimeHelperDefinitionsSource(runtimeHelpers: RLMRuntimeHelper[])
       return rlm_query_batched(prompts);
     }
 
-    return Promise.all(
-      prompts.map((prompt) => __helperRLMQuery(prompt, options)),
-    );
+    return Promise.all(prompts.map((prompt) => __helperRLMQuery(prompt, options)));
   };
 
   const __helperState = Object.create(null);
@@ -1747,7 +1745,7 @@ function buildRuntimeHelperDefinitionsSource(runtimeHelpers: RLMRuntimeHelper[])
     ${JSON.stringify(`with (__scope) {\n${executionCode}\n}`)},
   );
   const __run = () => __runner(__helperScope, input);
-  ${timeoutGuardSource ?? 'return await __run();'}
+  ${timeoutGuardSource}
 };`;
   }).join('\n\n');
 }

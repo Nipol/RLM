@@ -72,10 +72,18 @@ export interface RLMTranscriptTurn {
  */
 export interface BuildRLMTurnInputOptions {
   context: JsonValue | null;
+  /**
+   * @deprecated Step budgets are enforced outside the prompt so model inputs
+   * can keep a stable cache-friendly prefix.
+   */
   currentStep?: number;
   outputCharLimit: number;
   prompt: string;
   role?: RLMControllerRole;
+  /**
+   * @deprecated Step budgets are enforced outside the prompt so model inputs
+   * can keep a stable cache-friendly prefix.
+   */
   totalSteps?: number;
   transcript: RLMTranscriptTurn[];
 }
@@ -90,9 +98,23 @@ export interface BuildRLMTurnInputOptions {
  */
 export interface BuildRLMSystemPromptOptions {
   markdown?: string;
+  /**
+   * @deprecated Step budgets are enforced by the runtime and are no longer
+   * rendered into prompts, keeping prompt prefixes stable for provider caches.
+   */
   maxSteps?: number;
   role?: RLMControllerRole;
   runtimeHelperPromptBlocks?: string[];
+}
+
+/**
+ * Describes the execution feedback appended after one assistant REPL turn.
+ */
+export interface BuildRLMExecutionFeedbackInputOptions {
+  evaluatorFeedback?: string;
+  executions: RLMExecutionFeedback[];
+  outputCharLimit: number;
+  step: number;
 }
 
 function hasDelegatedTask(
@@ -462,13 +484,44 @@ export async function buildRLMSystemPrompt(
   options: BuildRLMSystemPromptOptions = {},
 ): Promise<string> {
   const markdown = options.markdown ?? await loadDefaultRLMSystemPromptMarkdown();
-  const maxStepsSentence = options.maxSteps === undefined
-    ? ''
-    : `사용할 수 있는 최대 단계 예산은 ${options.maxSteps}입니다.`;
   return renderMarkdownTemplate(markdown, {
-    MAX_STEPS_SENTENCE: maxStepsSentence,
+    MAX_STEPS_SENTENCE: '',
     RUNTIME_HELPER_PROMPT_BLOCKS: buildRuntimeHelperPromptBlocks(options.runtimeHelperPromptBlocks),
   });
+}
+
+/**
+ * Builds the user-role message appended after executing assistant-supplied
+ * REPL code. The wording makes the message a runtime result, not a new user
+ * instruction.
+ */
+export function buildRLMExecutionFeedbackInput(
+  options: BuildRLMExecutionFeedbackInputOptions,
+): string {
+  const sections = [
+    '## REPL 코드 실행 결과',
+    '이 메시지는 직전 assistant가 제출한 REPL 코드블록의 실행 결과입니다. 새로운 사용자 요청이 아닙니다.',
+  ];
+
+  for (const [index, execution] of options.executions.entries()) {
+    sections.push(
+      buildExecutionFeedbackText(
+        options.step,
+        index + 1,
+        execution,
+        options.outputCharLimit,
+      ),
+    );
+  }
+
+  if (options.evaluatorFeedback !== undefined && options.evaluatorFeedback.trim().length > 0) {
+    sections.push([
+      '## Evaluator Feedback',
+      clipText(options.evaluatorFeedback.trim(), options.outputCharLimit),
+    ].join('\n\n'));
+  }
+
+  return sections.join('\n\n');
 }
 
 /**
@@ -498,14 +551,15 @@ export function buildRLMTurnInput(options: BuildRLMTurnInputOptions): string {
   const delegatedExpectText = delegatedContext === null
     ? null
     : stringifyPromptValue(delegatedContext.expect);
-  // // 현재 단계와 총 단계가 모두 주어질 때만 단계 예산을 보여줍니다.
-  // if (options.currentStep !== undefined && options.totalSteps !== undefined) {
-  //   sections.push(`단계 예산: ${options.currentStep} / ${options.totalSteps}`);
-  // }
   const sections = [
-    `단계 예산: ${options.currentStep} / ${options.totalSteps}\n\n`,
     `## REPL 목표 :\n${taskText}\n`,
+    `## 사용 가능한 런타임 문맥\n${buildContextSummary(options.context)}`,
   ];
+
+  const contextPreviews = buildContextPreviews(options.context);
+  if (contextPreviews !== null) {
+    sections.push(`## 대형 문맥 미리보기\n${contextPreviews}`);
+  }
 
   // 위임 실행일 때만 payload/expect를 상단에 직접 보여줍니다.
   if (delegatedContext) {
@@ -557,6 +611,7 @@ export function buildRLMTurnInput(options: BuildRLMTurnInputOptions): string {
  * Exposes prompt-construction helpers for focused tests.
  */
 export const __rlmPromptTestables = {
+  buildRLMExecutionFeedbackInput,
   buildRuntimeHelperPromptBlocks,
   buildContextPreviews,
   buildContextSummary,
@@ -566,6 +621,7 @@ export const __rlmPromptTestables = {
   clipText,
   formatExecutionSignals,
   formatPromptSections,
+  stringifyPromptValue,
   isLargeContext,
   isLargeContextValue,
   slicePreviewTokens,

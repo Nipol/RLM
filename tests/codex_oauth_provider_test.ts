@@ -214,6 +214,18 @@ Deno.test('Codex OAuth helpers cover streamed payload parsing, structured errors
     ),
     {},
   );
+  assert.equal(
+    __codexOAuthProviderTestables.extractOutputTextOrNull({
+      output: [{
+        content: [{
+          text: { value: 'object text value' },
+          type: 'output_text',
+        }],
+        type: 'message',
+      }],
+    }),
+    'object text value',
+  );
   assert.deepEqual(
     __codexOAuthProviderTestables.normalizeStreamedCodexPayload(
       'event: response.created\ndata: {"type":"response.created"}\n',
@@ -252,6 +264,14 @@ Deno.test('Codex OAuth helpers cover streamed payload parsing, structured errors
     { output_text: 'PONG' },
   );
   assert.equal(
+    __codexOAuthProviderTestables.formatThrownErrorMessage(new Error('structured failure')),
+    'structured failure',
+  );
+  assert.equal(
+    __codexOAuthProviderTestables.formatThrownErrorMessage('string failure'),
+    'string failure',
+  );
+  assert.equal(
     __codexOAuthProviderTestables.parseCodexResponseBody('123'),
     123,
   );
@@ -266,6 +286,17 @@ Deno.test('Codex OAuth helpers cover streamed payload parsing, structured errors
       ],
     }),
     'pong',
+  );
+  assert.equal(
+    __codexOAuthProviderTestables.extractOutputTextOrNull({
+      output: [
+        {
+          content: [{ text: { value: 42 } as never, type: 'text' }],
+          type: 'message',
+        },
+      ],
+    }),
+    null,
   );
   assert.equal(
     __codexOAuthProviderTestables.extractOutputTextOrNull({
@@ -377,6 +408,14 @@ Deno.test('Codex OAuth helpers cover streamed payload parsing, structured errors
       models: { invalid: true } as unknown as Array<{ id?: string; slug?: string }>,
     }),
     ['gpt-5-3-instant'],
+  );
+  assert.deepEqual(
+    __codexOAuthProviderTestables.normalizeModelIds({
+      categories: [{ models: 'invalid' as never }],
+      data: [{ id: 'gpt-5-4-t-mini' }, { slug: 'gpt-5-4-thinking' }],
+      models: [{ id: 'gpt-5-4-t-mini' }, { id: '', slug: '' }, {}],
+    }),
+    ['gpt-5-4-t-mini', 'gpt-5-4-thinking'],
   );
 });
 
@@ -574,12 +613,19 @@ Deno.test('Codex OAuth filesystem and model-list helpers cover explicit, Deno-de
     }) as typeof __codexOAuthProviderTestables.resolveReadTextFile extends (
       file: unknown,
       importer: infer T,
-    ) => unknown ? T : never;
+    ) => unknown ? T
+      : never;
     const injectedMkdir = __codexOAuthProviderTestables.resolveMkdir(undefined, importBuiltin);
     await injectedMkdir(join(root, 'injected-dir'), { recursive: true });
-    const injectedWrite = __codexOAuthProviderTestables.resolveWriteTextFile(undefined, importBuiltin);
+    const injectedWrite = __codexOAuthProviderTestables.resolveWriteTextFile(
+      undefined,
+      importBuiltin,
+    );
     await injectedWrite(join(root, 'injected.txt'), 'node-write');
-    const injectedRead = __codexOAuthProviderTestables.resolveReadTextFile(undefined, importBuiltin);
+    const injectedRead = __codexOAuthProviderTestables.resolveReadTextFile(
+      undefined,
+      importBuiltin,
+    );
     assert.equal(await injectedRead(join(root, 'injected.txt')), 'node-read');
     assert.deepEqual(nodeFsCalls, [
       `mkdir:${join(root, 'injected-dir')}`,
@@ -647,7 +693,8 @@ Deno.test('Codex OAuth default authorization receiver covers the node-http callb
       writeHead(statusCode: number, headers: Record<string, string>): void;
     }) => void)
     | undefined;
-  let connectionListener: ((socket: { destroy(): void; once(event: 'close', listener: () => void): void }) => void)
+  let connectionListener:
+    | ((socket: { destroy(): void; once(event: 'close', listener: () => void): void }) => void)
     | undefined;
   let closeCalls = 0;
   let destroyedSockets = 0;
@@ -661,17 +708,25 @@ Deno.test('Codex OAuth default authorization receiver covers the node-http callb
     (async (specifier: string) => {
       assert.equal(specifier, 'http');
       return {
-        createServer: (handler: typeof capturedHandler extends undefined ? never : NonNullable<typeof capturedHandler>) => {
+        createServer: (
+          handler: typeof capturedHandler extends undefined ? never
+            : NonNullable<typeof capturedHandler>,
+        ) => {
           capturedHandler = handler;
           return {
             close: () => {
               closeCalls += 1;
             },
             listen: () => {},
-            on: (event: 'connection' | 'error', listener: ((socket: {
-              destroy(): void;
-              once(event: 'close', listener: () => void): void;
-            }) => void) | ((error: Error) => void)) => {
+            on: (
+              event: 'connection' | 'error',
+              listener:
+                | ((socket: {
+                  destroy(): void;
+                  once(event: 'close', listener: () => void): void;
+                }) => void)
+                | ((error: Error) => void),
+            ) => {
               if (event === 'connection') {
                 connectionListener = listener as typeof connectionListener;
               }
@@ -683,7 +738,8 @@ Deno.test('Codex OAuth default authorization receiver covers the node-http callb
       session: unknown,
       importer: infer T,
       denoServe: infer _U,
-    ) => unknown ? T : never,
+    ) => unknown ? T
+      : never,
     false,
   );
 
@@ -709,6 +765,20 @@ Deno.test('Codex OAuth default authorization receiver covers the node-http callb
     once: (_event: 'close', _listener: () => void) => {},
   };
   connectionListener?.(openSocket);
+
+  capturedHandler(
+    {
+      headers: {},
+    },
+    {
+      end: (text?: string) => {
+        responseBodies.push(text ?? '');
+      },
+      writeHead: (statusCode) => {
+        responseStatusCodes.push(statusCode);
+      },
+    },
+  );
 
   capturedHandler(
     {
@@ -746,8 +816,8 @@ Deno.test('Codex OAuth default authorization receiver covers the node-http callb
     state: 'state-test',
   });
 
-  assert.deepEqual(responseStatusCodes, [202, 200]);
-  assert.equal(responseBodies.length, 2);
+  assert.deepEqual(responseStatusCodes, [202, 202, 200]);
+  assert.equal(responseBodies.length, 3);
   assert.equal(closeCalls >= 1, true);
   assert.equal(destroyedSockets, 1);
 });
@@ -1143,7 +1213,7 @@ Deno.test('Codex OAuth provider surfaces missing token-set and missing account-i
   assert.equal(refreshed.tokens.expiresAt, '2026-03-27T01:00:00.000Z');
 });
 
-Deno.test('Codex OAuth provider reuses stored access tokens for backend model listing and ignores previous_response_id for Codex responses', async () => {
+Deno.test('Codex OAuth provider reuses stored access tokens and sends explicit input messages', async () => {
   const root = await Deno.makeTempDir({ prefix: 'rlm-codex-oauth-reuse-' });
   const storagePath = join(root, '.rlm/codex-oauth.json');
   const storedAuth = createStoredAuth();
@@ -1204,15 +1274,19 @@ Deno.test('Codex OAuth provider reuses stored access tokens for backend model li
   const completion = await llm.complete({
     input: 'Return done.',
     kind: 'root_turn',
+    messages: [
+      { content: 'Return done.', role: 'user' },
+      { content: '```repl\n"working"\n```', role: 'assistant' },
+      { content: 'REPL result: working', role: 'user' },
+    ],
     metadata: { depth: 0, step: 1 },
     model: 'gpt-5-4-t-mini',
     systemPrompt: 'Use the REPL.',
-    turnState: 'resp_prev_1',
   });
 
   assert.deepEqual(models, ['gpt-5-4-t-mini', 'gpt-5-3-instant']);
   assert.equal(completion.outputText, '```repl\nFINAL_VAR("done")\n```');
-  assert.equal(completion.turnState, 'resp_codex_1');
+  assert.equal(completion.turnState, undefined);
   assert.deepEqual(
     calls.map((call) => ({
       accountId: call.accountId,
@@ -1261,12 +1335,59 @@ Deno.test('Codex OAuth provider reuses stored access tokens for backend model li
         ],
         role: 'user',
       },
+      {
+        content: [
+          {
+            text: '```repl\n"working"\n```',
+            type: 'input_text',
+          },
+        ],
+        role: 'assistant',
+      },
+      {
+        content: [
+          {
+            text: 'REPL result: working',
+            type: 'input_text',
+          },
+        ],
+        role: 'user',
+      },
     ],
     instructions: 'Use the REPL.',
     model: 'gpt-5-4-t-mini',
     store: false,
     stream: true,
   });
+});
+
+Deno.test('Codex OAuth input payload builder falls back to legacy input when messages are absent or empty', () => {
+  const withoutMessages = __codexOAuthProviderTestables.buildCodexInputPayload({
+    input: 'Return done.',
+    kind: 'root_turn',
+    model: 'gpt-5-4-t-mini',
+    systemPrompt: 'Use the REPL.',
+  });
+  const withEmptyMessages = __codexOAuthProviderTestables.buildCodexInputPayload({
+    input: 'Return done.',
+    kind: 'root_turn',
+    messages: [],
+    model: 'gpt-5-4-t-mini',
+    systemPrompt: 'Use the REPL.',
+  });
+
+  assert.deepEqual(withoutMessages, [
+    {
+      content: [
+        {
+          text: 'Return done.',
+          type: 'input_text',
+        },
+      ],
+      role: 'user',
+    },
+  ]);
+  assert.deepEqual(withEmptyMessages, withoutMessages);
 });
 
 Deno.test('Codex OAuth provider can parse streamed Codex responses when the backend requires stream=true', async () => {
@@ -1328,7 +1449,7 @@ Deno.test('Codex OAuth provider can parse streamed Codex responses when the back
   });
 
   assert.equal(completion.outputText, '```repl\nFINAL_VAR("done")\n```');
-  assert.equal(completion.turnState, 'resp_stream_1');
+  assert.equal(completion.turnState, undefined);
   assert.deepEqual(completion.usage, {
     cachedInputTokens: undefined,
     inputTokens: 12,
@@ -1399,7 +1520,7 @@ Deno.test('Codex OAuth provider recognizes SSE response bodies even when the con
   });
 
   assert.equal(completion.outputText, 'PONG');
-  assert.equal(completion.turnState, 'resp_stream_sniff');
+  assert.equal(completion.turnState, undefined);
   assert.deepEqual(completion.usage, {
     cachedInputTokens: undefined,
     inputTokens: 4,
@@ -1463,7 +1584,7 @@ Deno.test('Codex OAuth provider can recover assistant text from streamed output_
   });
 
   assert.equal(completion.outputText, '```repl\nFINAL_VAR("done")\n```');
-  assert.equal(completion.turnState, 'resp_stream_2');
+  assert.equal(completion.turnState, undefined);
   assert.deepEqual(completion.usage, {
     cachedInputTokens: undefined,
     inputTokens: 7,
@@ -1531,7 +1652,7 @@ Deno.test('Codex OAuth provider can recover assistant text from streamed content
   });
 
   assert.equal(completion.outputText, '```repl\nFINAL_VAR("done")\n```');
-  assert.equal(completion.turnState, 'resp_stream_3');
+  assert.equal(completion.turnState, undefined);
   assert.deepEqual(completion.usage, {
     cachedInputTokens: undefined,
     inputTokens: 9,
@@ -1699,6 +1820,35 @@ Deno.test('Codex OAuth provider preserves primitive raw payloads, undefined turn
       }),
     /network boom/u,
   );
+
+  const responseThrowingProvider = new CodexOAuthProvider({
+    clock: createClock(),
+    fetcher: async (input) => {
+      const url = String(input);
+      if (url.includes('/codex/models')) {
+        return jsonResponse({
+          models: [{ slug: 'gpt-5-4-t-mini' }],
+        });
+      }
+
+      throw 'response transport boom';
+    },
+    storagePath,
+  });
+
+  await assert.rejects(
+    async () =>
+      await responseThrowingProvider.createCaller({
+        requestTimeoutMs: 15_000,
+      }).complete({
+        input: 'ping',
+        kind: 'plain_query',
+        metadata: { depth: 0 },
+        model: 'gpt-5-4-t-mini',
+        systemPrompt: 'Respond with pong.',
+      }),
+    /response transport boom/u,
+  );
 });
 
 Deno.test('Codex OAuth provider retries once when a streamed response completes with an empty assistant message and then succeeds', async () => {
@@ -1779,7 +1929,7 @@ Deno.test('Codex OAuth provider retries once when a streamed response completes 
 
   assert.equal(responsesCalls, 2);
   assert.equal(completion.outputText, '```repl\nFINAL_VAR("done")\n```');
-  assert.equal(completion.turnState, 'resp_success_attempt_2');
+  assert.equal(completion.turnState, undefined);
 });
 
 Deno.test('Codex OAuth provider surfaces a stable error after repeated empty assistant responses', async () => {
@@ -2117,6 +2267,46 @@ Deno.test('Codex OAuth provider surfaces raw HTTP failures, payload errors, time
     /timed out after 1ms/u,
   );
 
+  const externalAbortRoot = await Deno.makeTempDir({ prefix: 'rlm-codex-oauth-external-abort-' });
+  const externalAbortStoragePath = join(externalAbortRoot, '.rlm/codex-oauth.json');
+  await Deno.mkdir(join(externalAbortRoot, '.rlm'));
+  await Deno.writeTextFile(externalAbortStoragePath, JSON.stringify(createStoredAuth(), null, 2));
+  const runningController = new AbortController();
+  const externalAbortProvider = new CodexOAuthProvider({
+    clock: createClock(),
+    fetcher: async (input, init) => {
+      const url = String(input);
+      if (url.includes('/codex/models')) {
+        return jsonResponse({
+          models: [{ slug: 'gpt-5-4-t-mini' }],
+        });
+      }
+
+      if (url.endsWith('/codex/responses')) {
+        runningController.abort();
+        const requestInit = init as RequestInit | undefined;
+        assert.equal(requestInit?.signal?.aborted ?? false, true);
+        throw new DOMException('Aborted', 'AbortError');
+      }
+
+      throw new Error(`Unexpected request: ${url}`);
+    },
+    storagePath: externalAbortStoragePath,
+  });
+
+  await assert.rejects(
+    async () =>
+      await externalAbortProvider.createCaller({ requestTimeoutMs: 25 }).complete({
+        input: 'Return done.',
+        kind: 'root_turn',
+        metadata: { depth: 0, step: 1 },
+        model: 'gpt-5-4-t-mini',
+        signal: runningController.signal,
+        systemPrompt: 'Use the REPL.',
+      }),
+    /timed out after 25ms/u,
+  );
+
   const readErrorRoot = await Deno.makeTempDir({ prefix: 'rlm-codex-oauth-read-error-' });
   const readErrorStoragePath = join(readErrorRoot, '.rlm/codex-oauth.json');
   const readErrorProvider = new CodexOAuthProvider({
@@ -2272,6 +2462,36 @@ Deno.test('Codex OAuth provider surfaces structured model-list failures instead 
     },
     /model listing is not available for this account/u,
   );
+});
+
+Deno.test('Codex OAuth provider reports empty model-list HTTP bodies after retry', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'rlm-codex-oauth-model-empty-error-' });
+  const storagePath = join(root, '.rlm/codex-oauth.json');
+  await Deno.mkdir(join(root, '.rlm'));
+  await Deno.writeTextFile(storagePath, JSON.stringify(createStoredAuth(), null, 2));
+
+  let modelListCalls = 0;
+  const provider = new CodexOAuthProvider({
+    clock: createClock(),
+    fetcher: async (input) => {
+      const url = String(input);
+      if (url.includes('/codex/models')) {
+        modelListCalls += 1;
+        return new Response('', { status: 500 });
+      }
+
+      throw new Error(`Unexpected request: ${url}`);
+    },
+    storagePath,
+  });
+
+  await assert.rejects(
+    async () => {
+      await provider.listModels();
+    },
+    /Model listing failed with status 500\. raw=\(empty\)/u,
+  );
+  assert.equal(modelListCalls, 2);
 });
 
 Deno.test('Codex OAuth provider retries a transient HTML model-list response before completing a request', async () => {

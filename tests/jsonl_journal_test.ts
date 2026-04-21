@@ -120,6 +120,35 @@ Deno.test('jsonl journal helpers cover node fallback append and load paths', asy
   assert.equal(loaded.cells[0]?.finalAnswer, '42');
 });
 
+Deno.test('jsonl journal helpers can use the default node fallback importer', async () => {
+  const tempDir = await Deno.makeTempDir();
+  const journalPath = `${tempDir}/session.jsonl`;
+  const session: SessionEntry = {
+    context: null,
+    createdAt: '2026-04-04T00:00:00.000Z',
+    defaultTimeoutMs: 1_000,
+    sessionId: 'session-default-node',
+    type: 'session',
+  };
+
+  try {
+    await __jsonlJournalTestables.appendJournalEntryWithDependencies(
+      journalPath,
+      session,
+      { deno: {} },
+    );
+    const loaded = await __jsonlJournalTestables.loadJournalWithDependencies(
+      journalPath,
+      { deno: {} },
+    );
+
+    assert.equal(loaded.session?.sessionId, 'session-default-node');
+    assert.deepEqual(loaded.cells, []);
+  } finally {
+    await Deno.remove(tempDir, { recursive: true });
+  }
+});
+
 Deno.test('jsonl journal helpers return an empty snapshot for not-found errors and rethrow unknown failures', async () => {
   const missing = await __jsonlJournalTestables.loadJournalWithDependencies(
     '/tmp/missing/session.jsonl',

@@ -46,3 +46,26 @@ Deno.test('shared plugin smoke scenario caller surfaces unsupported request kind
     /Unsupported plugin smoke request kind: child_turn/u,
   );
 });
+
+Deno.test('shared plugin smoke scenario tolerates plugins without runtime helpers', async () => {
+  const fakeCreateRLM = (() => ({
+    async run() {
+      return {
+        answer: 'stub',
+        finalValue: 'stub',
+        session: { close: async () => undefined },
+        steps: 0,
+        usage: createUsageSummary(),
+      };
+    },
+  })) as unknown as CreateRLMFn;
+
+  const result = await runPluginSmokeScenario(
+    fakeCreateRLM,
+    () => ({ name: 'ping-pong' }),
+    () => ({ name: 'aot' }),
+  );
+
+  assert.equal(result.aotHelperName, null);
+  assert.deepEqual(result.helperNames, []);
+});

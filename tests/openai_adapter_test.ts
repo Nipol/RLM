@@ -23,7 +23,10 @@ function readRequestBody(init: unknown): Record<string, unknown> {
     return {};
   }
 
-  return JSON.parse(String((init as { body?: BodyInit | null }).body ?? '{}')) as Record<string, unknown>;
+  return JSON.parse(String((init as { body?: BodyInit | null }).body ?? '{}')) as Record<
+    string,
+    unknown
+  >;
 }
 
 Deno.test('OpenAI adapter posts model instructions and input to the Responses API', async () => {
@@ -87,7 +90,7 @@ Deno.test('OpenAI adapter posts model instructions and input to the Responses AP
   assert.equal(payload.instructions, 'Use the REPL.');
   assert.equal(payload.input, 'Solve the task.');
   assert.equal(response.outputText, '```repl\nFINAL_VAR(42)\n```');
-  assert.equal(response.turnState, 'resp_123');
+  assert.equal(response.turnState, undefined);
   assert.deepEqual(response.usage, {
     cachedInputTokens: 4,
     inputTokens: 10,
@@ -197,7 +200,7 @@ Deno.test('OpenAI adapter surfaces API failures with the provider message intact
   );
 });
 
-Deno.test('OpenAI adapter accepts direct output_text payloads and forwards opaque turn state to provider continuation state', async () => {
+Deno.test('OpenAI adapter accepts direct output_text payloads and ignores deprecated turn state', async () => {
   let capturedInit: RequestInit | undefined;
   const adapter = new OpenAIResponsesAdapter({
     config: {
@@ -229,9 +232,85 @@ Deno.test('OpenAI adapter accepts direct output_text payloads and forwards opaqu
   }));
 
   const payload = JSON.parse(String(capturedInit?.body)) as Record<string, unknown>;
-  assert.equal(payload.previous_response_id, 'resp_prev');
+  assert.equal('previous_response_id' in payload, false);
   assert.equal(response.outputText, 'FINAL("done")');
   assert.equal(response.usage, undefined);
+});
+
+Deno.test('OpenAI adapter sends append-only messages when provided and keeps string input as fallback only', async () => {
+  let capturedInit: RequestInit | undefined;
+  const adapter = new OpenAIResponsesAdapter({
+    config: {
+      apiKey: 'sk-test',
+      baseUrl: 'https://api.openai.com/v1',
+      requestTimeoutMs: 30_000,
+      rootModel: 'gpt-5-nano',
+      subModel: 'gpt-5-mini',
+    },
+    fetcher: async (_input, init) => {
+      capturedInit = init;
+
+      return new Response(
+        JSON.stringify({
+          output_text: 'FINAL("done")',
+        }),
+        {
+          headers: { 'Content-Type': 'application/json' },
+          status: 200,
+        },
+      );
+    },
+  });
+
+  await adapter.complete(createRequest({
+    input: 'legacy flattened fallback',
+    messages: [
+      { content: 'Initial task.', role: 'user' },
+      { content: '```repl\n1 + 1\n```', role: 'assistant' },
+      { content: 'REPL result: 2', role: 'user' },
+    ],
+  }));
+
+  const payload = JSON.parse(String(capturedInit?.body)) as Record<string, unknown>;
+  assert.deepEqual(payload.input, [
+    { content: 'Initial task.', role: 'user' },
+    { content: '```repl\n1 + 1\n```', role: 'assistant' },
+    { content: 'REPL result: 2', role: 'user' },
+  ]);
+});
+
+Deno.test('OpenAI adapter treats empty message arrays as legacy string input', async () => {
+  let capturedInit: RequestInit | undefined;
+  const adapter = new OpenAIResponsesAdapter({
+    config: {
+      apiKey: 'sk-test',
+      baseUrl: 'https://api.openai.com/v1',
+      requestTimeoutMs: 30_000,
+      rootModel: 'gpt-5-nano',
+      subModel: 'gpt-5-mini',
+    },
+    fetcher: async (_input, init) => {
+      capturedInit = init;
+
+      return new Response(
+        JSON.stringify({
+          output_text: 'FINAL("done")',
+        }),
+        {
+          headers: { 'Content-Type': 'application/json' },
+          status: 200,
+        },
+      );
+    },
+  });
+
+  await adapter.complete(createRequest({
+    input: 'legacy flattened fallback',
+    messages: [],
+  }));
+
+  const payload = JSON.parse(String(capturedInit?.body)) as Record<string, unknown>;
+  assert.equal(payload.input, 'legacy flattened fallback');
 });
 
 Deno.test('OpenAI adapter rejects responses that never contain assistant text', async () => {
@@ -709,7 +788,7 @@ Deno.test('OpenAI provider builds a provider-neutral caller that reuses the shar
 
   assert.equal(capturedAuthorization, 'Bearer sk-provider');
   assert.equal(response.outputText, 'FINAL("provider")');
-  assert.equal(response.turnState, 'resp_provider_1');
+  assert.equal(response.turnState, undefined);
 });
 
 Deno.test('OpenAI adapter rejects payloads whose output container is not an array', async () => {

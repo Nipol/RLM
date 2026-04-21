@@ -168,6 +168,7 @@ Deno.test('AoT JSON helpers cover strict parsing, normalization, aliases, and va
     ],
   );
   assert.deepEqual(normalizeSubquestions('not-an-array'), []);
+  assert.deepEqual(normalizeSubquestions([]), []);
 
   assert.deepEqual(
     normalizeDecomposition({ atomic: false, reason: 'needs split', subquestions: [{ id: 'q1', question: 'A', deps: [] }] }),
@@ -180,6 +181,11 @@ Deno.test('AoT JSON helpers cover strict parsing, normalization, aliases, and va
   assert.deepEqual(normalizeDecomposition({ reason: 'none', subquestions: [] }), {
     atomic: true,
     reason: 'none',
+    subquestions: [],
+  });
+  assert.deepEqual(normalizeDecomposition('not-an-object'), {
+    atomic: true,
+    reason: '',
     subquestions: [],
   });
 
@@ -225,6 +231,13 @@ Deno.test('AoT JSON helpers cover strict parsing, normalization, aliases, and va
       selectedIds: ['c1', 'c2'],
     },
   );
+  assert.deepEqual(
+    normalizeFrontierDecision({ reason: 'no explicit selection' }),
+    {
+      reason: 'no explicit selection',
+      selectedIds: [],
+    },
+  );
   assert.throws(
     () => normalizeFrontierDecision([]),
     /aot\(frontier\) must return a JSON object/u,
@@ -254,6 +267,25 @@ Deno.test('AoT prompt builders cover optional context, goal, sampling, and final
       { sampleIndex: 1, totalSamples: 3 },
     ),
     /Candidate sample: 2 \/ 3[\s\S]*Shared context:/u,
+  );
+  assert.match(
+    buildContractionPrompt(
+      'Explain this.',
+      { subquestions: [{ id: 'q1', question: 'Why?', deps: [] }] },
+      [{ id: 'q1', question: 'Why?', answer: 'Because.' }],
+      { context: null },
+      { totalSamples: 2 },
+    ),
+    /Candidate sample: 1 \/ 2/u,
+  );
+  assert.doesNotMatch(
+    buildContractionPrompt(
+      'Explain this.',
+      { subquestions: [{ id: 'q1', question: 'Why?', deps: [] }] },
+      [{ id: 'q1', question: 'Why?', answer: 'Because.' }],
+      { context: null },
+    ),
+    /Candidate sample:/u,
   );
   assert.match(
     buildStateSolvePrompt('Original?', 'Reduced?', { context: { doc: 'x' }, goal: 'brief' }),

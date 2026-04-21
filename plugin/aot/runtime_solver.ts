@@ -839,7 +839,7 @@ export async function runAOTHardHelperFromConfig(
       acceptedCandidates.map((candidate) => ({
         answer: candidate.answer,
         id: candidate.id,
-        judgeReason: String(candidate.traceEntry.judgeReason ?? ''),
+        judgeReason: String(candidate.traceEntry.judgeReason),
         pathScore: candidate.parentScore,
         question: candidate.question,
         ready: candidate.ready,
@@ -906,11 +906,11 @@ export async function runAOTHardHelperFromConfig(
         stoppedBecause: bestCompletedCandidate.stoppedBecause,
       };
     } else {
-      const question = frontier[0]?.question ?? config.question;
+      const fallbackNode = frontier[0]!;
       finalCandidate = {
-        answer: await solveStateAnswer(config.question, question, config),
-        path: frontier[0]?.path ?? [],
-        question,
+        answer: await solveStateAnswer(config.question, fallbackNode.question, config),
+        path: fallbackNode.path,
+        question: fallbackNode.question,
         stoppedBecause: 'max_iterations',
       };
     }

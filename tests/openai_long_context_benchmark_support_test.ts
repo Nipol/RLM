@@ -80,6 +80,13 @@ Deno.test('all long-context scenario factories build populated scenarios with la
     assert.ok((context.document as string).length > 0);
     assert.ok(countWords(context.document as string) >= scenario.expectedMinDocumentWords);
   }
+
+  const rulerEntry = LONG_CONTEXT_SCENARIO_FACTORIES.find((entry) =>
+    entry.summaryLabel === 'ruler-inspired-near-max-needle'
+  );
+  assert.ok(rulerEntry);
+  const defaultRulerScenario = await rulerEntry.createScenario();
+  assert.equal(defaultRulerScenario.summaryLabel, 'ruler-inspired-near-max-needle');
 });
 
 Deno.test('runLongContextScenario records a passed benchmark outcome for a successful local harness', async () => {
@@ -124,6 +131,7 @@ Deno.test('runLongContextScenario records a passed benchmark outcome for a succe
       expectedAnswer: '42',
       expectedMinDocumentWords: 3,
       journalPathName: 'unit-success',
+      normalizeAnswer: (answer) => answer.trim(),
       prompt: 'Return only the exact answer through FINAL_VAR.',
       summaryLabel: 'unit-success',
     },
@@ -215,4 +223,164 @@ Deno.test('runLongContextScenario reports a failed benchmark outcome when the ha
   assert.equal(outcome.providerTotalTokens, 0);
   assert.equal(outcome.reportedRequests, 0);
   assert.equal(outcome.requests, 0);
+});
+
+Deno.test('runLongContextScenario reports context and provider usage after post-run validation failures', async () => {
+  const harness: CodexLiveHarness = {
+    provider: {
+      createCaller() {
+        return {
+          async complete() {
+            return {
+              outputText: '```repl\nFINAL_VAR("42");\n```',
+              usage: {
+                inputTokens: 50,
+                outputTokens: 10,
+                totalTokens: 60,
+              },
+            };
+          },
+        };
+      },
+      async listModels() {
+        return ['gpt-5-mini'];
+      },
+      async loadAuth() {
+        return null;
+      },
+    },
+    runOptions: {
+      cellTimeoutMs: 5_000,
+      maxSteps: 1,
+      maxSubcallDepth: 1,
+      outputCharLimit: 1_200,
+      requestTimeoutMs: 5_000,
+      rootModel: 'gpt-5-mini',
+      subModel: 'gpt-5-mini',
+    },
+  };
+
+  const outcome = await runLongContextScenario(
+    {
+      context: {},
+      expectedAnswer: '42',
+      expectedMinDocumentWords: 1,
+      journalPathName: 'unit-post-run-failure',
+      normalizeAnswer() {
+        throw 'normalizer failed';
+      },
+      prompt: 'Return only the exact answer through FINAL_VAR.',
+      summaryLabel: 'unit-post-run-failure',
+    },
+    harness,
+  );
+
+  assert.equal(outcome.passed, false);
+  assert.equal(outcome.actualAnswer, null);
+  assert.equal(outcome.contextChars, 0);
+  assert.equal(outcome.contextWords, 0);
+  assert.equal(outcome.error, 'normalizer failed');
+  assert.equal(outcome.providerInputTokens, 50);
+  assert.equal(outcome.providerOutputTokens, 10);
+  assert.equal(outcome.providerTotalTokens, 60);
+  assert.equal(outcome.reportedRequests, 1);
+  assert.equal(outcome.requests, 1);
+  assert.equal(outcome.steps, 1);
+  assert.ok(outcome.totalCostUsd !== null && outcome.totalCostUsd > 0);
+});
+
+Deno.test('runLongContextScenario measures null contexts as empty before provider execution', async () => {
+  const harness: CodexLiveHarness = {
+    provider: {
+      createCaller() {
+        return {
+          async complete() {
+            throw new Error('synthetic null-context failure');
+          },
+        };
+      },
+      async listModels() {
+        return ['gpt-5-mini'];
+      },
+      async loadAuth() {
+        return null;
+      },
+    },
+    runOptions: {
+      cellTimeoutMs: 5_000,
+      maxSteps: 1,
+      maxSubcallDepth: 1,
+      outputCharLimit: 1_200,
+      requestTimeoutMs: 5_000,
+      rootModel: 'gpt-5-mini',
+      subModel: 'gpt-5-mini',
+    },
+  };
+
+  const outcome = await runLongContextScenario(
+    {
+      context: null,
+      expectedAnswer: '42',
+      expectedMinDocumentWords: 0,
+      journalPathName: 'unit-null-context-failure',
+      prompt: 'Return only the exact answer through FINAL_VAR.',
+      summaryLabel: 'unit-null-context-failure',
+    },
+    harness,
+  );
+
+  assert.equal(outcome.contextChars, 0);
+  assert.equal(outcome.contextWords, 0);
+  assert.match(outcome.error ?? '', /synthetic null-context failure/u);
+});
+
+Deno.test('runLongContextScenario can pass without answer normalization', async () => {
+  const harness: CodexLiveHarness = {
+    provider: {
+      createCaller() {
+        return {
+          async complete() {
+            return {
+              outputText: '```repl\nFINAL_VAR("42");\n```',
+              usage: {
+                inputTokens: 50,
+                outputTokens: 10,
+                totalTokens: 60,
+              },
+            };
+          },
+        };
+      },
+      async listModels() {
+        return ['gpt-5-mini'];
+      },
+      async loadAuth() {
+        return null;
+      },
+    },
+    runOptions: {
+      cellTimeoutMs: 5_000,
+      maxSteps: 1,
+      maxSubcallDepth: 1,
+      outputCharLimit: 1_200,
+      requestTimeoutMs: 5_000,
+      rootModel: 'gpt-5-mini',
+      subModel: 'gpt-5-mini',
+    },
+  };
+
+  const outcome = await runLongContextScenario(
+    {
+      context: { document: 'Needle answer 42.' },
+      expectedAnswer: '42',
+      expectedMinDocumentWords: 3,
+      journalPathName: 'unit-no-normalizer',
+      prompt: 'Return only the exact answer through FINAL_VAR.',
+      summaryLabel: 'unit-no-normalizer',
+    },
+    harness,
+  );
+
+  assert.equal(outcome.passed, true);
+  assert.equal(outcome.actualAnswer, '42');
 });

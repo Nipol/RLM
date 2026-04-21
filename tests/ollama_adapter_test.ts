@@ -69,6 +69,156 @@ Deno.test('Ollama adapter posts model system prompt and input to the generate en
   });
 });
 
+Deno.test('Ollama adapter flattens append-only messages for the generate endpoint fallback', async () => {
+  let payload: Record<string, unknown> = {};
+  const adapter = new OllamaGenerateAdapter({
+    config: {
+      baseUrl: 'http://localhost:11434/api',
+      requestTimeoutMs: 30_000,
+      rootModel: 'llama3.2',
+      subModel: 'llama3.2',
+    },
+    fetcher: async (_input, init) => {
+      payload = JSON.parse(String((init as RequestInit | undefined)?.body ?? '{}')) as Record<
+        string,
+        unknown
+      >;
+
+      return new Response(
+        JSON.stringify({
+          done: true,
+          response: 'FINAL("ok")',
+        }),
+        {
+          headers: { 'Content-Type': 'application/json' },
+          status: 200,
+        },
+      );
+    },
+  });
+
+  await adapter.complete(createRequest({
+    input: 'legacy fallback',
+    messages: [
+      { content: 'Initial task.', role: 'user' },
+      { content: '```repl\n1 + 1\n```', role: 'assistant' },
+      { content: 'REPL result: 2', role: 'user' },
+    ],
+  }));
+
+  assert.equal(
+    payload.prompt,
+    [
+      'user:',
+      'Initial task.',
+      '',
+      'assistant:',
+      '```repl\n1 + 1\n```',
+      '',
+      'user:',
+      'REPL result: 2',
+    ].join('\n'),
+  );
+});
+
+Deno.test('Ollama adapter treats empty message arrays as legacy string input', async () => {
+  let payload: Record<string, unknown> = {};
+  const adapter = new OllamaGenerateAdapter({
+    config: {
+      baseUrl: 'http://localhost:11434/api',
+      requestTimeoutMs: 30_000,
+      rootModel: 'llama3.2',
+      subModel: 'llama3.2',
+    },
+    fetcher: async (_input, init) => {
+      payload = JSON.parse(String((init as RequestInit | undefined)?.body ?? '{}')) as Record<
+        string,
+        unknown
+      >;
+
+      return new Response(
+        JSON.stringify({
+          done: true,
+          response: 'FINAL("ok")',
+        }),
+        {
+          headers: { 'Content-Type': 'application/json' },
+          status: 200,
+        },
+      );
+    },
+  });
+
+  await adapter.complete(createRequest({
+    input: 'legacy fallback',
+    messages: [],
+  }));
+
+  assert.equal(payload.prompt, 'legacy fallback');
+});
+
+Deno.test('Ollama adapter handles partial usage counters from successful responses', async () => {
+  const adapter = new OllamaGenerateAdapter({
+    config: {
+      baseUrl: 'http://localhost:11434/api',
+      requestTimeoutMs: 30_000,
+      rootModel: 'llama3.2',
+      subModel: 'llama3.2',
+    },
+    fetcher: async () =>
+      new Response(
+        JSON.stringify({
+          done: true,
+          eval_count: 7,
+          response: 'FINAL("ok")',
+        }),
+        {
+          headers: { 'Content-Type': 'application/json' },
+          status: 200,
+        },
+      ),
+  });
+
+  const response = await adapter.complete(createRequest());
+
+  assert.deepEqual(response.usage, {
+    cachedInputTokens: undefined,
+    inputTokens: undefined,
+    outputTokens: 7,
+    totalTokens: 7,
+  });
+
+  const promptOnlyAdapter = new OllamaGenerateAdapter({
+    config: {
+      baseUrl: 'http://localhost:11434/api',
+      requestTimeoutMs: 30_000,
+      rootModel: 'llama3.2',
+      subModel: 'llama3.2',
+    },
+    fetcher: async () =>
+      new Response(
+        JSON.stringify({
+          done: true,
+          prompt_eval_count: 11,
+          response: 'FINAL("ok")',
+        }),
+        {
+          headers: { 'Content-Type': 'application/json' },
+          status: 200,
+        },
+      ),
+  });
+
+  const promptOnlyResponse = await promptOnlyAdapter.complete(createRequest());
+
+  assert.deepEqual(promptOnlyResponse.usage, {
+    cachedInputTokens: undefined,
+    inputTokens: 11,
+    outputTokens: undefined,
+    totalTokens: 11,
+  });
+});
+
 Deno.test('Ollama adapter surfaces HTTP failures with provider messages', async () => {
   const adapter = new OllamaGenerateAdapter({
     config: {
@@ -94,6 +244,28 @@ Deno.test('Ollama adapter surfaces HTTP failures with provider messages', async 
       await adapter.complete(createRequest());
     },
     OllamaGenerateError,
+  );
+
+  const genericFailure = new OllamaGenerateAdapter({
+    config: {
+      baseUrl: 'http://localhost:11434/api',
+      requestTimeoutMs: 30_000,
+      rootModel: 'llama3.2',
+      subModel: 'llama3.2',
+    },
+    fetcher: async () =>
+      new Response(
+        JSON.stringify({ done: true }),
+        {
+          headers: { 'Content-Type': 'application/json' },
+          status: 502,
+        },
+      ),
+  });
+
+  await assert.rejects(
+    () => genericFailure.complete(createRequest()),
+    /Ollama request failed with status 502/u,
   );
 });
 
@@ -220,13 +392,49 @@ Deno.test('Ollama adapter maps aborts and non-Error transport failures into stab
     },
     fetcher: async (_input, init) => {
       const requestInit = init as RequestInit | undefined;
-      assert.equal((requestInit?.signal?.aborted ?? false), true);
+      assert.equal(requestInit?.signal?.aborted ?? false, true);
       throw new DOMException('Aborted', 'AbortError');
     },
   });
   await assert.rejects(
     () => abortingAdapter.complete(createRequest({ signal: controller.signal })),
     /timed out after 25ms/u,
+  );
+
+  const runningController = new AbortController();
+  const externallyAbortedAdapter = new OllamaGenerateAdapter({
+    config: {
+      baseUrl: 'http://localhost:11434/api',
+      requestTimeoutMs: 50,
+      rootModel: 'llama3.2',
+      subModel: 'llama3.2',
+    },
+    fetcher: async (_input, init) => {
+      runningController.abort();
+      const requestInit = init as RequestInit | undefined;
+      assert.equal(requestInit?.signal?.aborted ?? false, true);
+      throw new DOMException('Aborted', 'AbortError');
+    },
+  });
+  await assert.rejects(
+    () => externallyAbortedAdapter.complete(createRequest({ signal: runningController.signal })),
+    /timed out after 50ms/u,
+  );
+
+  const errorFailureAdapter = new OllamaGenerateAdapter({
+    config: {
+      baseUrl: 'http://localhost:11434/api',
+      requestTimeoutMs: 30_000,
+      rootModel: 'llama3.2',
+      subModel: 'llama3.2',
+    },
+    fetcher: async () => {
+      throw new TypeError('socket closed');
+    },
+  });
+  await assert.rejects(
+    () => errorFailureAdapter.complete(createRequest()),
+    /socket closed/u,
   );
 
   const unknownFailureAdapter = new OllamaGenerateAdapter({
